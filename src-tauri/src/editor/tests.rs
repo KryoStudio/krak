@@ -1,0 +1,1419 @@
+//! End-to-end runs of the editor on the real machine (ignored by default: they need Media
+//! Foundation and the GPU, and `editor_end_to_end` records the screen for a few seconds).
+//! Nothing here makes a sound: the known audio signal is written into the clip, not played.
+//!
+//! `cargo test -- --ignored --nocapture editor_end_to_end`; `KRYO_EDITOR_OUT` picks the
+//! folder, `KRYO_EDITOR_KEEP=1` keeps every file (to check them with another decoder),
+//! `KRYO_EDITOR_SOURCE` reuses an engine clip instead of recording one.
+
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
+
+use windows::Win32::Media::MediaFoundation::{
+    MF_SOURCE_READER_ALL_STREAMS, MF_SOURCE_READER_FIRST_VIDEO_STREAM,
+    MF_SOURCE_READERF_ENDOFSTREAM, MFCreateSourceReaderFromURL, MFMediaType_Audio,
+    MFMediaType_Video, MFVideoFormat_NV12,
+};
+use windows::core::HSTRING;
+
+use super::demux::{self, Movie};
+use super::export::{self, Destination, Exported, Request};
+use super::mapped::MappedFile;
+use super::pcm::Pcm;
+use super::transcode::Options;
+use super::{CANCELLED, Gains, INVALID_RANGE, Progress, TrackKind, decode, probe};
+use crate::capture::{
+    CaptureState, CaptureStatus, Engine, EngineConfig, EngineEvents, SaveRequest, Stamp,
+};
+use crate::media::mf::media_type;
+use crate::media::{ComGuard, MfGuard, TICKS_PER_SECOND, rescale, testing};
+use crate::settings::Quality;
+use crate::state::lock;
+
+/// Latest status, and the save outcome.
+type Seen = (Option<CaptureStatus>, Option<Result<PathBuf, &'static str>>);
+
+#[derive(Default)]
+struct Events {
+    seen: Mutex<Seen>,
+    changed: Condvar,
+}
+
+impl EngineEvents for Events {
+    fn status_changed(&self, status: &CaptureStatus) {
+        lock(&self.seen).0 = Some(status.clone());
+        self.changed.notify_all();
+    }
+
+    fn saved(&self, path: &Path) {
+        lock(&self.seen).1 = Some(Ok(path.to_path_buf()));
+        self.changed.notify_all();
+    }
+
+    fn save_failed(&self, code: &'static str) {
+        lock(&self.seen).1 = Some(Err(code));
+        self.changed.notify_all();
+    }
+}
+
+impl Events {
+    fn wait<T>(&self, timeout: Duration, found: impl Fn(&Self) -> Option<T>) -> Option<T> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Some(value) = found(self) {
+                return Some(value);
+            }
+            let left = deadline.checked_duration_since(Instant::now())?;
+            let guard = lock(&self.seen);
+            let _ = self
+                .changed
+                .wait_timeout(guard, left.min(Duration::from_millis(50)));
+        }
+    }
+}
+
+/// Records `seconds` (+ up to a GOP) of the screen with the microphone setting on (Mix, Game,
+/// Microphone tracks). Silently: nothing is played.
+fn record(dir: &Path, seconds: u32) -> (PathBuf, CaptureStatus) {
+    let events = Arc::new(Events::default());
+    let config = EngineConfig {
+        fps: 60,
+        quality: Quality::High,
+        buffer_seconds: seconds,
+        microphone: true,
+    };
+    let started = Instant::now();
+    let engine = Engine::start(config, events.clone());
+    events
+        .wait(Duration::from_secs(10), |e| {
+            lock(&e.seen)
+                .0
+                .as_ref()
+                .is_some_and(|s| s.state == CaptureState::Ready)
+                .then_some(())
+        })
+        .expect("engine never became ready");
+    std::thread::sleep(
+        Duration::from_secs(u64::from(seconds) + 3).saturating_sub(started.elapsed()),
+    );
+    let status = engine.status();
+    engine
+        .save(SaveRequest {
+            clips_dir: dir.to_path_buf(),
+            game: None,
+            desktop_label: "Editor test".into(),
+            stamp: Stamp::now(),
+        })
+        .expect("save accepted");
+    let saved = events
+        .wait(Duration::from_secs(30), |e| lock(&e.seen).1.clone())
+        .expect("save timed out")
+        .expect("save failed");
+    drop(engine);
+    (saved, status)
+}
+
+/// A copy of an engine clip whose "Game" track is a known signal (a 20 ms beep every 0.4 s,
+/// 600 to 1400 Hz), with the recorded "Microphone" kept as it is and "Mix" rebuilt as Game +
+/// Microphone like the engine does. Video samples are copied. This gives the gain and mix
+/// checks a real game signal without playing anything through the speakers.
+fn with_test_audio(clip: &Path, dir: &Path) -> PathBuf {
+    use super::pcm;
+    use crate::media::aac::{self, AacConfig, AacStream};
+    use crate::media::mp4_writer::{
+        self, AudioTrack, Options as MuxOptions, VideoSample, VideoTrack,
+    };
+    let movie = demux::open(clip).expect("demux");
+    let file = MappedFile::open(clip).expect("map");
+    let video = movie.video().expect("video");
+    let demux::Codec::Avc { sps, pps, .. } = &video.codec else {
+        panic!("not H.264");
+    };
+    let last = video.samples.last().expect("frames");
+    let video = VideoTrack {
+        sps: &sps[0],
+        pps: &pps[0],
+        samples: (0..video.samples.len())
+            .map(|i| {
+                let s = &video.samples[i];
+                VideoSample {
+                    data: file.slice(s.offset, s.size).expect("sample"),
+                    pts: video.sample_time(i),
+                    keyframe: s.sync,
+                }
+            })
+            .collect(),
+        last_duration: rescale(
+            i64::from(last.duration),
+            i64::from(video.header.timescale),
+            TICKS_PER_SECOND,
+        ),
+    };
+    assert_eq!(movie.audio().count(), 3, "Mix, Game, Microphone");
+    let track = |name: &str| movie.audio().find(|t| t.header.name == name).expect(name);
+    let mic_track = track("Microphone");
+    let demux::Codec::Aac { asc: mic_asc, .. } = &mic_track.codec else {
+        panic!("not AAC");
+    };
+    let frames = track("Game").samples.len() * 1024;
+    let mut game = vec![0i16; frames * 2];
+    for (j, at) in (0..frames).step_by(19_200).enumerate() {
+        let freq = 600.0 + 200.0 * (j % 5) as f64;
+        for i in 0..960.min(frames - at) {
+            let v = (2.0 * std::f64::consts::PI * freq * i as f64 / 48_000.0).sin() * 8000.0;
+            game[(at + i) * 2] = v as i16;
+            game[(at + i) * 2 + 1] = v as i16;
+        }
+    }
+    let game = Pcm {
+        samples: game,
+        channels: 2,
+    };
+    let mic = our_audio(clip, "Microphone", 0.0, frames as f64 / 48_000.0);
+    let mix = pcm::mix(&[(&game, 1.0), (&mic, 1.0)], frames, false);
+    let stereo = AacConfig {
+        sample_rate: 48_000,
+        channels: 2,
+        bitrate: 160_000,
+    };
+    let game_aac = aac::encode(&game.samples, stereo).expect("aac");
+    let mix_aac = aac::encode(&mix.samples, stereo).expect("aac");
+    fn stereo_track<'a>(name: &'a str, stream: &'a AacStream) -> AudioTrack<'a> {
+        AudioTrack {
+            name,
+            sample_rate: 48_000,
+            channels: 2,
+            bitrate: 160_000,
+            asc: &stream.asc,
+            frames: stream.frames.iter().map(Vec::as_slice).collect(),
+        }
+    }
+    let mic_frames = mic_track
+        .samples
+        .iter()
+        .map(|s| file.slice(s.offset, s.size).expect("mic frame"))
+        .collect();
+    let audio = [
+        stereo_track("Mix", &mix_aac),
+        stereo_track("Game", &game_aac),
+        AudioTrack {
+            name: "Microphone",
+            sample_rate: 48_000,
+            channels: 1,
+            bitrate: 96_000,
+            asc: mic_asc,
+            frames: mic_frames,
+        },
+    ];
+    let stem = clip.file_stem().unwrap().to_string_lossy();
+    let path = dir.join(format!("{stem} beeps.mp4"));
+    mp4_writer::write_file(&path, &video, &audio, &MuxOptions::default(), true).expect("mux");
+    path
+}
+
+struct Run {
+    exported: Result<Exported, &'static str>,
+    seconds: f64,
+    reports: Vec<f64>,
+}
+
+/// Runs one export; `cancel_at` cancels it from the progress callback once reached.
+fn run(
+    source: &Path,
+    start: f64,
+    end: f64,
+    gains: Gains,
+    destination: Destination,
+    options: Options,
+    cancel_at: Option<f64>,
+) -> Run {
+    let cancel = AtomicBool::new(false);
+    let reports = Mutex::new(Vec::new());
+    let report = |p: f64| {
+        lock(&reports).push(p);
+        if cancel_at.is_some_and(|at| p >= at) {
+            cancel.store(true, Ordering::SeqCst);
+        }
+    };
+    let progress = Progress::new(&cancel, &report);
+    let request = Request {
+        start,
+        end,
+        gains,
+        destination,
+        options,
+    };
+    let started = Instant::now();
+    let exported = export::export(source, &request, &progress);
+    let seconds = started.elapsed().as_secs_f64();
+    Run {
+        exported,
+        seconds,
+        reports: reports.into_inner().unwrap_or_default(),
+    }
+}
+
+fn copy_to(label: &str) -> Destination {
+    Destination::Copy {
+        label: label.into(),
+    }
+}
+
+/// Decodes the audio track called `name` (the first one for "") of an MP4 over `from..to`
+/// (timeline seconds) with our decoder.
+fn our_audio(path: &Path, name: &str, from: f64, to: f64) -> Pcm {
+    let movie = demux::open(path).expect("demux");
+    let file = MappedFile::open(path).expect("map");
+    let track = movie
+        .audio()
+        .find(|t| name.is_empty() || t.header.name == name)
+        .expect("audio track");
+    let cancel = AtomicBool::new(false);
+    let report = |_| {};
+    let progress = Progress::new(&cancel, &report);
+    let t = |s: f64| (s * TICKS_PER_SECOND as f64).round() as i64;
+    decode::aac_track(&file, track, t(from), t(to), &progress.span(0.0, 1.0)).expect("decode")
+}
+
+/// Decodes the audio track called `name` with Media Foundation (which lists MP4 tracks in
+/// reverse file order).
+fn mf_audio(path: &Path, name: &str) -> (Vec<i16>, u32) {
+    let movie = demux::open(path).expect("demux");
+    let names: Vec<&str> = movie.audio().map(|t| t.header.name.as_str()).collect();
+    let position = names.iter().position(|n| *n == name).expect("track");
+    testing::decode_audio(path, names.len() - 1 - position)
+}
+
+fn channel(pcm: &Pcm, c: usize) -> Vec<f64> {
+    let n = usize::from(pcm.channels);
+    pcm.samples
+        .iter()
+        .skip(c.min(n - 1))
+        .step_by(n)
+        .map(|&s| f64::from(s))
+        .collect()
+}
+
+fn rms(v: &[f64]) -> f64 {
+    (v.iter().map(|x| x * x).sum::<f64>() / v.len().max(1) as f64).sqrt()
+}
+
+/// Least-squares gain of `y` against `x`, and the residual relative to `|gain·x|`.
+fn fit(x: &[f64], y: &[f64]) -> (f64, f64) {
+    let n = x.len().min(y.len());
+    let (x, y) = (&x[..n], &y[..n]);
+    let xx: f64 = x.iter().map(|a| a * a).sum();
+    let gain = x.iter().zip(y).map(|(a, b)| a * b).sum::<f64>() / xx.max(1.0);
+    let residual: Vec<f64> = x.iter().zip(y).map(|(a, b)| b - gain * a).collect();
+    (gain, rms(&residual) / (gain.abs() * rms(x)).max(1e-9))
+}
+
+/// Every frame Media Foundation decodes from the file (NV12): (count, last timestamp).
+fn decode_all_frames(path: &Path) -> (usize, i64) {
+    // SAFETY: Source Reader on a file we wrote; NV12 output, reads until the end.
+    unsafe {
+        let reader =
+            MFCreateSourceReaderFromURL(&HSTRING::from(path.as_os_str()), None).expect("reader");
+        let video = MF_SOURCE_READER_FIRST_VIDEO_STREAM.0.cast_unsigned();
+        reader
+            .SetStreamSelection(MF_SOURCE_READER_ALL_STREAMS.0.cast_unsigned(), false)
+            .expect("deselect");
+        reader.SetStreamSelection(video, true).expect("select");
+        let ty = media_type(&MFMediaType_Video, &MFVideoFormat_NV12).expect("type");
+        reader.SetCurrentMediaType(video, None, &ty).expect("nv12");
+        let (mut count, mut last) = (0, 0);
+        loop {
+            let (mut flags, mut time) = (0u32, 0i64);
+            let mut sample = None;
+            reader
+                .ReadSample(
+                    video,
+                    0,
+                    None,
+                    Some(&mut flags),
+                    Some(&mut time),
+                    Some(&mut sample),
+                )
+                .expect("read");
+            if sample.is_some() {
+                count += 1;
+                last = time;
+            }
+            if flags & MF_SOURCE_READERF_ENDOFSTREAM.0.cast_unsigned() != 0 {
+                return (count, last);
+            }
+        }
+    }
+}
+
+/// Index of the first video frame at or after `time` (timeline, within 1 ms).
+fn frame_at(movie: &Movie, time: i64) -> usize {
+    let video = movie.video().expect("video");
+    (0..video.samples.len())
+        .find(|&i| video.sample_time(i) >= time - TICKS_PER_SECOND / 1000)
+        .expect("a frame")
+}
+
+/// Timeline time of the first video frame shown (the edit list hides earlier ones).
+fn first_presented(movie: &Movie) -> i64 {
+    movie.video().unwrap().sample_time(frame_at(movie, 0))
+}
+
+fn frame_bytes(path: &Path, movie: &Movie, index: usize) -> Vec<u8> {
+    let sample = movie.video().unwrap().samples[index];
+    let file = MappedFile::open(path).unwrap();
+    file.slice(sample.offset, sample.size).unwrap().to_vec()
+}
+
+fn files(dir: &Path) -> Vec<PathBuf> {
+    let mut files: Vec<PathBuf> = std::fs::read_dir(dir)
+        .map(|entries| {
+            entries
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| p.is_file())
+                .collect()
+        })
+        .unwrap_or_default();
+    files.sort();
+    files
+}
+
+#[test]
+#[ignore = "records the screen for a few seconds; run with --ignored"]
+fn editor_end_to_end() {
+    let _com = ComGuard::new();
+    let _mf = MfGuard::new().expect("media foundation");
+    let dir = std::env::var_os("KRYO_EDITOR_OUT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| std::env::temp_dir().join("kryo-editor-e2e"));
+    let keep = std::env::var_os("KRYO_EDITOR_KEEP").is_some();
+    std::fs::create_dir_all(&dir).expect("output dir");
+    let exports = dir.join("exports");
+    // KRYO_EDITOR_SECONDS records a longer clip and adds full-length timings.
+    let seconds: u32 = std::env::var("KRYO_EDITOR_SECONDS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(5);
+    let (recorded, status) = match std::env::var_os("KRYO_EDITOR_SOURCE") {
+        Some(clip) => (PathBuf::from(clip), None),
+        None => {
+            let (clip, status) = record(&dir, seconds);
+            println!("recorded {} ({status:?})", clip.display());
+            (clip, Some(status))
+        }
+    };
+    let source = with_test_audio(&recorded, &dir);
+    if status.is_some() {
+        // Same video: the recording itself is not needed any more.
+        let _ = std::fs::remove_file(&recorded);
+    }
+    let source_size = std::fs::metadata(&source).expect("clip").len();
+
+    // (1) Probe.
+    let info = probe::probe(&source).expect("probe");
+    println!("probe: {info:?}");
+    assert_eq!(info.fps, 60.0);
+    if let Some(status) = &status {
+        assert_eq!((info.width, info.height), (status.width, status.height));
+        assert!(
+            (info.duration - status.buffered_seconds).abs() < 0.6,
+            "duration {}",
+            info.duration
+        );
+    }
+    let kinds: Vec<TrackKind> = info.audio_tracks.iter().map(|t| t.kind).collect();
+    assert_eq!(kinds, [TrackKind::Mix, TrackKind::Game, TrackKind::Mic]);
+    let original = demux::open(&source).expect("demux");
+    let keyframes: Vec<f64> = {
+        let v = original.video().expect("video");
+        (0..v.samples.len())
+            .filter(|&i| v.samples[i].sync)
+            .map(|i| v.sample_time(i) as f64 / 1e7)
+            .collect()
+    };
+    println!("source keyframes at {keyframes:?}");
+
+    // Out of range.
+    let bad = run(
+        &source,
+        info.duration + 10.0,
+        info.duration + 20.0,
+        Gains {
+            game: 1.0,
+            mic: 1.0,
+        },
+        copy_to("edit"),
+        Options::default(),
+        None,
+    );
+    assert_eq!(bad.exported.err(), Some(INVALID_RANGE));
+
+    // (2) Copy 1.0–3.5 s, game at 50 %, microphone muted.
+    let gains = Gains {
+        game: 0.5,
+        mic: 0.0,
+    };
+    let copy = run(
+        &source,
+        1.0,
+        3.5,
+        gains,
+        copy_to("edit"),
+        Options::default(),
+        None,
+    );
+    let exported = copy.exported.expect("copy export");
+    println!(
+        "copy: {exported:?} in {:.2} s, {} progress events",
+        copy.seconds,
+        copy.reports.len()
+    );
+    assert!(!exported.reencoded);
+    let stem = source.file_stem().unwrap().to_str().unwrap();
+    assert_eq!(exported.path, dir.join(format!("{stem} (edit).mp4")));
+    assert_eq!(copy.reports.last(), Some(&1.0));
+    assert!(
+        copy.reports.windows(2).all(|w| w[1] >= w[0]),
+        "progress never goes back"
+    );
+    let movie = demux::open(&exported.path).expect("demux copy");
+    assert!(
+        (movie.duration - 2.5).abs() < 0.03,
+        "copy duration {}",
+        movie.duration
+    );
+    let shown_at = first_presented(&movie);
+    println!("copy: first presented frame at {shown_at} × 100 ns");
+    assert!(
+        (0..10_000).contains(&shown_at),
+        "first presented frame at the start"
+    );
+    // File order: the main track last, and the only enabled one (Media Foundation plays the
+    // last audio track, Chromium and ffmpeg the enabled one).
+    let names: Vec<&str> = movie.audio().map(|t| t.header.name.as_str()).collect();
+    assert_eq!(names, ["Game", "Microphone", "Mix"]);
+    let enabled: Vec<&str> = movie
+        .audio()
+        .filter(|t| t.header.enabled)
+        .map(|t| t.header.name.as_str())
+        .collect();
+    assert_eq!(enabled, ["Mix"]);
+    let copy_info = probe::probe(&exported.path).expect("probe copy");
+    let probed: Vec<&str> = copy_info
+        .audio_tracks
+        .iter()
+        .map(|t| t.name.as_str())
+        .collect();
+    assert_eq!(
+        probed,
+        ["Mix", "Game", "Microphone"],
+        "main track first for the UI"
+    );
+    let (selected, _) = testing::default_audio(&exported.path);
+    assert_eq!(
+        selected,
+        [testing::stream_index(&exported.path, &MFMediaType_Audio, 0)],
+        "Media Foundation selects the last track (Mix)"
+    );
+    let shown = {
+        let v = movie.video().unwrap();
+        (0..v.samples.len())
+            .filter(|&i| (0..25_000_000).contains(&v.sample_time(i)))
+            .count()
+    };
+    assert!((149..=151).contains(&shown), "{shown} frames shown");
+    // Audio, with our decoder (edit lists applied): Mic silent, Game and Mix = half the
+    // original game audio.
+    let source_game = channel(&our_audio(&source, "Game", 1.0, 3.5), 0);
+    let copy_mix = our_audio(&exported.path, "Mix", 0.0, 2.5);
+    let copy_game = channel(&our_audio(&exported.path, "Game", 0.0, 2.5), 0);
+    let copy_mic = our_audio(&exported.path, "Microphone", 0.0, 2.5);
+    assert_eq!(copy_mic.channels, 1);
+    assert!(copy_mic.samples.iter().all(|&s| s == 0), "microphone muted");
+    println!("source game rms {:.1} over 1.0–3.5 s", rms(&source_game));
+    assert!(rms(&source_game) > 100.0, "the beeps are in the game track");
+    let (gain, residual) = fit(&source_game, &copy_game);
+    println!(
+        "copy Game = {gain:.3} × source Game (residual {:.1} %)",
+        residual * 100.0
+    );
+    assert!((gain - 0.5).abs() < 0.02 && residual < 0.1);
+    let (gain, residual) = fit(&source_game, &channel(&copy_mix, 0));
+    println!(
+        "copy Mix = {gain:.3} × source Game (residual {:.1} %)",
+        residual * 100.0
+    );
+    assert!((gain - 0.5).abs() < 0.02 && residual < 0.1);
+    // Independently, with Media Foundation's demuxer and decoder.
+    let (mf_source, _) = mf_audio(&source, "Game");
+    let (mf_copy, mf_channels) = mf_audio(&exported.path, "Game");
+    let (mf_mic, _) = mf_audio(&exported.path, "Microphone");
+    assert!(mf_mic.iter().all(|&s| s == 0), "MF: microphone muted");
+    let origin = first_sample_time(&movie);
+    let from = ((1.0 + origin) * 48_000.0).round() as usize * 2;
+    let left = |v: &[i16], skip: usize| {
+        v.iter()
+            .skip(skip)
+            .step_by(2)
+            .map(|&s| f64::from(s))
+            .collect::<Vec<_>>()
+    };
+    let (gain, residual) = fit(&left(&mf_source, from), &left(&mf_copy, 0));
+    println!(
+        "MF: copy Game = {gain:.3} × source Game (residual {:.1} %), {mf_channels} channels",
+        residual * 100.0
+    );
+    assert!((gain - 0.5).abs() < 0.02 && residual < 0.1);
+    let (frames, last) = decode_all_frames(&exported.path);
+    println!(
+        "MF decodes {frames} frames of the copy, last at {:.3} s",
+        last as f64 / 1e7
+    );
+
+    // (2b) A start between keyframes: the edit list hides the lead-in; the frame shown first is
+    // the source's frame at 1.5 s, byte for byte.
+    let half = run(
+        &source,
+        1.5,
+        3.5,
+        Gains {
+            game: 1.0,
+            mic: 1.0,
+        },
+        copy_to("edit"),
+        Options::default(),
+        None,
+    );
+    let half = half.exported.expect("copy 1.5–3.5");
+    println!("copy 1.5–3.5: {half:?}");
+    assert_eq!(
+        half.path,
+        dir.join(format!("{stem} (edit) (2).mp4")),
+        "collision → (2)"
+    );
+    let half_movie = demux::open(&half.path).expect("demux");
+    assert!(
+        (half_movie.duration - 2.0).abs() < 0.03,
+        "duration {}",
+        half_movie.duration
+    );
+    let shown_at = first_presented(&half_movie);
+    let lead_in = -half_movie.video().unwrap().sample_time(0);
+    println!(
+        "edit list hides {:.4} s, first presented frame at {shown_at} × 100 ns",
+        lead_in as f64 / 1e7
+    );
+    assert!((0..10_000).contains(&shown_at));
+    assert!(
+        lead_in > 0,
+        "the start is not on a keyframe: an edit list is needed"
+    );
+    let source_frame = frame_bytes(&source, &original, frame_at(&original, 15_000_000));
+    let shown = frame_bytes(&half.path, &half_movie, frame_at(&half_movie, 0));
+    assert_eq!(shown, source_frame, "first shown frame = source at 1.5 s");
+    // Gains at 1: the rebuilt Mix equals the source Mix (re-encoded).
+    let (gain, residual) = fit(
+        &channel(&our_audio(&source, "Mix", 1.5, 3.5), 0),
+        &channel(&our_audio(&half.path, "Mix", 0.0, 2.0), 0),
+    );
+    println!(
+        "gains 1: Mix = {gain:.3} × source Mix (residual {:.1} %)",
+        residual * 100.0
+    );
+    assert!((gain - 1.0).abs() < 0.03 && residual < 0.15);
+
+    // (3) Discord with a limit that forces a re-encode.
+    let max_bytes = 600_000;
+    let discord = run(
+        &source,
+        1.0,
+        5.0,
+        Gains {
+            game: 1.0,
+            mic: 1.0,
+        },
+        Destination::Discord {
+            dir: exports.clone(),
+            max_bytes,
+        },
+        Options::default(),
+        None,
+    );
+    let d = discord.exported.expect("discord export");
+    let speed = 4.0 / discord.seconds;
+    println!(
+        "discord: {d:?} in {:.2} s ({speed:.1}× real time), {} progress events",
+        discord.seconds,
+        discord.reports.len()
+    );
+    assert!(d.reencoded);
+    assert!(
+        d.size as f64 <= max_bytes as f64 * 0.95,
+        "{} > 95 % of {max_bytes}",
+        d.size
+    );
+    assert_eq!(d.path, exports.join(format!("{stem}.mp4")));
+    let d_movie = demux::open(&d.path).expect("demux discord");
+    assert!(
+        (d_movie.duration - 4.0).abs() < 0.05,
+        "duration {}",
+        d_movie.duration
+    );
+    let d_names: Vec<&str> = d_movie.audio().map(|t| t.header.name.as_str()).collect();
+    assert_eq!(d_names, ["Mix"]);
+    let (frames, last) = decode_all_frames(&d.path);
+    let d_video = d_movie.video().unwrap();
+    println!(
+        "MF decodes {frames}/{} frames, last at {:.3} s",
+        d_video.samples.len(),
+        last as f64 / 1e7
+    );
+    assert_eq!(frames, d_video.samples.len(), "every frame decodes");
+    assert!((118..=121).contains(&frames), "30 fps over 4 s: {frames}");
+    let d_info = probe::probe(&d.path).expect("probe discord");
+    println!("discord probe: {d_info:?}");
+    assert_eq!(d_info.fps, 30.0);
+    assert!(d_info.height <= 480);
+
+    // Discord with room to spare: the passthrough is kept, with its edit list, one Mix track.
+    let roomy = run(
+        &source,
+        1.5,
+        3.5,
+        Gains {
+            game: 1.0,
+            mic: 0.5,
+        },
+        Destination::Discord {
+            dir: exports.clone(),
+            max_bytes: 50_000_000,
+        },
+        Options::default(),
+        None,
+    );
+    let roomy = roomy.exported.expect("discord passthrough");
+    println!("discord passthrough: {roomy:?}");
+    assert!(!roomy.reencoded && roomy.size as f64 <= 50e6 * 0.95);
+    assert_eq!(
+        roomy.path,
+        exports.join(format!("{stem}.mp4")),
+        "replaces the previous export"
+    );
+    let roomy_movie = demux::open(&roomy.path).expect("demux");
+    assert_eq!(
+        roomy_movie
+            .audio()
+            .map(|t| t.header.name.as_str())
+            .collect::<Vec<_>>(),
+        ["Mix"]
+    );
+    assert!((roomy_movie.duration - 2.0).abs() < 0.03);
+    assert_eq!(
+        frame_bytes(&roomy.path, &roomy_movie, frame_at(&roomy_movie, 0)),
+        source_frame
+    );
+
+    // Fallback paths, each on 1 s.
+    for (name, options) in [
+        (
+            "software encoder",
+            Options {
+                software_encoder: true,
+                ..Options::default()
+            },
+        ),
+        (
+            "gpu scaling",
+            Options {
+                gpu_scaling: true,
+                ..Options::default()
+            },
+        ),
+        (
+            "software decoding",
+            Options {
+                software_decoding: true,
+                ..Options::default()
+            },
+        ),
+        (
+            "software decoding + encoder",
+            Options {
+                software_decoding: true,
+                software_encoder: true,
+                gpu_scaling: false,
+            },
+        ),
+    ] {
+        let fallback_dir = exports.join("fallback");
+        let r = run(
+            &source,
+            2.0,
+            3.0,
+            Gains {
+                game: 1.0,
+                mic: 1.0,
+            },
+            Destination::Discord {
+                dir: fallback_dir.clone(),
+                max_bytes: 200_000,
+            },
+            options,
+            None,
+        );
+        let e = r.exported.unwrap_or_else(|code| panic!("{name}: {code}"));
+        let (frames, _) = decode_all_frames(&e.path);
+        println!(
+            "{name}: {} bytes in {:.2} s, {frames} frames decode, {}",
+            e.size, r.seconds, e.detail
+        );
+        assert!(e.reencoded && (29..=31).contains(&frames), "{name}");
+        if !keep {
+            let _ = std::fs::remove_file(&e.path);
+        }
+    }
+
+    // (4) Cancel midway: during the re-encode, and during the audio encoding of a copy (the
+    // write itself is covered by a unit test: progress events are too sparse to hit it).
+    let before = files(&exports);
+    let cancelled = run(
+        &source,
+        0.0,
+        5.0,
+        Gains {
+            game: 1.0,
+            mic: 1.0,
+        },
+        Destination::Discord {
+            dir: exports.clone(),
+            max_bytes: 500_000,
+        },
+        Options::default(),
+        Some(0.4),
+    );
+    println!(
+        "cancelled discord after {:.2} s at {:?}",
+        cancelled.seconds,
+        cancelled.reports.last()
+    );
+    assert_eq!(cancelled.exported.err(), Some(CANCELLED));
+    assert_eq!(files(&exports), before, "nothing left behind");
+    let before = files(&dir);
+    let cancelled = run(
+        &source,
+        0.0,
+        5.0,
+        Gains {
+            game: 1.0,
+            mic: 1.0,
+        },
+        copy_to("edit"),
+        Options::default(),
+        // On the first report: the copy is too quick for later ones (100 ms apart).
+        Some(0.0),
+    );
+    println!(
+        "cancelled copy after {:.2} s at {:?}",
+        cancelled.seconds,
+        cancelled.reports.last()
+    );
+    assert_eq!(cancelled.exported.err(), Some(CANCELLED));
+    assert_eq!(files(&dir), before, "nothing left behind");
+
+    if seconds >= 20 {
+        let full = f64::from(seconds);
+        for (name, destination) in [
+            ("full copy", copy_to("edit")),
+            (
+                "full discord 10 MB",
+                Destination::Discord {
+                    dir: exports.clone(),
+                    max_bytes: 10_000_000,
+                },
+            ),
+            (
+                "full discord 50 MB",
+                Destination::Discord {
+                    dir: exports.clone(),
+                    max_bytes: 50_000_000,
+                },
+            ),
+        ] {
+            let r = run(
+                &source,
+                0.0,
+                full,
+                Gains {
+                    game: 1.0,
+                    mic: 1.0,
+                },
+                destination,
+                Options::default(),
+                None,
+            );
+            let e = r.exported.unwrap_or_else(|code| panic!("{name}: {code}"));
+            println!(
+                "{name}: {} bytes in {:.2} s ({:.1}× real time), reencoded {}, {}",
+                e.size,
+                r.seconds,
+                full / r.seconds,
+                e.reencoded,
+                e.detail
+            );
+            if !keep && !e.path.starts_with(&exports) {
+                let _ = std::fs::remove_file(&e.path);
+            }
+        }
+    }
+
+    println!("---- editor end-to-end ----");
+    println!("source {} bytes, {:.2} s", source_size, info.duration);
+    println!(
+        "copy 1.0–3.5: {} bytes in {:.2} s",
+        exported.size, copy.seconds
+    );
+    println!(
+        "discord 1.0–5.0: {} bytes in {:.2} s ({speed:.1}× real time)",
+        d.size, discord.seconds
+    );
+    if !keep {
+        let _ = std::fs::remove_file(&source);
+        let _ = std::fs::remove_file(&half.path);
+        let _ = std::fs::remove_dir_all(&exports);
+        println!("kept {}", exported.path.display());
+    }
+}
+
+/// Timeline time (seconds) of the first sample of the copy's video: minus the hidden lead-in.
+fn first_sample_time(movie: &Movie) -> f64 {
+    movie.video().unwrap().sample_time(0) as f64 / 1e7
+}
+
+// ---- Synthetic clip: every frame shows its own index, beeps every 0.25 s. ----
+
+const SYN_W: u32 = 1280;
+const SYN_H: u32 = 720;
+const SYN_FPS: u32 = 60;
+const SYN_FRAMES: u32 = 300;
+const BITS: u32 = 9;
+
+/// NV12 frame `k`: the top quarter shows `k` in binary (9 blocks, white = 1), then noise, and a
+/// bar moves across the lower half.
+fn pattern(k: u32) -> Vec<u8> {
+    let (w, h) = (SYN_W as usize, SYN_H as usize);
+    let mut frame = vec![128u8; w * h * 3 / 2];
+    for y in 0..h {
+        for x in 0..w {
+            frame[y * w + x] = if y < h / 4 {
+                let bit = x * BITS as usize / w;
+                if (k >> bit) & 1 == 1 { 235 } else { 16 }
+            } else if (x + w - (k as usize * 8) % w) % w < 64 {
+                200
+            } else if y < h / 2 {
+                // Noise that changes every frame: makes the passthrough expensive (8 Mbit/s),
+                // so small Discord limits force a re-encode.
+                let mut v = (x as u32 ^ (y as u32) << 11 ^ k << 22).wrapping_mul(0x9E37_79B9);
+                v ^= v >> 15;
+                (v.wrapping_mul(0x85EB_CA6B) >> 24) as u8
+            } else {
+                60
+            };
+        }
+    }
+    frame
+}
+
+/// Reads the index back from a grey image (any size): block centres of the top band.
+fn read_index(luma: impl Fn(usize, usize) -> u8, w: usize, h: usize) -> u32 {
+    (0..BITS)
+        .map(|bit| {
+            let x = (bit as usize * 2 + 1) * w / (2 * BITS as usize);
+            u32::from(luma(x, h / 8) > 128) << bit
+        })
+        .sum()
+}
+
+/// 5 s at 60 fps (software encoder, keyframe every second) with a 20 ms 1 kHz beep at every
+/// multiple of 0.25 s on a "Game" track.
+fn synthetic_clip(path: &Path) {
+    use crate::media::aac::{self, AacConfig};
+    use crate::media::h264::{Frame, H264Config, H264Encoder};
+    use crate::media::mp4_writer::{
+        self, AudioTrack, Options as MuxOptions, VideoSample, VideoTrack,
+    };
+    let config = H264Config {
+        width: SYN_W,
+        height: SYN_H,
+        fps: SYN_FPS,
+        bitrate: 8_000_000,
+    };
+    let mut encoder = H264Encoder::software(config).expect("encoder");
+    let mut packets = Vec::new();
+    for k in 0..SYN_FRAMES {
+        let pts = i64::from(k) * TICKS_PER_SECOND / i64::from(SYN_FPS);
+        assert!(
+            encoder
+                .encode(Frame::Nv12(&pattern(k)), pts, &mut packets)
+                .expect("encode")
+        );
+    }
+    encoder.drain(&mut packets).expect("drain");
+    let (sps, pps) = encoder.parameter_sets().expect("parameter sets");
+    let seconds = SYN_FRAMES as usize / SYN_FPS as usize;
+    let mut pcm = vec![0i16; 48_000 * seconds * 2];
+    for beep in 0..seconds * 4 {
+        for i in 0..960 {
+            let v = ((2.0 * std::f64::consts::PI * 1000.0 * i as f64 / 48_000.0).sin() * 10_000.0)
+                as i16;
+            let at = (beep * 12_000 + i) * 2;
+            pcm[at] = v;
+            pcm[at + 1] = v;
+        }
+    }
+    let config = AacConfig {
+        sample_rate: 48_000,
+        channels: 2,
+        bitrate: 160_000,
+    };
+    let stream = aac::encode(&pcm, config).expect("aac");
+    let video = VideoTrack {
+        sps,
+        pps,
+        samples: packets
+            .iter()
+            .map(|p| VideoSample {
+                data: &p.data,
+                pts: p.pts,
+                keyframe: p.keyframe,
+            })
+            .collect(),
+        last_duration: TICKS_PER_SECOND / i64::from(SYN_FPS),
+    };
+    let audio = AudioTrack {
+        name: "Game",
+        sample_rate: 48_000,
+        channels: 2,
+        bitrate: 160_000,
+        asc: &stream.asc,
+        frames: stream.frames.iter().map(Vec::as_slice).collect(),
+    };
+    mp4_writer::write_file(path, &video, &[audio], &MuxOptions::default(), true).expect("mux");
+}
+
+/// (timestamp, index) of every frame Media Foundation decodes (no edit list applied).
+fn decoded_indices(path: &Path) -> Vec<(i64, u32)> {
+    use windows::Win32::Media::MediaFoundation::{IMF2DBuffer, MF_MT_FRAME_SIZE};
+    use windows::core::Interface;
+    let mut out = Vec::new();
+    // SAFETY: Source Reader on our own file; NV12 frames read with their pitch.
+    unsafe {
+        let reader =
+            MFCreateSourceReaderFromURL(&HSTRING::from(path.as_os_str()), None).expect("reader");
+        let video = MF_SOURCE_READER_FIRST_VIDEO_STREAM.0.cast_unsigned();
+        reader
+            .SetStreamSelection(MF_SOURCE_READER_ALL_STREAMS.0.cast_unsigned(), false)
+            .expect("deselect");
+        reader.SetStreamSelection(video, true).expect("select");
+        let ty = media_type(&MFMediaType_Video, &MFVideoFormat_NV12).expect("type");
+        reader.SetCurrentMediaType(video, None, &ty).expect("nv12");
+        let size = reader
+            .GetCurrentMediaType(video)
+            .expect("current")
+            .GetUINT64(&MF_MT_FRAME_SIZE)
+            .expect("size");
+        let (w, h) = ((size >> 32) as usize, (size as u32) as usize);
+        loop {
+            let (mut flags, mut time) = (0u32, 0i64);
+            let mut sample = None;
+            reader
+                .ReadSample(
+                    video,
+                    0,
+                    None,
+                    Some(&mut flags),
+                    Some(&mut time),
+                    Some(&mut sample),
+                )
+                .expect("read");
+            if let Some(sample) = sample {
+                let buffer = sample.GetBufferByIndex(0).expect("buffer");
+                let planar = buffer.cast::<IMF2DBuffer>().expect("2d buffer");
+                let (mut scan0, mut pitch) = (std::ptr::null_mut(), 0i32);
+                planar.Lock2D(&mut scan0, &mut pitch).expect("lock");
+                let index = read_index(|x, y| *scan0.add(y * pitch as usize + x), w, h);
+                planar.Unlock2D().expect("unlock");
+                out.push((time, index));
+            }
+            if flags & MF_SOURCE_READERF_ENDOFSTREAM.0.cast_unsigned() != 0 {
+                return out;
+            }
+        }
+    }
+}
+
+/// The first beep (every 0.25 s on the source) at or after `start`, past the output's first
+/// AAC frame: a stream's first frame decodes with a ~10 ms fade-in (nothing to overlap with),
+/// so a beep right at 0 is not a fair timing probe.
+fn expected_beep(start: f64) -> f64 {
+    const FIRST_FRAME: f64 = 1024.0 / 48_000.0;
+    ((start + FIRST_FRAME) / 0.25).ceil() * 0.25 - start
+}
+
+fn first_onset_after(pcm: &Pcm, from: f64) -> f64 {
+    beep_onsets(pcm)
+        .into_iter()
+        .find(|&t| t >= from - 0.002)
+        .expect("a beep")
+}
+
+/// Onsets (seconds) of the beeps in the first channel.
+fn beep_onsets(pcm: &Pcm) -> Vec<f64> {
+    let left = channel(pcm, 0);
+    let mut onsets = Vec::new();
+    let mut quiet = 480;
+    for (i, &v) in left.iter().enumerate() {
+        if v.abs() > 1500.0 {
+            if quiet >= 480 {
+                onsets.push(i as f64 / 48_000.0);
+            }
+            quiet = 0;
+        } else {
+            quiet += 1;
+        }
+    }
+    onsets
+}
+
+#[test]
+#[ignore = "needs Media Foundation and the GPU; run with --ignored"]
+fn editor_timing_synthetic() {
+    let _com = ComGuard::new();
+    let _mf = MfGuard::new().expect("media foundation");
+    let dir = std::env::var_os("KRYO_EDITOR_OUT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| std::env::temp_dir().join("kryo-editor-e2e"))
+        .join("synthetic");
+    let keep = std::env::var_os("KRYO_EDITOR_KEEP").is_some();
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("dir");
+    let source = dir.join("Synthetic.mp4");
+    synthetic_clip(&source);
+    let indices = decoded_indices(&source);
+    assert_eq!(indices.len(), SYN_FRAMES as usize);
+    assert!(
+        indices.iter().enumerate().all(|(k, &(_, i))| i == k as u32),
+        "pattern reads back"
+    );
+    let unity = Gains {
+        game: 1.0,
+        mic: 1.0,
+    };
+    let exports = dir.join("exports");
+    let discord = || Destination::Discord {
+        dir: exports.clone(),
+        max_bytes: 250_000,
+    };
+
+    // Re-encodes (Discord sizes): output frame n (30 fps) shows the source frame visible at
+    // start + n/30, the beeps stay where they were relative to start.
+    for (start, end, first_frame) in [
+        (1.0, 3.0, 60u32),
+        (1.508, 3.0, 90),
+        (1.495, 3.0, 89),
+        (0.0, 1.0, 0),
+    ] {
+        let r = run(
+            &source,
+            start,
+            end,
+            unity,
+            discord(),
+            Options::default(),
+            None,
+        );
+        let e = r
+            .exported
+            .unwrap_or_else(|c| panic!("re-encode {start}: {c}"));
+        assert!(e.reencoded);
+        let frames = decoded_indices(&e.path);
+        let expected: Vec<u32> = (0..frames.len() as u32)
+            .map(|n| first_frame + 2 * n)
+            .collect();
+        let got: Vec<u32> = frames.iter().map(|&(_, i)| i).collect();
+        println!(
+            "re-encode {start}..{end}: {} frames, first {:?}, {}",
+            frames.len(),
+            &got[..4],
+            e.detail
+        );
+        assert_eq!(
+            got, expected,
+            "frame n shows source frame {first_frame} + 2n"
+        );
+        assert!(
+            frames
+                .iter()
+                .enumerate()
+                .all(|(n, &(t, _))| (t - n as i64 * TICKS_PER_SECOND / 30).abs() < 10),
+            "30 fps timestamps"
+        );
+        let pcm = our_audio(&e.path, "", 0.0, end - start);
+        let beep = expected_beep(start);
+        let onset = first_onset_after(&pcm, beep);
+        println!("  beeps at {:?}", &beep_onsets(&pcm)[..4]);
+        assert!(
+            (onset - beep).abs() < 0.0002,
+            "beep at {onset} instead of {beep}"
+        );
+        let _ = std::fs::remove_file(&e.path);
+    }
+
+    // Passthrough copies: the first presented frame (our timeline = what ffmpeg shows) is the
+    // one at or just after `start`; then re-encoding that copy must see the same timeline
+    // although Media Foundation ignores its edit list.
+    for (start, shown) in [(1.5, 90u32), (1.508, 91), (2.0, 120)] {
+        let r = run(
+            &source,
+            start,
+            4.0,
+            unity,
+            copy_to("edit"),
+            Options::default(),
+            None,
+        );
+        let copy = r.exported.unwrap_or_else(|c| panic!("copy {start}: {c}"));
+        let movie = demux::open(&copy.path).expect("demux");
+        let mf = decoded_indices(&copy.path);
+        let video = movie.video().unwrap();
+        let first = frame_at(&movie, 0);
+        println!(
+            "copy from {start}: lead-in {:.4} s, first presented frame #{first} = source {}",
+            -video.sample_time(0) as f64 / 1e7,
+            mf[first].1
+        );
+        assert_eq!(mf[first].1, shown);
+        // The lead-in hidden by the edit list carries the fade-in: even a beep right at 0 is
+        // whole when it is at least one AAC frame after the keyframe.
+        let pcm = our_audio(&copy.path, "", 0.0, 4.0 - start);
+        let beep = expected_beep(start);
+        let onset = first_onset_after(&pcm, beep);
+        println!("  beeps at {:?}", &beep_onsets(&pcm)[..4]);
+        assert!(
+            (onset - beep).abs() < 0.0002,
+            "copy beep at {onset} instead of {beep}"
+        );
+
+        // Re-encode of the edit-listed copy, from 0.25 s into it.
+        let again = run(
+            &copy.path,
+            0.25,
+            1.25,
+            unity,
+            discord(),
+            Options::default(),
+            None,
+        );
+        let again = again.exported.expect("re-encode of the copy");
+        let frames = decoded_indices(&again.path);
+        // The source frame visible at start + 0.25 s (or the next one when start is between
+        // frames: the copy's own timeline starts at its first shown frame).
+        let visible = ((start + 0.25) * 60.0 + 1e-6).floor() as u32;
+        let first_frames: Vec<u32> = frames.iter().take(3).map(|f| f.1).collect();
+        println!(
+            "  re-encode of the copy from 0.25 s: first frames {first_frames:?} (source frame visible: {visible})"
+        );
+        assert!(
+            frames[0].1 == visible || frames[0].1 == visible + 1,
+            "first frame {}",
+            frames[0].1
+        );
+        let pcm = our_audio(&again.path, "", 0.0, 1.0);
+        let beep = expected_beep(start + 0.25);
+        let onset = first_onset_after(&pcm, beep);
+        assert!(
+            (onset - beep).abs() < 0.0002,
+            "re-encoded copy beep at {onset} instead of {beep}"
+        );
+        if !keep {
+            let _ = std::fs::remove_file(&copy.path);
+            let _ = std::fs::remove_file(&again.path);
+        }
+    }
+    if !keep {
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// First beep onset (seconds) of audio track `nth` of an export, decoded by Media Foundation
+/// when the file is not ours to demux (it only applies to re-encoded outputs: no edit list).
+fn export_beep(path: &Path, from: f64) -> f64 {
+    let (pcm, channels) = testing::decode_audio(path, 0);
+    let pcm = Pcm {
+        samples: pcm,
+        channels: channels as u16,
+    };
+    first_onset_after(&pcm, from)
+}
+
+/// Media Foundation's timestamps of the first two samples of the first audio stream.
+fn first_audio_timestamps(path: &Path) -> Vec<i64> {
+    use windows::Win32::Media::MediaFoundation::MF_SOURCE_READER_FIRST_AUDIO_STREAM;
+    let mut out = Vec::new();
+    // SAFETY: Source Reader on a sample file, compressed samples.
+    unsafe {
+        let reader =
+            MFCreateSourceReaderFromURL(&HSTRING::from(path.as_os_str()), None).expect("reader");
+        let audio = MF_SOURCE_READER_FIRST_AUDIO_STREAM.0.cast_unsigned();
+        reader
+            .SetStreamSelection(MF_SOURCE_READER_ALL_STREAMS.0.cast_unsigned(), false)
+            .expect("deselect");
+        reader.SetStreamSelection(audio, true).expect("select");
+        while out.len() < 2 {
+            let (mut flags, mut time) = (0u32, 0i64);
+            let mut sample = None;
+            reader
+                .ReadSample(
+                    audio,
+                    0,
+                    None,
+                    Some(&mut flags),
+                    Some(&mut time),
+                    Some(&mut sample),
+                )
+                .expect("read");
+            if sample.is_some() {
+                out.push(time);
+            }
+            if flags & MF_SOURCE_READERF_ENDOFSTREAM.0.cast_unsigned() != 0 {
+                break;
+            }
+        }
+    }
+    out
+}
+
+/// Third-party files made by `make_samples.py` (ffmpeg): 6 s at 30 fps, the frame index drawn
+/// in binary, a beep every 0.25 s. `KRYO_EDITOR_SAMPLES` is their folder.
+#[test]
+#[ignore = "needs sample files (KRYO_EDITOR_SAMPLES) and the GPU; run with --ignored"]
+fn editor_third_party() {
+    let _com = ComGuard::new();
+    let _mf = MfGuard::new().expect("media foundation");
+    let samples =
+        PathBuf::from(std::env::var_os("KRYO_EDITOR_SAMPLES").expect("KRYO_EDITOR_SAMPLES"));
+    let out = samples.join("out");
+    let _ = std::fs::remove_dir_all(&out);
+    std::fs::create_dir_all(&out).expect("out");
+    let unity = Gains {
+        game: 1.0,
+        mic: 1.0,
+    };
+    let mut failures = Vec::new();
+    for source in files(&samples) {
+        let name = source.file_name().unwrap().to_string_lossy().into_owned();
+        // Work on a copy so the outputs land in `out`.
+        let input = out.join(&name);
+        std::fs::copy(&source, &input).expect("copy sample");
+        println!(
+            "==== {name}: MF first audio timestamps {:?}",
+            first_audio_timestamps(&input)
+        );
+        match probe::probe(&input) {
+            Ok(info) => {
+                println!("probe: {info:?}");
+                assert!(
+                    (info.duration - 6.0).abs() < 0.1,
+                    "{name}: duration {}",
+                    info.duration
+                );
+                assert_eq!(
+                    (info.width, info.height, info.fps),
+                    (1280, 720, 30.0),
+                    "{name}"
+                );
+                assert_eq!(info.audio_tracks.len(), 1, "{name}");
+            }
+            Err(code) => {
+                println!("probe failed: {code}");
+                failures.push(format!("{name}: probe {code}"));
+                continue;
+            }
+        }
+        for (label, destination) in [
+            ("copy", copy_to("edit")),
+            (
+                "discord",
+                Destination::Discord {
+                    dir: out.join("exports"),
+                    max_bytes: 150_000,
+                },
+            ),
+        ] {
+            let started = Instant::now();
+            let r = run(
+                &input,
+                1.0,
+                3.0,
+                unity,
+                destination,
+                Options::default(),
+                None,
+            );
+            let e = match r.exported {
+                Ok(e) => e,
+                Err(code) => {
+                    println!("{label}: failed with {code}");
+                    failures.push(format!("{name}: {label} {code}"));
+                    continue;
+                }
+            };
+            let frames = decoded_indices(&e.path);
+            let shown: Vec<u32> = frames.iter().map(|f| f.1).collect();
+            let movie = demux::open(&e.path).expect("our output");
+            println!(
+                "{label}: {} bytes, reencoded {}, {:.2} s, duration {:.3}, frames {:?}..., {}",
+                e.size,
+                e.reencoded,
+                started.elapsed().as_secs_f64(),
+                movie.duration,
+                &shown[..shown.len().min(4)],
+                e.detail
+            );
+            assert!(
+                (movie.duration - 2.0).abs() < 0.05,
+                "{name} {label}: duration {}",
+                movie.duration
+            );
+            // Source frame visible at 1.0 s is #30, then one per output frame (30 fps).
+            let first = frame_at(&movie, 0);
+            let expected: Vec<u32> = (0..(shown.len() - first) as u32).map(|n| 30 + n).collect();
+            assert_eq!(&shown[first..], &expected[..], "{name} {label}: frames");
+            let beep = expected_beep(1.0);
+            let onset = if e.reencoded || movie.video().is_some_and(|v| v.sample_time(0) == 0) {
+                export_beep(&e.path, beep)
+            } else {
+                first_onset_after(&our_audio(&e.path, "", 0.0, 2.0), beep)
+            };
+            println!(
+                "{label}: beep at {onset:.5} s (expected {beep:.5}, off by {:.1} ms)",
+                (onset - beep) * 1000.0
+            );
+            // MP4 timing is ours (edit lists applied); other containers' is Media Foundation's,
+            // which does not skip the codec's priming (one AAC frame, Opus pre-skip).
+            let tolerance = if demux::open(&input).is_some() {
+                0.0005
+            } else {
+                0.025
+            };
+            assert!(
+                (onset - beep).abs() < tolerance,
+                "{name} {label}: beep at {onset}"
+            );
+        }
+    }
+    println!("failures: {failures:?}");
+    let _ = std::fs::remove_dir_all(&out);
+}
