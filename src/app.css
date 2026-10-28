@@ -1,22 +1,72 @@
 :root {
-  --nuit: #0b1020;
-  --nuit-2: #0f1629;
-  --nuit-3: #151d35;
-  --line: rgba(154, 168, 194, 0.12);
-  --line-strong: rgba(154, 168, 194, 0.22);
-  --cyan: #4fc3f7;
-  --cyan-soft: rgba(79, 195, 247, 0.12);
-  --glace: #b8ecfb;
-  --givre: #e6fbff;
-  --gris: #9aa8c2;
-  --gris-2: #6b7894;
+  /* Surfaces: neutral graphite, from the canvas up to popovers. */
+  --bg: #0a0b0d;
+  --bg-raised: #0e0f12;
+  --surface: #131418;
+  --surface-2: #191a1f;
+  --surface-3: #212228;
+  --border: rgba(255, 255, 255, 0.06);
+  --border-strong: rgba(255, 255, 255, 0.1);
 
-  --font-ui: 'Space Grotesk Variable', system-ui, sans-serif;
-  --font-display: 'Unbounded Variable', var(--font-ui);
-  --radius: 14px;
-  --ease: cubic-bezier(0.2, 0.8, 0.2, 1);
+  --text: #ededef;
+  --text-2: #a1a2a9;
+  --text-3: #6e6f77;
+
+  /* One accent, used sparingly. Overridden by [data-accent]. */
+  --accent: #5aa9ff;
+  --accent-fg: #04111f;
+  --accent-soft: color-mix(in srgb, var(--accent) 14%, transparent);
+  --accent-line: color-mix(in srgb, var(--accent) 45%, transparent);
+
+  --danger: #f0565c;
+  --success: #3dd68c;
+  --rec: #ff4f5e;
+
+  /* Brand colors of the logo: fixed, whatever the accent. */
+  --face: #1aa0e6;
+  --glace: #e8fbff;
+
+  --font-ui: 'Inter Variable', 'Segoe UI Variable Text', system-ui, sans-serif;
+  --font-brand: 'Unbounded Variable', var(--font-ui);
+
+  --radius-sm: 6px;
+  --radius: 10px;
+  --radius-lg: 14px;
+
+  --ease-out: cubic-bezier(0.16, 1, 0.3, 1);
+  --ease-in-out: cubic-bezier(0.65, 0, 0.35, 1);
+  --fast: 120ms;
+  --normal: 200ms;
+  --slow: 320ms;
+
+  --shadow-pop: 0 0 0 1px var(--border-strong), 0 16px 40px -12px rgba(0, 0, 0, 0.7);
+
+  --titlebar: 44px;
+  --sidebar: 244px;
+  --sidebar-collapsed: 64px;
 
   color-scheme: dark;
+}
+
+:root[data-accent='aurora'] {
+  --accent: #9a8cff;
+  --accent-fg: #0e0a24;
+}
+:root[data-accent='jade'] {
+  --accent: #3fd49a;
+  --accent-fg: #03170f;
+}
+:root[data-accent='ember'] {
+  --accent: #ff9152;
+  --accent-fg: #1f0c02;
+}
+:root[data-accent='rose'] {
+  --accent: #ff7aa2;
+  --accent-fg: #22050f;
+}
+:root[data-accent='frost'] {
+  --accent: #e6e8ec;
+  --accent-fg: #0a0b0d;
 }
 
 * {
@@ -27,13 +77,22 @@ html,
 body {
   margin: 0;
   height: 100%;
-  background: var(--nuit);
-  color: var(--givre);
+  background: var(--bg);
+  color: var(--text);
   font-family: var(--font-ui);
-  font-size: 15px;
+  font-size: 14px;
+  line-height: 1.45;
+  font-feature-settings: 'cv11', 'ss03';
   -webkit-font-smoothing: antialiased;
   user-select: none;
   overflow: hidden;
+}
+
+h1,
+h2,
+h3,
+p {
+  margin: 0;
 }
 
 button,
@@ -49,29 +108,87 @@ button {
   border: 0;
   padding: 0;
 }
+button:disabled {
+  cursor: default;
+}
 
+input {
+  user-select: text;
+}
+
+:focus {
+  outline: none;
+}
 :focus-visible {
-  outline: 2px solid var(--cyan);
+  outline: 2px solid var(--accent);
   outline-offset: 2px;
 }
 
 kbd {
+  display: inline-flex;
+  align-items: center;
   font-family: var(--font-ui);
-  font-size: 12px;
+  font-size: 11px;
   font-weight: 600;
-  padding: 2px 7px;
-  border-radius: 6px;
-  border: 1px solid var(--line-strong);
+  line-height: 1;
+  height: 20px;
+  padding: 0 6px;
+  border-radius: 5px;
+  border: 1px solid var(--border-strong);
   border-bottom-width: 2px;
-  background: var(--nuit-3);
-  color: var(--givre);
+  background: var(--surface-2);
+  color: var(--text-2);
+}
+
+::selection {
+  background: var(--accent-soft);
+}
+
+.tooltip {
+  position: fixed;
+  z-index: 100;
+  pointer-events: none;
+  padding: 5px 9px;
+  border-radius: var(--radius-sm);
+  background: var(--surface-3);
+  box-shadow: var(--shadow-pop);
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 500;
+  white-space: nowrap;
+  opacity: 0;
+  transform: translateX(-4px);
+  transition:
+    opacity var(--fast) var(--ease-out),
+    transform var(--normal) var(--ease-out);
+}
+.tooltip:not([data-side='right']) {
+  transform: translateY(-3px);
+}
+.tooltip.on {
+  opacity: 1;
+  transform: none;
 }
 
 ::-webkit-scrollbar {
-  width: 10px;
+  width: 12px;
+  height: 12px;
 }
 ::-webkit-scrollbar-thumb {
-  background: var(--line-strong);
-  border-radius: 10px;
-  border: 3px solid var(--nuit);
+  background: rgba(255, 255, 255, 0.08);
+  border-radius: 12px;
+  border: 4px solid transparent;
+  background-clip: padding-box;
+}
+::-webkit-scrollbar-thumb:hover {
+  background-color: rgba(255, 255, 255, 0.14);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+  }
 }
