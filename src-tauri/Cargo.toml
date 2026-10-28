@@ -20,11 +20,51 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = [] }
+tauri = { version = "2", features = ["protocol-asset", "tray-icon"] }
+tauri-plugin-autostart = "2.7.0"
+tauri-plugin-dialog = "2.8.4"
+tauri-plugin-global-shortcut = "2.4.1"
 tauri-plugin-opener = "2"
+tauri-plugin-process = "2"
+tauri-plugin-single-instance = "2.5.5"
+tauri-plugin-updater = "2"
+tauri-plugin-window-state = "2.5.0"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+notify-debouncer-mini = "0.7.0"
+sys-locale = "0.3.2"
+trash = { version = "5.2.9", default-features = false, features = ["coinit_apartmentthreaded"] }
 
+[target.'cfg(windows)'.dependencies]
+clipboard-win = "5.4.3"
+# Same version as Tauri's own (already in Cargo.lock): capture engine (D3D11, DXGI duplication,
+# Media Foundation, WASAPI) and the few Win32 calls around it.
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D10",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Graphics_Gdi",
+    "Win32_Media",
+    "Win32_Media_Audio",
+    "Win32_Media_KernelStreaming",
+    "Win32_Media_MediaFoundation",
+    "Win32_Media_Multimedia",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Memory",
+    "Win32_System_Ole",
+    "Win32_System_Performance",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+    "Win32_System_Variant",
+    "Win32_UI_HiDpi",
+    "Win32_UI_WindowsAndMessaging",
+] }
 
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration
 [profile.release]

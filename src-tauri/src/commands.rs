@@ -1,0 +1,388 @@
+//! Tauri commands called by the frontend. Errors are short snake_case codes the UI translates.
+
+use std::collections::BTreeSet;
+use std::fs;
+use std::path::{Path, PathBuf};
+
+use tauri::{AppHandle, Emitter, Manager};
+use tauri_plugin_dialog::DialogExt;
+use tauri_plugin_opener::OpenerExt;
+
+use crate::capture::CaptureStatus;
+use crate::editor::export::{self, Destination};
+use crate::editor::{
+    EXPORT_PROGRESS, ExportProgress, ExportRequest, ExportResult, ExportSlot, INVALID_REQUEST,
+    Progress, ShardInfo, Target, WRITE_FAILED,
+};
+use crate::library::{self, NOT_FOUND, Shard};
+use crate::media::{ComGuard, MfGuard};
+use crate::settings::{Settings, SettingsPatch};
+use crate::state::{AppState, lock};
+use crate::{clipboard, editor, i18n, names, replay, shell, update, window};
+
+type CmdResult<T> = Result<T, String>;
+
+const INTERNAL: &str = "internal";
+
+/// Runs filesystem-heavy work on the blocking pool.
+async fn blocking<T: Send + 'static>(
+    f: impl FnOnce() -> Result<T, &'static str> + Send + 'static,
+) -> CmdResult<T> {
+    tauri::async_runtime::spawn_blocking(f)
+        .await
+        .map_err(|_| INTERNAL.to_string())?
+        .map_err(String::from)
+}
+
+/// Runs Media Foundation work on a fresh thread with COM (MTA) and Media Foundation started,
+/// so no runtime or shell thread ever gets its COM apartment changed.
+async fn media_thread<T: Send + 'static>(
+    name: &str,
+    f: impl FnOnce() -> Result<T, &'static str> + Send + 'static,
+) -> CmdResult<T> {
+    let (tx, mut rx) = tauri::async_runtime::channel(1);
+    std::thread::Builder::new()
+        .name(name.into())
+        .spawn(move || {
+            let result = {
+                let _com = ComGuard::new();
+                match MfGuard::new() {
+                    Ok(_mf) => f(),
+                    Err(_) => Err(editor::UNSUPPORTED),
+                }
+            };
+            let _ = tx.blocking_send(result);
+        })
+        .map_err(|_| INTERNAL.to_string())?;
+    rx.recv()
+        .await
+        .ok_or_else(|| INTERNAL.to_string())?
+        .map_err(String::from)
+}
+
+#[tauri::command]
+pub async fn get_settings(app: AppHandle) -> CmdResult<Settings> {
+    Ok(app.state::<AppState>().settings())
+}
+
+#[tauri::command]
+pub async fn update_settings(app: AppHandle, patch: SettingsPatch) -> CmdResult<Settings> {
+    update::apply(&app, patch).await.map_err(String::from)
+}
+
+/// Native folder picker; `None` when cancelled.
+#[tauri::command]
+pub async fn choose_clips_dir(app: AppHandle) -> CmdResult<Option<Settings>> {
+    let current = app.state::<AppState>().settings();
+    let (tx, mut rx) = tauri::async_runtime::channel(1);
+    let mut dialog = app
+        .dialog()
+        .file()
+        .set_title(i18n::labels(current.language).choose_clips_dir)
+        .set_directory(&current.clips_dir);
+    if let Some(main) = app.get_webview_window(window::MAIN) {
+        dialog = dialog.set_parent(&main);
+    }
+    dialog.pick_folder(move |picked| {
+        let _ = tx.try_send(picked);
+    });
+    let Some(Some(picked)) = rx.recv().await else {
+        return Ok(None);
+    };
+    let dir = picked
+        .into_path()
+        .map_err(|_| update::INVALID_DIR.to_string())?;
+    let patch = SettingsPatch {
+        clips_dir: Some(dir.to_string_lossy().into_owned()),
+        ..SettingsPatch::default()
+    };
+    update::apply(&app, patch)
+        .await
+        .map(Some)
+        .map_err(String::from)
+}
+
+#[tauri::command]
+pub async fn list_shards(app: AppHandle) -> CmdResult<Vec<Shard>> {
+    blocking(move || {
+        let state = app.state::<AppState>();
+        let dir = state.clips_dir();
+        let favorites = lock(&state.meta).favorites.clone();
+        Ok(library::scan(&dir, &favorites, &mut lock(&state.durations)))
+    })
+    .await
+}
+
+/// Renames the clip file (same folder, same extension) and carries its favorite over.
+#[tauri::command]
+pub async fn rename_shard(app: AppHandle, id: String, title: String) -> CmdResult<Shard> {
+    blocking(move || {
+        let state = app.state::<AppState>();
+        let dir = state.clips_dir();
+        let source = library::resolve_id(&dir, &id)?;
+        let stem = names::sanitize_title(&title).ok_or("invalid_name")?;
+        let extension = source
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or_default();
+        let file_name = format!("{stem}.{extension}");
+        let target = source.with_file_name(&file_name);
+
+        if target != source {
+            // A case-only rename points at the same file on Windows and is allowed.
+            if target.exists() && !same_file(&source, &target) {
+                return Err("exists");
+            }
+            fs::rename(&source, &target).map_err(|err| match err.kind() {
+                std::io::ErrorKind::NotFound => NOT_FOUND,
+                std::io::ErrorKind::AlreadyExists => "exists",
+                _ => "rename_failed",
+            })?;
+        }
+
+        let new_id = library::sibling_id(&id, &file_name);
+        let favorites = {
+            let mut meta = lock(&state.meta);
+            if new_id != id && meta.favorites.remove(&id) {
+                meta.favorites.insert(new_id.clone());
+                let _ = meta.save(&state.meta_path);
+            }
+            meta.favorites.clone()
+        };
+        library::shard(&dir, &new_id, &favorites, &mut lock(&state.durations))
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn set_favorite(app: AppHandle, id: String, favorite: bool) -> CmdResult<Shard> {
+    blocking(move || {
+        let state = app.state::<AppState>();
+        let dir = state.clips_dir();
+        library::resolve_id(&dir, &id)?;
+        let favorites = {
+            let mut meta = lock(&state.meta);
+            let changed = if favorite {
+                meta.favorites.insert(id.clone())
+            } else {
+                meta.favorites.remove(&id)
+            };
+            if changed && meta.save(&state.meta_path).is_err() {
+                // Keep memory and disk in sync.
+                if favorite {
+                    meta.favorites.remove(&id);
+                } else {
+                    meta.favorites.insert(id.clone());
+                }
+                return Err("save_failed");
+            }
+            meta.favorites.clone()
+        };
+        library::shard(&dir, &id, &favorites, &mut lock(&state.durations))
+    })
+    .await
+}
+
+/// Moves clips to the Recycle Bin (never a hard delete). Ids that no longer exist are skipped.
+#[tauri::command]
+pub async fn delete_shards(app: AppHandle, ids: Vec<String>) -> CmdResult<()> {
+    let state = app.state::<AppState>();
+    let dir = state.clips_dir();
+    let paths: Vec<_> = ids
+        .iter()
+        .filter_map(|id| library::resolve_id(&dir, id).ok())
+        .collect();
+    // Game folders that may be left empty: removed afterwards so the folder stays tidy.
+    let folders: BTreeSet<PathBuf> = paths
+        .iter()
+        .filter_map(|path| path.parent())
+        .filter(|parent| *parent != dir)
+        .map(Path::to_path_buf)
+        .collect();
+    let trashed = if paths.is_empty() {
+        Ok(())
+    } else {
+        shell::isolated(move || trash::delete_all(paths))
+            .await
+            .ok_or(INTERNAL)
+            .and_then(|result| result.map_err(|_| "delete_failed"))
+    };
+
+    // Forget metadata of every requested clip that is gone, even after a partial failure.
+    let mut meta = lock(&state.meta);
+    let before = meta.favorites.len();
+    meta.favorites
+        .retain(|fav| !ids.contains(fav) || library::resolve_id(&dir, fav).is_ok());
+    if meta.favorites.len() != before {
+        let _ = meta.save(&state.meta_path);
+    }
+    drop(meta);
+    for folder in folders {
+        // Only succeeds on an empty folder: anything else in it is left alone.
+        let _ = fs::remove_dir(folder);
+    }
+    trashed.map_err(String::from)
+}
+
+/// Opens Explorer with the clip selected.
+#[tauri::command]
+pub async fn reveal_shard(app: AppHandle, id: String) -> CmdResult<()> {
+    let path = library::resolve_id(&app.state::<AppState>().clips_dir(), &id)?;
+    let opener = app.clone();
+    shell::isolated(move || opener.opener().reveal_item_in_dir(path))
+        .await
+        .ok_or(INTERNAL)?
+        .map_err(|_| "reveal_failed".to_string())
+}
+
+#[tauri::command]
+pub async fn open_clips_dir(app: AppHandle) -> CmdResult<()> {
+    let dir = app.state::<AppState>().clips_dir();
+    shell::open_dir(&app, dir).await.map_err(String::from)
+}
+
+/// Puts the clip file itself on the clipboard.
+#[tauri::command]
+pub async fn copy_shard(app: AppHandle, id: String) -> CmdResult<()> {
+    let path = library::resolve_id(&app.state::<AppState>().clips_dir(), &id)?;
+    shell::isolated(move || clipboard::copy_file(&path))
+        .await
+        .ok_or(INTERNAL)?
+        .map_err(String::from)
+}
+
+#[tauri::command]
+pub async fn get_capture_status(app: AppHandle) -> CmdResult<CaptureStatus> {
+    Ok(replay::status(&app))
+}
+
+/// Pausing stops capture and clears the replay buffer; resuming starts it again.
+#[tauri::command]
+pub async fn set_capture_paused(app: AppHandle, paused: bool) -> CmdResult<CaptureStatus> {
+    Ok(replay::set_paused(&app, paused))
+}
+
+/// Same as the hotkey: returns at once, the result comes as `shard-saved` / `capture-failed`.
+#[tauri::command]
+pub async fn save_replay(app: AppHandle) -> CmdResult<()> {
+    replay::request_save(&app);
+    Ok(())
+}
+
+/// Duration, size, frame rate and audio tracks of a clip, for the editor.
+#[tauri::command]
+pub async fn probe_shard(app: AppHandle, id: String) -> CmdResult<ShardInfo> {
+    let path = library::resolve_id(&app.state::<AppState>().clips_dir(), &id)?;
+    media_thread("kryo-probe", move || editor::probe::probe(&path)).await
+}
+
+/// Exports a trimmed, re-mixed clip: a copy next to the original (`copy`), or a file under
+/// `maxBytes` put on the clipboard (`discord`). Progress comes as `export-progress` events.
+#[tauri::command]
+pub async fn export_shard(app: AppHandle, request: ExportRequest) -> CmdResult<ExportResult> {
+    // Held until the result is ready (clipboard included).
+    let slot = ExportSlot::acquire()?;
+    let state = app.state::<AppState>();
+    let clips_dir = state.clips_dir();
+    let source = library::resolve_id(&clips_dir, &request.id)?;
+    let destination = match request.target {
+        Target::Copy => Destination::Copy {
+            label: i18n::labels(state.settings().language).edited.to_string(),
+        },
+        Target::Discord => {
+            let max_bytes = request
+                .max_bytes
+                .filter(|m| m.is_finite() && *m >= 1.0)
+                .ok_or(INVALID_REQUEST)?;
+            let dir = app
+                .path()
+                .app_cache_dir()
+                .map_err(|_| WRITE_FAILED)?
+                .join("exports");
+            Destination::Discord {
+                dir,
+                max_bytes: max_bytes as u64,
+            }
+        }
+    };
+    let job = export::Request {
+        start: request.start,
+        end: request.end,
+        gains: request.gains,
+        destination,
+        options: editor::transcode::Options::default(),
+    };
+    let cancel = slot.cancel_flag();
+    let emitter = app.clone();
+    let id = request.id.clone();
+    let exported = media_thread("kryo-export", move || {
+        let report = move |progress: f64| {
+            let payload = ExportProgress {
+                id: id.clone(),
+                progress,
+            };
+            let _ = emitter.emit(EXPORT_PROGRESS, payload);
+        };
+        let progress = Progress::new(cancel, &report);
+        let started = std::time::Instant::now();
+        let exported = export::export(&source, &job, &progress)?;
+        eprintln!(
+            "kryo-shard: exported {} ({} bytes, {}) in {:.1} s",
+            exported.path.display(),
+            exported.size,
+            exported.detail,
+            started.elapsed().as_secs_f64()
+        );
+        Ok(exported)
+    })
+    .await?;
+
+    let shard = match request.target {
+        Target::Copy => {
+            let file_name = exported
+                .path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or_default()
+                .to_string();
+            let new_id = library::sibling_id(&request.id, &file_name);
+            let app = app.clone();
+            // The file is written: a failed lookup only means the UI refreshes on its own.
+            blocking(move || {
+                let state = app.state::<AppState>();
+                let favorites = lock(&state.meta).favorites.clone();
+                Ok(
+                    library::shard(&clips_dir, &new_id, &favorites, &mut lock(&state.durations))
+                        .ok(),
+                )
+            })
+            .await?
+        }
+        Target::Discord => {
+            let path = exported.path.clone();
+            shell::isolated(move || clipboard::copy_file(&path))
+                .await
+                .ok_or(INTERNAL)?
+                .map_err(String::from)?;
+            None
+        }
+    };
+    drop(slot);
+    Ok(ExportResult {
+        path: exported.path.to_string_lossy().into_owned(),
+        size: exported.size,
+        shard,
+        reencoded: exported.reencoded,
+    })
+}
+
+/// Stops the running export (it then fails with `cancelled` and leaves no file behind).
+#[tauri::command]
+pub async fn cancel_export() -> CmdResult<()> {
+    editor::cancel();
+    Ok(())
+}
+
+fn same_file(a: &Path, b: &Path) -> bool {
+    matches!((fs::canonicalize(a), fs::canonicalize(b)), (Ok(a), Ok(b)) if a == b)
+}
