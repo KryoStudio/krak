@@ -18,11 +18,11 @@
     </mask>
   </defs>
   {#if small}
-    <polygon mask="url(#{id})" points="78,4 158,44 184,150 108,198 24,136 36,52" fill="var(--cyan)" />
+    <polygon mask="url(#{id})" points="78,4 158,44 184,150 108,198 24,136 36,52" fill="var(--face)" />
   {:else}
     <g mask="url(#{id})">
       <polygon points="36,52 78,4 158,44 184,150 142,104 84,70" fill="var(--glace)" />
-      <polygon points="36,52 84,70 84,138 142,104 184,150 108,198 24,136" fill="var(--cyan)" />
+      <polygon points="36,52 84,70 84,138 142,104 184,150 108,198 24,136" fill="var(--face)" />
     </g>
   {/if}
 </svg>

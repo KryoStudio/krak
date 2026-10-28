@@ -1,30 +1,27 @@
+<!-- Shared by every window (main app and the in-game overlay): fonts, theme, language. -->
 <script lang="ts">
-  import '@fontsource-variable/space-grotesk';
+  import '@fontsource-variable/inter';
   import '@fontsource-variable/unbounded';
   import '../app.css';
-  import Sidebar from '$lib/components/Sidebar.svelte';
-  import { i18n } from '$lib/i18n.svelte';
+  import { onMount } from 'svelte';
+  import { i18n, systemLang } from '$lib/i18n.svelte';
+  import { settings } from '$lib/settings.svelte';
 
   let { children } = $props();
 
   $effect(() => {
+    i18n.lang = settings.value.language ?? systemLang;
     document.documentElement.lang = i18n.lang;
+  });
+  $effect(() => {
+    document.documentElement.dataset.accent = settings.value.accent;
+  });
+
+  onMount(() => {
+    settings.load();
   });
 </script>
 
-<div class="app">
-  <Sidebar />
-  <main>{@render children()}</main>
-</div>
-
-<style>
-  .app {
-    display: grid;
-    grid-template-columns: 260px 1fr;
-    height: 100vh;
-  }
-  main {
-    position: relative;
-    overflow-y: auto;
-  }
-</style>
+{#if settings.loaded}
+  {@render children()}
+{/if}
