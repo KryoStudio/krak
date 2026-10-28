@@ -9,9 +9,9 @@
 </p>
 
 <p align="center">
-  <img alt="Status: early development" src="https://img.shields.io/badge/status-early%20development-4FC3F7?style=flat-square&labelColor=0B1020">
-  <img alt="Platform: Windows" src="https://img.shields.io/badge/platform-Windows-4FC3F7?style=flat-square&labelColor=0B1020">
-  <img alt="License: GPL-3.0" src="https://img.shields.io/badge/license-GPL--3.0-4FC3F7?style=flat-square&labelColor=0B1020">
+  <img alt="Status: early development" src="https://img.shields.io/badge/status-early%20development-3EC6FF?style=flat-square&labelColor=0C0E12">
+  <img alt="Platform: Windows" src="https://img.shields.io/badge/platform-Windows-3EC6FF?style=flat-square&labelColor=0C0E12">
+  <img alt="License: GPL-3.0" src="https://img.shields.io/badge/license-GPL--3.0-3EC6FF?style=flat-square&labelColor=0C0E12">
 </p>
 
 ---
@@ -35,12 +35,15 @@ A clip is called a **shard**. Your library is the **Glacier**.
 ## Roadmap to the first beta
 
 - [x] Brand, app shell and Glacier preview (FR / EN)
-- [ ] Always-on replay buffer and capture hotkey, "Shard captured" notification
-- [ ] Separate audio tracks: game, microphone, Discord
-- [ ] Glacier: shards sorted by game, favorites, search, built-in player
-- [ ] Editor: trim bar, mute or lower each audio track
-- [ ] Discord export: fit a clip under 10 MB, 50 MB or 500 MB, copy and paste it straight into Discord
-- [ ] Installer and signed automatic updates
+- [x] App foundation: settings, global hotkey, tray icon, launch at Windows startup, single instance
+- [x] Glacier: shards sorted by game, favorites, search, rename, built-in player, copy a clip for Discord, Recycle Bin
+- [x] Always-on replay buffer (capture engine), capture sound and in-game notification
+- [x] Separate audio tracks: game and microphone, plus a mix that every player picks by default
+- [x] Editor: trim bar, mute or lower each audio track
+- [x] Discord export: fit a clip under 10 MB, 50 MB or 500 MB, copy and paste it straight into Discord
+- [x] Installer and signed automatic updates
+- [ ] Windows code signing (no SmartScreen warning)
+- [ ] Separate Discord voice track, mouse cursor in clips, choice of the captured screen
 
 **Later:** auto-clips (Rocket League first), vertical 9:16 format, slow motion, text and local subtitles, importing clips from ShadowPlay / OBS / Medal, Discord Rich Presence, community translations and detectors.
 
@@ -53,6 +56,14 @@ npm install
 npm run tauri dev     # run the app with hot reload
 npm run tauri build   # build the installer
 ```
+
+`tauri build` also signs the in-app update files, so it needs the update signing key: set `TAURI_SIGNING_PRIVATE_KEY` to the key (or its path) first. Forks generate their own pair with `npx tauri signer generate` and put the public key in `src-tauri/tauri.conf.json`.
+
+Releases are built by GitHub Actions: push a tag such as `v0.2.0` (matching the version in `tauri.conf.json`) and a draft release is created with the installer and the signed update manifest.
+
+### How capture works
+
+The screen is read with DXGI Desktop Duplication, the same Windows API that OBS and Discord use, so nothing is injected into games. Frames are encoded on the graphics card (NVENC, AMF or Quick Sync through Media Foundation, with a software fallback) and the last seconds are kept in memory. Game sound comes from WASAPI loopback and the microphone from its own device, on separate tracks. Pressing the hotkey writes an MP4 straight from memory, without re-encoding.
 
 Built with Rust, [Tauri](https://tauri.app) and [Svelte](https://svelte.dev).
 
