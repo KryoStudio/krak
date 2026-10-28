@@ -13,23 +13,87 @@
   "app": {
     "windows": [
       {
+        "label": "main",
         "title": "Kryo Shard",
         "width": 1280,
         "height": 800,
         "minWidth": 960,
         "minHeight": 600,
         "center": true,
-        "backgroundColor": "#0B1020",
-        "theme": "Dark"
+        "decorations": false,
+        "visible": false,
+        "shadow": true,
+        "backgroundColor": "#0A0B0D",
+        "theme": "Dark",
+        "create": false
+      },
+      {
+        "label": "overlay",
+        "url": "/overlay",
+        "title": "Kryo Shard",
+        "width": 372,
+        "height": 100,
+        "resizable": false,
+        "decorations": false,
+        "transparent": true,
+        "alwaysOnTop": true,
+        "skipTaskbar": true,
+        "focusable": false,
+        "focus": false,
+        "visible": false,
+        "shadow": false,
+        "contentProtected": true,
+        "create": false
       }
     ],
     "security": {
-      "csp": null
+      "csp": {
+        "default-src": [
+          "'self'",
+          "ipc:",
+          "http://ipc.localhost"
+        ],
+        "img-src": [
+          "'self'",
+          "asset:",
+          "http://asset.localhost",
+          "data:",
+          "blob:"
+        ],
+        "media-src": [
+          "'self'",
+          "asset:",
+          "http://asset.localhost",
+          "blob:"
+        ],
+        "style-src": [
+          "'self'",
+          "'unsafe-inline'"
+        ],
+        "font-src": [
+          "'self'",
+          "data:"
+        ],
+        "connect-src": [
+          "ipc:",
+          "http://ipc.localhost"
+        ]
+      },
+      "devCsp": null,
+      "dangerousDisableAssetCspModification": [
+        "style-src"
+      ],
+      "assetProtocol": {
+        "enable": true,
+        "scope": []
+      }
     }
   },
   "bundle": {
     "active": true,
-    "targets": ["nsis"],
+    "targets": [
+      "nsis"
+    ],
     "publisher": "Kryo Studio",
     "copyright": "Copyright (C) 2026 Kryo Studio. GPL-3.0-only.",
     "category": "Video",
@@ -40,6 +104,36 @@
       "icons/128x128@2x.png",
       "icons/icon.icns",
       "icons/icon.ico"
-    ]
+    ],
+    "windows": {
+      "webviewInstallMode": {
+        "type": "embedBootstrapper"
+      },
+      "nsis": {
+        "installMode": "currentUser",
+        "languages": [
+          "French",
+          "English"
+        ],
+        "displayLanguageSelector": false,
+        "installerIcon": "icons/icon.ico",
+        "uninstallerIcon": "icons/icon.ico",
+        "sidebarImage": "icons/installer-sidebar.bmp",
+        "headerImage": "icons/installer-header.bmp",
+        "uninstallerHeaderImage": "icons/installer-header.bmp"
+      }
+    },
+    "createUpdaterArtifacts": true
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDAxRDVGMTgyMjhCQTU3RUQKUldUdFY3b29ndkhWQWZlbTlqbDdhVmpJZm1vcDc4dEhrNkRoUU0yWTVHbk43K0h5T3RmRlpxOG0K",
+      "endpoints": [
+        "https://github.com/KryoStudio/kryo-shard/releases/latest/download/latest.json"
+      ],
+      "windows": {
+        "installMode": "passive"
+      }
+    }
   }
 }
