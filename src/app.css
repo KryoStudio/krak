@@ -1,0 +1,77 @@
+:root {
+  --nuit: #0b1020;
+  --nuit-2: #0f1629;
+  --nuit-3: #151d35;
+  --line: rgba(154, 168, 194, 0.12);
+  --line-strong: rgba(154, 168, 194, 0.22);
+  --cyan: #4fc3f7;
+  --cyan-soft: rgba(79, 195, 247, 0.12);
+  --glace: #b8ecfb;
+  --givre: #e6fbff;
+  --gris: #9aa8c2;
+  --gris-2: #6b7894;
+
+  --font-ui: 'Space Grotesk Variable', system-ui, sans-serif;
+  --font-display: 'Unbounded Variable', var(--font-ui);
+  --radius: 14px;
+  --ease: cubic-bezier(0.2, 0.8, 0.2, 1);
+
+  color-scheme: dark;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  height: 100%;
+  background: var(--nuit);
+  color: var(--givre);
+  font-family: var(--font-ui);
+  font-size: 15px;
+  -webkit-font-smoothing: antialiased;
+  user-select: none;
+  overflow: hidden;
+}
+
+button,
+input,
+select {
+  font: inherit;
+  color: inherit;
+}
+
+button {
+  cursor: pointer;
+  background: none;
+  border: 0;
+  padding: 0;
+}
+
+:focus-visible {
+  outline: 2px solid var(--cyan);
+  outline-offset: 2px;
+}
+
+kbd {
+  font-family: var(--font-ui);
+  font-size: 12px;
+  font-weight: 600;
+  padding: 2px 7px;
+  border-radius: 6px;
+  border: 1px solid var(--line-strong);
+  border-bottom-width: 2px;
+  background: var(--nuit-3);
+  color: var(--givre);
+}
+
+::-webkit-scrollbar {
+  width: 10px;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--line-strong);
+  border-radius: 10px;
+  border: 3px solid var(--nuit);
+}
