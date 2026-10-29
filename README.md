@@ -50,7 +50,7 @@ A clip is called a **shard**. Your library is the **Glacier**.
 - [ ] Windows code signing (no SmartScreen warning)
 - [ ] Native AMD and Intel encoders, separate Discord voice track, mouse cursor in clips, choice of the captured screen
 
-**Later:** auto-clips (Rocket League first), vertical 9:16 format, slow motion, text and local subtitles, importing clips from ShadowPlay / OBS / Medal, community translations and detectors.
+**Later:** vertical 9:16 format, slow motion, text and local subtitles, importing clips from ShadowPlay / OBS / Medal, community translations.
 
 ## Building from source
 
