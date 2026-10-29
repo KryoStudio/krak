@@ -1,4 +1,4 @@
-<!-- Screenshots: a grid filtered by game, a full-size viewer (←/→), copy for Discord, delete. -->
+<!-- Screenshots: a grid filtered by game, a full-size viewer (←/→), crop, copy for Discord, delete. -->
 <script lang="ts">
   import { flip } from 'svelte/animate';
   import { fade, fly, scale } from 'svelte/transition';
@@ -7,9 +7,11 @@
   import { SvelteSet } from 'svelte/reactivity';
   import Icon from '$lib/components/Icon.svelte';
   import GameIcon from '$lib/components/GameIcon.svelte';
+  import Cropper from '$lib/components/Cropper.svelte';
+  import Segmented from '$lib/components/Segmented.svelte';
   import Select from '$lib/components/Select.svelte';
   import SelectionBar from '$lib/components/SelectionBar.svelte';
-  import { mediaSrc, type Screenshot } from '$lib/api';
+  import { mediaSrc, type Crop, type Screenshot } from '$lib/api';
   import { gameTint } from '$lib/games';
   import { formatAge, formatHotkey, formatSize, t } from '$lib/i18n.svelte';
   import { portal } from '$lib/portal';
@@ -85,9 +87,53 @@
     else ui.viewing = shot.id;
   }
 
+  // Cropping ---------------------------------------------------------------------------
+  /** The screenshot being cropped (leaving it, even for the next one, ends the crop). */
+  let cropping = $state<string | null>(null);
+  let crop = $state<Crop>({ x: 0, y: 0, width: 0, height: 0 });
+  /** width / height, null = free. */
+  let aspect = $state<number | null>(null);
+  let saving = $state(false);
+  const isCropping = $derived(!!viewing && cropping === viewing.id);
+  const aspects = $derived([
+    { value: 0, label: t('screens.cropFree') },
+    { value: 16 / 9, label: '16:9' },
+    { value: 4 / 3, label: '4:3' },
+    { value: 1, label: '1:1' },
+    { value: 9 / 16, label: '9:16' },
+  ]);
+
+  function startCrop(shot: Screenshot) {
+    crop = { x: 0, y: 0, width: shot.width, height: shot.height };
+    aspect = null;
+    cropping = shot.id;
+    ui.viewing = shot.id;
+  }
+
+  /** A shape: the largest frame of it inside the current one, around the same center. */
+  function setAspect(value: number) {
+    aspect = value || null;
+    if (!aspect) return;
+    const width = Math.min(crop.width, crop.height * aspect);
+    const height = width / aspect;
+    crop = { x: crop.x + (crop.width - width) / 2, y: crop.y + (crop.height - height) / 2, width, height };
+  }
+
+  async function saveCrop() {
+    if (!viewing || saving) return;
+    saving = true;
+    const saved = await screens.saveCrop(viewing, crop);
+    saving = false;
+    if (saved) {
+      cropping = null;
+      ui.viewing = saved.id;
+    }
+  }
+
   function menuFor(shot: Screenshot, x: number, y: number) {
     openMenu(x, y, [
       { label: t('screens.copy'), icon: 'copy', shortcut: 'Ctrl+C', run: () => screens.copy(shot) },
+      { label: t('screens.crop'), icon: 'crop', shortcut: 'R', run: () => startCrop(shot) },
       { label: t('shard.reveal'), icon: 'folder', run: () => screens.reveal(shot) },
       'separator',
       { label: t('shard.delete'), icon: 'trash', shortcut: t('key.delete'), danger: true, run: () => remove([shot.id]) },
@@ -102,8 +148,15 @@
   function onkeydown(e: KeyboardEvent) {
     if (e.defaultPrevented || (e.target as HTMLElement).closest('input')) return;
     const key = e.key;
-    if (viewing) {
+    if (isCropping && viewing) {
+      if (key === 'Escape') cropping = null;
+      else if (key === 'Enter' && (e.target as HTMLElement).tagName !== 'BUTTON') saveCrop();
+      else if (e.ctrlKey && key.toLowerCase() === 'c') screens.copy(viewing, crop);
+      else return;
+      e.preventDefault();
+    } else if (viewing) {
       if (key === 'Escape') ui.viewing = null;
+      else if (key.toLowerCase() === 'r' && !e.ctrlKey && !e.altKey) startCrop(viewing);
       else if (key === 'ArrowLeft') go(-1);
       else if (key === 'ArrowRight') go(1);
       else if (key === 'Delete') remove([viewing.id]);
@@ -203,12 +256,18 @@
   {@const tint = gameTint(viewing.game)}
   <div class="viewer" use:portal={'.content'} transition:fade={{ duration: 160 * motion }}>
     <div class="viewer-bar">
-      <button class="icon-btn" onclick={() => (ui.viewing = null)} aria-label={t('common.close')}><Icon name="chevronLeft" size={18} /></button>
+      <button class="back" onclick={() => (ui.viewing = null)} use:tooltip={{ text: `${t('common.close')} · ${t('key.escape')}`, side: 'bottom' }}>
+        <Icon name="arrowLeft" size={16} />{t('player.back')}
+      </button>
       <GameIcon game={viewing.game} size={28} />
       <div class="viewer-title">
         <strong>{viewing.game ?? t('game.desktop')}</strong>
         <span>{formatAge(viewing.createdAt)} · {viewing.width}×{viewing.height} · {formatSize(viewing.size)}</span>
       </div>
+      {#if !isCropping}
+      <button class="icon-btn" onclick={() => viewing && startCrop(viewing)} aria-label={t('screens.crop')} use:tooltip={{ text: `${t('screens.crop')} · R`, side: 'bottom' }}>
+        <Icon name="crop" size={16} />
+      </button>
       <button class="icon-btn" onclick={() => viewing && screens.copy(viewing)} aria-label={t('screens.copy')} use:tooltip={{ text: `${t('screens.copy')} · Ctrl+C`, side: 'bottom' }}>
         <Icon name="copy" size={16} />
       </button>
@@ -218,12 +277,15 @@
       <button class="icon-btn danger" onclick={() => viewing && remove([viewing.id])} aria-label={t('shard.delete')} use:tooltip={{ text: t('shard.delete'), side: 'bottom' }}>
         <Icon name="trash" size={16} />
       </button>
+      {/if}
     </div>
-    <div class="stage">
+    <div class="stage" class:cropping={isCropping}>
       <button class="nav" disabled={index <= 0} onclick={() => go(-1)} aria-label={t('player.prev')}><Icon name="chevronLeft" size={22} /></button>
       {#key viewing.id}
         <div class="frame" in:scale={{ start: 0.985, duration: 220 * motion, opacity: 0 }}>
-          {#if src(viewing)}
+          {#if isCropping}
+            <Cropper src={src(viewing)} width={viewing.width} height={viewing.height} {aspect} bind:crop />
+          {:else if src(viewing)}
             <img src={src(viewing)} alt="" />
           {:else}
             <div class="placeholder" style:--a={tint[0]} style:--b={tint[1]}></div>
@@ -232,6 +294,20 @@
       {/key}
       <button class="nav" disabled={index < 0 || index >= shown.length - 1} onclick={() => go(1)} aria-label={t('player.next')}><Icon name="chevronRight" size={22} /></button>
     </div>
+    {#if isCropping}
+      <div class="crop-bar" transition:fly={{ y: 12, duration: 220 * motion, easing: cubicOut }}>
+        <Segmented label={t('screens.crop')} options={aspects} value={aspect ?? 0} onchange={setAspect} />
+        <span class="crop-size">{Math.round(crop.width)} × {Math.round(crop.height)}</span>
+        <span class="spacer"></span>
+        <button class="text-btn" onclick={() => (cropping = null)} use:tooltip={{ text: t('key.escape'), side: 'top' }}>{t('common.cancel')}</button>
+        <button class="text-btn solid" onclick={() => viewing && screens.copy(viewing, crop)} use:tooltip={{ text: 'Ctrl+C', side: 'top' }}>
+          <Icon name="copy" size={14} />{t('screens.copy')}
+        </button>
+        <button class="text-btn accent" onclick={saveCrop} disabled={saving} use:tooltip={{ text: t('key.enter'), side: 'top' }}>
+          <Icon name={saving ? 'spinner' : 'check'} size={14} />{t('screens.saveCopy')}
+        </button>
+      </div>
+    {/if}
   </div>
 {/if}
 
@@ -466,9 +542,106 @@
     font-size: 15px;
     font-weight: 600;
   }
+  .viewer-title :is(strong, span) {
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
   .viewer-title span {
     font-size: 12.5px;
     color: var(--text-3);
+  }
+  .back {
+    display: inline-flex;
+    align-items: center;
+    gap: 7px;
+    height: 34px;
+    padding: 0 14px 0 10px;
+    margin-right: 2px;
+    border-radius: 9px;
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--text);
+    background: var(--surface-2);
+    box-shadow: inset 0 0 0 1px var(--border-strong);
+    transition:
+      background var(--fast),
+      transform var(--fast) var(--ease-out);
+  }
+  .back:hover {
+    background: var(--surface-3);
+  }
+  .back:active,
+  .text-btn:active:not(:disabled) {
+    transform: scale(0.97);
+  }
+  .crop-bar {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin: 0 24px 16px;
+    padding: 8px 8px 8px 10px;
+    border-radius: var(--radius-lg);
+    background: var(--surface);
+    box-shadow: inset 0 0 0 1px var(--border-strong);
+  }
+  .spacer {
+    flex: 1;
+  }
+  .crop-size {
+    min-width: 92px;
+    margin: 0 4px;
+    font-size: 12.5px;
+    text-align: center;
+    color: var(--text-3);
+    font-variant-numeric: tabular-nums;
+  }
+  .text-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 7px;
+    height: 34px;
+    padding: 0 13px;
+    border-radius: 9px;
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--text-2);
+    transition:
+      background var(--fast),
+      color var(--fast),
+      filter var(--fast),
+      transform var(--fast) var(--ease-out);
+  }
+  .text-btn:hover {
+    color: var(--text);
+    background: rgba(255, 255, 255, 0.06);
+  }
+  .text-btn.solid {
+    color: var(--text);
+    background: var(--surface-2);
+    box-shadow: inset 0 0 0 1px var(--border-strong);
+  }
+  .text-btn.solid:hover {
+    background: var(--surface-3);
+  }
+  .text-btn.accent {
+    color: var(--accent-fg);
+    background: var(--accent);
+  }
+  .text-btn.accent:hover {
+    filter: brightness(1.08);
+  }
+  .text-btn:disabled {
+    opacity: 0.6;
+  }
+  .stage.cropping {
+    padding-bottom: 14px;
+  }
+  .stage.cropping .nav {
+    visibility: hidden;
+  }
+  .stage.cropping .frame {
+    position: relative;
   }
   .icon-btn {
     display: grid;

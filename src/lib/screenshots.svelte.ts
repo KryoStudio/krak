@@ -1,5 +1,5 @@
 // Screenshots: PNGs saved by the screenshot hotkey in <clipsDir>/Screenshots/<Game>/.
-import { api, errorCode, native, type Screenshot } from './api';
+import { api, errorCode, native, type Crop, type Screenshot } from './api';
 import { t } from './i18n.svelte';
 import { library } from './library.svelte';
 import { showError } from './shard-actions';
@@ -51,14 +51,31 @@ class Screens {
     this.items = this.items.filter((s) => !ids.includes(s.id));
   }
 
-  async copy(shot: Screenshot) {
+  /** The image on the clipboard, or only `crop` of it. */
+  async copy(shot: Screenshot, crop?: Crop) {
     if (this.#demo) {
       toast({ kind: 'info', title: t('toast.demo') });
       return;
     }
     try {
-      await api.copyScreenshot(shot.id);
+      await api.copyScreenshot(shot.id, crop && pixels(crop));
       toast({ kind: 'success', title: t('screens.copied'), body: t('toast.copiedBody') });
+    } catch (e) {
+      showError(errorCode(e));
+    }
+  }
+
+  /** Saves `crop` of the screenshot as a new one next to it; returns it (undefined on failure). */
+  async saveCrop(shot: Screenshot, crop: Crop): Promise<Screenshot | undefined> {
+    if (this.#demo) {
+      toast({ kind: 'info', title: t('toast.demo') });
+      return;
+    }
+    try {
+      const saved = await api.saveScreenshotCrop(shot.id, pixels(crop));
+      this.upsert(saved);
+      toast({ kind: 'success', title: t('screens.cropSaved') });
+      return saved;
     } catch (e) {
       showError(errorCode(e));
     }
@@ -71,6 +88,13 @@ class Screens {
 }
 
 export const screens = new Screens();
+
+/** A crop on whole pixels (the cropper works in fractions of them). */
+const pixels = (c: Crop): Crop => {
+  const x = Math.round(c.x);
+  const y = Math.round(c.y);
+  return { x, y, width: Math.round(c.x + c.width) - x, height: Math.round(c.y + c.height) - y };
+};
 
 /** Same as the screenshot hotkey; the file arrives as a `screenshot-saved` event. */
 export async function takeScreenshot() {

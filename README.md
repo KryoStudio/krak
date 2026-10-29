@@ -39,7 +39,7 @@ A clip is called a **shard**. Your library is the **Glacier**.
 - [x] Glacier: shards sorted by game, favorites, search, rename, multi-select, built-in player, Recycle Bin
 - [x] Always-on replay buffer, encoded natively with NVENC on NVIDIA (H.264, HEVC), with Standard, High and Premium presets
 - [x] Continuous recording while the replay keeps working, safe from crashes
-- [x] Screenshots, with their own page
+- [x] Screenshots, with their own page and a crop tool (copy the part you keep, or save it)
 - [x] Separate audio tracks: game and microphone, plus a mix that every player picks by default
 - [x] Editor: trim bar, waveforms, volume of each audio track, remembered per clip
 - [x] Export to a file, to the Glacier or to Discord under 10 MB, 50 MB or 500 MB, with an optional "by krak" badge

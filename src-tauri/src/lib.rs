@@ -98,6 +98,7 @@ pub fn run() {
             screenshots::list_screenshots,
             screenshots::delete_screenshots,
             screenshots::copy_screenshot,
+            screenshots::save_screenshot_crop,
             screenshots::reveal_screenshot,
         ])
         .build(context)

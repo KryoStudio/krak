@@ -88,6 +88,14 @@ export interface StorageInfo {
   freeBytes: number;
 }
 
+/** A part of a screenshot, in its pixels. */
+export interface Crop {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
 /** A PNG in <clipsDir>/Screenshots/<Game>/. */
 export interface Screenshot {
   /** Path relative to the clips folder, forward slashes. */
@@ -201,7 +209,9 @@ export const api = {
   takeScreenshot: () => invoke<void>('take_screenshot'),
   listScreenshots: () => invoke<Screenshot[]>('list_screenshots'),
   deleteScreenshots: (ids: string[]) => invoke<void>('delete_screenshots', { ids }),
-  copyScreenshot: (id: string) => invoke<void>('copy_screenshot', { id }),
+  /** The whole image, or only `crop` (in the screenshot's pixels). */
+  copyScreenshot: (id: string, crop?: Crop) => invoke<void>('copy_screenshot', { id, crop }),
+  saveScreenshotCrop: (id: string, crop: Crop) => invoke<Screenshot>('save_screenshot_crop', { id, crop }),
   revealScreenshot: (id: string) => invoke<void>('reveal_screenshot', { id }),
   getPresence: () => invoke<{ enabled: boolean; connected: boolean }>('get_presence'),
   getWaveforms: (id: string, buckets: number) => invoke<Waveform[]>('get_waveforms', { id, buckets }),

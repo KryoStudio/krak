@@ -7,6 +7,9 @@
 //! Ids are paths relative to the clips folder with forward slashes, like shard ids:
 //! `Screenshots/Valorant/Valorant 2026-10-29 20-15-03.png`. The folder is never a game of
 //! the Glacier (`library` skips it).
+//!
+//! The viewer crops: `copy_screenshot` with a `crop` puts just that part on the clipboard, and
+//! `save_screenshot_crop` writes it as "<name> (<edited>).png" next to the original.
 
 use std::collections::BTreeSet;
 use std::fs::{self, Metadata};
@@ -15,12 +18,13 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager};
 use tauri_plugin_opener::OpenerExt;
 
 use crate::capture::screenshot::{self, Image};
 use crate::capture::{self, Stamp, naming};
+use crate::editor::naming::{MAX_ATTEMPTS, copy_stem};
 use crate::media::mp4_writer::{part_path, rename_no_replace};
 use crate::media::{ComGuard, png};
 use crate::replay::{self, CAPTURE_FAILED};
@@ -36,6 +40,7 @@ const DEBOUNCE: Duration = Duration::from_millis(400);
 const STARTING_WAIT: Duration = Duration::from_secs(2);
 const WRITE_FAILED: &str = "write_failed";
 const ENCODE_FAILED: &str = "encode_failed";
+const INVALID_RANGE: &str = "invalid_range";
 const INTERNAL: &str = "internal";
 
 type CmdResult<T> = Result<T, String>;
@@ -51,6 +56,15 @@ pub struct Screenshot {
     /// ms since the epoch.
     pub created_at: u64,
     pub size: u64,
+    pub width: u32,
+    pub height: u32,
+}
+
+/// A part of a screenshot, in its pixels (from the top-left corner).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+pub struct Crop {
+    pub x: u32,
+    pub y: u32,
     pub width: u32,
     pub height: u32,
 }
@@ -145,7 +159,7 @@ fn grab(app: &AppHandle) -> crate::media::MediaResult<Image> {
     screenshot::one_shot()
 }
 
-/// Writes the PNG through `<name>.png.part` (synced, then renamed) under a free name.
+/// Writes the PNG of a new screenshot under a free name in its game folder.
 fn write_png(
     dir: &Path,
     game: Option<&str>,
@@ -158,9 +172,20 @@ fn write_png(
         None => dir.to_path_buf(),
     };
     fs::create_dir_all(&folder).map_err(|_| WRITE_FAILED)?;
+    write_new(bytes, |number| {
+        naming::free_screenshot_path(dir, game, desktop_label, stamp, number)
+    })
+}
+
+/// Writes `bytes` through `<name>.png.part` (synced, then renamed, never over another file)
+/// under the first free name `candidate(n)` offers from n = 1 (it returns the path and its n).
+fn write_new(
+    bytes: &[u8],
+    candidate: impl Fn(u32) -> (PathBuf, u32),
+) -> Result<PathBuf, &'static str> {
     let mut number = 1;
     for _ in 0..20 {
-        let (path, n) = naming::free_screenshot_path(dir, game, desktop_label, stamp, number);
+        let (path, n) = candidate(number);
         let part = part_path(&path);
         let mut file = match fs::OpenOptions::new()
             .write(true)
@@ -193,6 +218,51 @@ fn write_png(
         }
     }
     Err(WRITE_FAILED)
+}
+
+/// The `crop` part of a `width`×`height` image (top-down, tightly packed BGR rows), clamped
+/// to the image: (width, height, pixels), `None` when nothing is left.
+fn crop_bgr(bgr: &[u8], width: u32, height: u32, crop: Crop) -> Option<(u32, u32, Vec<u8>)> {
+    let x = crop.x.min(width);
+    let y = crop.y.min(height);
+    let w = crop.width.min(width - x);
+    let h = crop.height.min(height - y);
+    if w == 0 || h == 0 {
+        return None;
+    }
+    let stride = width as usize * 3;
+    let row = w as usize * 3;
+    let mut out = Vec::with_capacity(row * h as usize);
+    for line in y..y + h {
+        let start = line as usize * stride + x as usize * 3;
+        out.extend_from_slice(bgr.get(start..start + row)?);
+    }
+    Some((w, h, out))
+}
+
+/// Decodes the PNG at `path` and keeps the `crop` part: (width, height, pixels). The caller
+/// has initialized COM.
+fn read_crop(path: &Path, crop: Crop) -> Result<(u32, u32, Vec<u8>), &'static str> {
+    let bytes = fs::read(path).map_err(|_| library::NOT_FOUND)?;
+    let (width, height, bgr) = png::decode_bgr(&bytes).map_err(|_| ENCODE_FAILED)?;
+    crop_bgr(&bgr, width, height, crop).ok_or(INVALID_RANGE)
+}
+
+/// "<stem> (<label>).png" next to `source` (" (2)"... when taken), from candidate `first` on:
+/// the first free one, with its number. Cropping a crop doesn't stack the label.
+fn crop_path(source: &Path, label: &str, first: u32) -> (PathBuf, u32) {
+    let stem = source
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or(FOLDER);
+    let mut n = first.max(1);
+    loop {
+        let path = source.with_file_name(format!("{}.png", copy_stem(stem, label, n)));
+        if n >= MAX_ATTEMPTS || !(path.exists() || part_path(&path).exists()) {
+            return (path, n);
+        }
+        n += 1;
+    }
 }
 
 /// Checks the shape of an id without touching the disk: `Screenshots/<file>.png` or
@@ -361,19 +431,42 @@ pub async fn delete_screenshots(app: AppHandle, ids: Vec<String>) -> CmdResult<(
     trashed.map_err(String::from)
 }
 
-/// Puts the image itself on the clipboard (Ctrl+V in Discord, a document, an image editor).
+/// Puts the image itself on the clipboard (Ctrl+V in Discord, a document, an image editor),
+/// or only its `crop` part.
 #[tauri::command]
-pub async fn copy_screenshot(app: AppHandle, id: String) -> CmdResult<()> {
+pub async fn copy_screenshot(app: AppHandle, id: String, crop: Option<Crop>) -> CmdResult<()> {
     let path = resolve_id(&app.state::<AppState>().clips_dir(), &id)?;
     shell::isolated(move || {
-        let bytes = fs::read(&path).map_err(|_| library::NOT_FOUND)?;
         let _com = ComGuard::new();
-        let (width, height, bgr) = png::decode_bgr(&bytes).map_err(|_| "copy_failed")?;
+        let Some(crop) = crop else {
+            let bytes = fs::read(&path).map_err(|_| library::NOT_FOUND)?;
+            let (width, height, bgr) = png::decode_bgr(&bytes).map_err(|_| "copy_failed")?;
+            return clipboard::copy_image(&bytes, width, height, &bgr);
+        };
+        let (width, height, bgr) = read_crop(&path, crop)?;
+        let bytes = png::encode_bgr(width, height, &bgr).map_err(|_| ENCODE_FAILED)?;
         clipboard::copy_image(&bytes, width, height, &bgr)
     })
     .await
     .ok_or(INTERNAL)?
     .map_err(String::from)
+}
+
+/// Saves the `crop` part of a screenshot as a new one next to it, which it returns.
+#[tauri::command]
+pub async fn save_screenshot_crop(app: AppHandle, id: String, crop: Crop) -> CmdResult<Screenshot> {
+    let state = app.state::<AppState>();
+    let clips_dir = state.clips_dir();
+    let path = resolve_id(&clips_dir, &id)?;
+    let label = i18n::labels(state.settings().language.as_deref()).edited;
+    on_thread("kryo-screenshot-crop", move || {
+        let _com = ComGuard::new();
+        let (width, height, bgr) = read_crop(&path, crop)?;
+        let bytes = png::encode_bgr(width, height, &bgr).map_err(|_| ENCODE_FAILED)?;
+        let saved = write_new(&bytes, |n| crop_path(&path, label, n))?;
+        screenshot_at(&clips_dir, &saved).ok_or(WRITE_FAILED)
+    })
+    .await
 }
 
 /// Opens Explorer with the screenshot selected.
@@ -426,6 +519,90 @@ mod tests {
         png.extend_from_slice(&1u32.to_be_bytes());
         png.extend_from_slice(&[8, 2, 0, 0, 0, 0, 0, 0, 0]);
         png
+    }
+
+    #[test]
+    fn crops_inside_the_image() {
+        // 3x2 image, pixel (x, y) = [x, y, 9].
+        let bgr: Vec<u8> = (0..2u8)
+            .flat_map(|y| (0..3u8).flat_map(move |x| [x, y, 9]))
+            .collect();
+        let crop = |x, y, width, height| {
+            crop_bgr(
+                &bgr,
+                3,
+                2,
+                Crop {
+                    x,
+                    y,
+                    width,
+                    height,
+                },
+            )
+        };
+        assert_eq!(crop(1, 1, 2, 1), Some((2, 1, vec![1, 1, 9, 2, 1, 9])));
+        assert_eq!(crop(0, 0, 3, 2), Some((3, 2, bgr.clone())));
+        // Clamped to the image; nothing left is none.
+        assert_eq!(crop(2, 0, 50, 50), Some((1, 2, vec![2, 0, 9, 2, 1, 9])));
+        assert_eq!(crop(3, 0, 1, 1), None);
+        assert_eq!(crop(0, 0, 0, 2), None);
+        assert_eq!(crop(u32::MAX, u32::MAX, u32::MAX, u32::MAX), None);
+    }
+
+    #[test]
+    fn saves_the_crop_of_a_real_png() {
+        let tmp = TempDir::new("crop-save");
+        let clips = &tmp.0;
+        let dir = clips.join(FOLDER).join("Game");
+        fs::create_dir_all(&dir).unwrap();
+        // 4x2, pixel (x, y) = [x * 10, y * 10, 200].
+        let bgr: Vec<u8> = (0..2u8)
+            .flat_map(|y| (0..4u8).flat_map(move |x| [x * 10, y * 10, 200]))
+            .collect();
+        let _com = ComGuard::new();
+        let source = dir.join("Game 2026-10-29 21-04-09.png");
+        fs::write(&source, png::encode_bgr(4, 2, &bgr).expect("encode")).unwrap();
+
+        let crop = Crop {
+            x: 1,
+            y: 1,
+            width: 2,
+            height: 1,
+        };
+        let (width, height, part) = read_crop(&source, crop).expect("crop");
+        assert_eq!((width, height), (2, 1));
+        assert_eq!(part, [10, 10, 200, 20, 10, 200]);
+        let bytes = png::encode_bgr(width, height, &part).expect("encode");
+        let saved = write_new(&bytes, |n| crop_path(&source, "edit", n)).expect("write");
+        let shot = screenshot_at(clips, &saved).expect("shot");
+        assert_eq!(
+            shot.id,
+            "Screenshots/Game/Game 2026-10-29 21-04-09 (edit).png"
+        );
+        assert_eq!((shot.width, shot.height), (2, 1));
+        assert_eq!(
+            read_crop(&source, Crop { x: 4, ..crop }),
+            Err(INVALID_RANGE)
+        );
+    }
+
+    #[test]
+    fn names_crops_next_to_the_original() {
+        let tmp = TempDir::new("crop-names");
+        let source = tmp.0.join("Valorant 2026-10-29 21-04-09.png");
+        let (first, n) = crop_path(&source, "edit", 1);
+        assert_eq!(first, tmp.0.join("Valorant 2026-10-29 21-04-09 (edit).png"));
+        assert_eq!(n, 1);
+        fs::write(&first, b"x").unwrap();
+        assert_eq!(
+            crop_path(&source, "edit", 1).0,
+            tmp.0.join("Valorant 2026-10-29 21-04-09 (edit) (2).png")
+        );
+        // A crop of a crop: no "(edit) (edit)".
+        assert_eq!(
+            crop_path(&first, "edit", 1).0,
+            tmp.0.join("Valorant 2026-10-29 21-04-09 (edit) (2).png")
+        );
     }
 
     #[test]
