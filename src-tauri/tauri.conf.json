@@ -58,7 +58,8 @@
           "asset:",
           "http://asset.localhost",
           "data:",
-          "blob:"
+          "blob:",
+          "https://cdn.discordapp.com"
         ],
         "media-src": [
           "'self'",

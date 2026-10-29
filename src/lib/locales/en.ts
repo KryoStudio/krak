@@ -370,6 +370,7 @@ export const en = {
   'presence.recording': 'Recording their game',
   'presence.button': 'Get Krak',
   'presence.connected': 'Connected to Discord',
+  'presence.connectedAs': 'Connected as {name}',
   'presence.disconnected': 'Discord isn’t open',
 
   'overlay.lastSeconds': 'Last {seconds} seconds',

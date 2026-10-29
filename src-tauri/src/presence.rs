@@ -3,6 +3,11 @@
 //! (`\\.\pipe\discord-ipc-N`, N = 0..9) where each frame is an opcode and a length (u32 LE)
 //! followed by JSON; a handshake with our client id, then `SET_ACTIVITY` commands.
 //!
+//! The handshake's `READY` names the Discord account of the client (id, names, avatar): no
+//! login, no token, nothing leaves the PC. The app shows it ("connected as"), and the button
+//! leads to the site with that id (`?ref=<id>`), which the community bot uses to credit who
+//! brought whom when the friend joins the Discord server from there.
+//!
 //! One background thread owns the connection:
 //! - while the setting is on, it connects (and retries quietly every 20 s while Discord is
 //!   closed; a closed or restarted Discord shows up as a broken pipe), answers pings, and every
@@ -46,7 +51,10 @@ const CLIENT_ID: &str = "1565168468159103067";
 const LARGE_IMAGE: &str = "logo";
 const IMAGE_READY: &str = "ready";
 const IMAGE_RECORDING: &str = "rec";
-const DOWNLOAD_URL: &str = "https://github.com/KryoStudio/krak/releases/latest";
+/// Where "Get Krak" leads (with `?ref=<Discord id>` when the account is known).
+const SITE_URL: &str = "https://krakclip.com/";
+/// Discord's image CDN (avatars).
+const CDN: &str = "https://cdn.discordapp.com";
 /// Emitted when a continuous recording is saved (payload: the shard).
 const RECORDING_SAVED: &str = "recording-saved";
 
@@ -111,12 +119,58 @@ const NOT_GAMES: [&str; 27] = [
 ];
 
 /// `get_presence`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct PresenceInfo {
     /// The setting.
     pub enabled: bool,
     /// Discord is running and talking to us.
     pub connected: bool,
+    /// The account signed in to that Discord, while connected.
+    pub user: Option<DiscordUser>,
+}
+
+/// The Discord account of the client we talk to, from its `READY`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiscordUser {
+    /// Snowflake id (digits).
+    pub id: String,
+    pub username: String,
+    /// The display name, when the account has one.
+    pub display_name: Option<String>,
+    /// 64 px avatar on Discord's CDN (one of the default ones when none is set).
+    pub avatar: String,
+}
+
+impl DiscordUser {
+    /// `None` when `READY` has no usable user. Only digits make an id and only letters, digits
+    /// and `_` an avatar hash, so both go into URLs as they are.
+    fn from_ready(ready: &Value) -> Option<Self> {
+        let user = &ready["data"]["user"];
+        let id = user["id"]
+            .as_str()
+            .filter(|id| !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit()))?;
+        let hash = user["avatar"].as_str().filter(|hash| {
+            !hash.is_empty() && hash.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+        });
+        let avatar = match hash {
+            Some(hash) => format!("{CDN}/avatars/{id}/{hash}.png?size=64"),
+            // Accounts without an avatar get one of six, picked from the id.
+            None => {
+                let index = id.parse::<u64>().map_or(0, |n| (n >> 22) % 6);
+                format!("{CDN}/embed/avatars/{index}.png")
+            }
+        };
+        Some(Self {
+            id: id.to_string(),
+            username: user["username"].as_str().unwrap_or_default().to_string(),
+            display_name: user["global_name"]
+                .as_str()
+                .filter(|name| !name.trim().is_empty())
+                .map(str::to_string),
+            avatar,
+        })
+    }
 }
 
 /// Managed state: the link to the presence thread.
@@ -133,6 +187,8 @@ struct Shared {
     attempted: Condvar,
     attempts: AtomicU64,
     connected: AtomicBool,
+    /// Who is signed in to the connected Discord.
+    user: Mutex<Option<DiscordUser>>,
 }
 
 /// Why the thread was woken.
@@ -219,6 +275,7 @@ pub fn info(app: &AppHandle) -> PresenceInfo {
         return PresenceInfo {
             enabled,
             connected: false,
+            user: None,
         };
     };
     let shared = &presence.shared;
@@ -239,9 +296,11 @@ pub fn info(app: &AppHandle) -> PresenceInfo {
                 .0;
         }
     }
+    let connected = shared.connected.load(Ordering::SeqCst);
     PresenceInfo {
         enabled,
-        connected: shared.connected.load(Ordering::SeqCst),
+        connected,
+        user: lock(&shared.user).clone().filter(|_| connected),
     }
 }
 
@@ -337,6 +396,7 @@ impl Worker {
         match Connection::open(PIPE_PREFIX, CLIENT_ID) {
             Ok(connection) => {
                 eprintln!("krak: connected to Discord");
+                *lock(&self.shared.user) = connection.user.clone();
                 self.connection = Some(connection);
                 self.shown = None;
                 self.last_error = None;
@@ -397,6 +457,7 @@ impl Worker {
             None => Capture::Off,
         };
         let today = self.today.count(Path::new(&settings.clips_dir));
+        let user = self.connection.as_ref().and_then(|c| c.user.as_ref());
         Activity::new(
             labels,
             self.tracker.current.as_deref(),
@@ -404,6 +465,7 @@ impl Worker {
             today,
             self.tracker.since,
         )
+        .brought_by(user.map(|u| u.id.as_str()))
     }
 }
 
@@ -455,6 +517,8 @@ struct Activity {
     /// Small image and its hover text.
     small: Option<(&'static str, Option<String>)>,
     button: String,
+    /// The button's link.
+    url: String,
 }
 
 impl Activity {
@@ -477,7 +541,16 @@ impl Activity {
             start: since,
             small,
             button: fit(labels.presence_button, MAX_LABEL),
+            url: SITE_URL.to_string(),
         }
+    }
+
+    /// The button credits `referrer` (a Discord id) for the friends who follow it.
+    fn brought_by(mut self, referrer: Option<&str>) -> Self {
+        if let Some(id) = referrer {
+            self.url = format!("{SITE_URL}?ref={id}");
+        }
+        self
     }
 
     fn to_json(&self) -> Value {
@@ -493,7 +566,7 @@ impl Activity {
             "state": self.state,
             "timestamps": { "start": self.start },
             "assets": assets,
-            "buttons": [{ "label": self.button, "url": DOWNLOAD_URL }],
+            "buttons": [{ "label": self.button, "url": self.url }],
             "instance": false,
         })
     }
@@ -682,6 +755,8 @@ fn invalid(what: &str) -> io::Error {
 struct Connection {
     pipe: File,
     commands: u64,
+    /// The account signed in to it (`READY`).
+    user: Option<DiscordUser>,
 }
 
 impl Connection {
@@ -702,7 +777,11 @@ impl Connection {
                     continue;
                 }
             };
-            let mut connection = Self { pipe, commands: 0 };
+            let mut connection = Self {
+                pipe,
+                commands: 0,
+                user: None,
+            };
             match connection.handshake(client_id) {
                 Ok(()) => return Ok(connection),
                 Err(err) => last = err,
@@ -716,7 +795,10 @@ impl Connection {
         let deadline = Instant::now() + REPLY_TIMEOUT;
         loop {
             match self.receive(deadline)? {
-                (OP_FRAME, reply) if reply["evt"] == "READY" => return Ok(()),
+                (OP_FRAME, reply) if reply["evt"] == "READY" => {
+                    self.user = DiscordUser::from_ready(&reply);
+                    return Ok(());
+                }
                 (OP_CLOSE, reply) => return Err(closed(&reply)),
                 _ => {}
             }
@@ -868,12 +950,18 @@ mod tests {
                         },
                         "buttons": [{
                             "label": "Get Krak",
-                            "url": "https://github.com/KryoStudio/krak/releases/latest"
+                            "url": "https://krakclip.com/"
                         }],
                         "instance": false
                     }
                 }
             })
+        );
+        // Known account: the button credits it.
+        let a = a.brought_by(Some("80351110224678912"));
+        assert_eq!(
+            a.to_json()["buttons"][0]["url"],
+            "https://krakclip.com/?ref=80351110224678912"
         );
         // Recording: the red dot with its text; the desktop; one shard.
         let a = Activity::new(en(), None, Capture::Recording, 1, 5);
@@ -899,6 +987,47 @@ mod tests {
         let clear = set_activity_command(42, None, "n2");
         assert!(clear["args"].get("activity").is_none());
         assert_eq!(clear["args"]["pid"], 42);
+    }
+
+    #[test]
+    fn reads_the_account_from_ready() {
+        let ready = |user: Value| json!({ "evt": "READY", "data": { "v": 1, "user": user } });
+        let user = DiscordUser::from_ready(&ready(json!({
+            "id": "80351110224678912", "username": "nelly", "global_name": "Nelly",
+            "avatar": "a_8342729096ea3675442027381ff50dfe"
+        })))
+        .expect("user");
+        assert_eq!(
+            user,
+            DiscordUser {
+                id: "80351110224678912".into(),
+                username: "nelly".into(),
+                display_name: Some("Nelly".into()),
+                avatar: "https://cdn.discordapp.com/avatars/80351110224678912/a_8342729096ea3675442027381ff50dfe.png?size=64".into(),
+            }
+        );
+        // No avatar, no display name: a default avatar picked from the id.
+        let plain = DiscordUser::from_ready(&ready(json!({
+            "id": "80351110224678912", "username": "nelly", "global_name": null, "avatar": null
+        })))
+        .expect("user");
+        assert_eq!(plain.display_name, None);
+        assert_eq!(
+            plain.avatar,
+            format!(
+                "https://cdn.discordapp.com/embed/avatars/{}.png",
+                (80_351_110_224_678_912u64 >> 22) % 6
+            )
+        );
+        // Nothing that could step out of the URL it goes into.
+        assert!(DiscordUser::from_ready(&ready(json!({ "id": "1/../x" }))).is_none());
+        assert!(DiscordUser::from_ready(&json!({ "evt": "READY", "data": { "v": 1 } })).is_none());
+        let odd = DiscordUser::from_ready(&ready(json!({ "id": "1", "avatar": "x?y" }))).unwrap();
+        assert!(
+            odd.avatar.ends_with("/embed/avatars/0.png"),
+            "{}",
+            odd.avatar
+        );
     }
 
     #[test]
@@ -1125,7 +1254,10 @@ mod tests {
             write_frame(
                 &mut server,
                 OP_FRAME,
-                json!({ "cmd": "DISPATCH", "evt": "READY", "data": { "v": 1 } }),
+                json!({ "cmd": "DISPATCH", "evt": "READY", "data": { "v": 1, "user": {
+                    "id": "80351110224678912", "username": "nelly", "global_name": "Nelly",
+                    "avatar": "8342729096ea3675442027381ff50dfe"
+                } } }),
             );
             let (op, set) = read_frame(&mut server);
             assert_eq!(op, OP_FRAME);
@@ -1164,6 +1296,8 @@ mod tests {
         });
 
         let mut connection = Connection::open(&prefix, "123").expect("handshake");
+        let user = connection.user.clone().expect("READY names the account");
+        assert_eq!(user.display_name.as_deref(), Some("Nelly"));
         let activity = Activity::new(en(), Some("Valorant"), Capture::Ready, 2, 9);
         let reply = connection.set_activity(42, Some(&activity)).expect("set");
         assert_eq!(reply["data"]["details"], "Clipping Valorant");
@@ -1218,7 +1352,11 @@ mod tests {
     #[ignore = "talks to the Discord client; run with --ignored"]
     fn discord_handshake_live() {
         match Connection::open(PIPE_PREFIX, CLIENT_ID) {
-            Ok(_) => println!("Discord answered the handshake"),
+            Ok(connection) => {
+                println!("Discord answered the handshake");
+                let user = connection.user.expect("READY names the account");
+                println!("account: {} ({})", user.username, user.avatar);
+            }
             Err(err) if err.kind() == io::ErrorKind::NotFound => println!("Discord is not running"),
             Err(err) => panic!("handshake: {err}"),
         }

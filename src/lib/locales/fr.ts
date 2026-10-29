@@ -371,6 +371,7 @@ export const fr: Translation = {
   'presence.recording': 'Enregistre sa partie',
   'presence.button': 'Télécharger Krak',
   'presence.connected': 'Connecté à Discord',
+  'presence.connectedAs': 'Connecté en tant que {name}',
   'presence.disconnected': 'Discord n’est pas ouvert',
 
   'overlay.lastSeconds': '{seconds} dernières secondes',

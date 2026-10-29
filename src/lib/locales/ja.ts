@@ -371,6 +371,7 @@ export const ja: Translation = {
   'presence.recording': 'ゲームを録画中',
   'presence.button': 'Krak を入手',
   'presence.connected': 'Discord に接続済み',
+  'presence.connectedAs': '{name} として接続中',
   'presence.disconnected': 'Discord が起動していません',
 
   'overlay.lastSeconds': '直前の{seconds}秒',

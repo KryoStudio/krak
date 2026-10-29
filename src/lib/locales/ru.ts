@@ -395,6 +395,7 @@ export const ru: Translation = {
   'presence.recording': 'Записывает свою игру',
   'presence.button': 'Скачать Krak',
   'presence.connected': 'Подключено к Discord',
+  'presence.connectedAs': 'Подключено как {name}',
   'presence.disconnected': 'Discord не запущен',
 
   'overlay.lastSeconds': 'Последние {seconds} с',

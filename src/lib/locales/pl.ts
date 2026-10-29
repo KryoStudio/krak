@@ -395,6 +395,7 @@ export const pl: Translation = {
   'presence.recording': 'Nagrywa swoją rozgrywkę',
   'presence.button': 'Pobierz Krak',
   'presence.connected': 'Połączono z Discordem',
+  'presence.connectedAs': 'Połączono jako {name}',
   'presence.disconnected': 'Discord nie jest otwarty',
 
   'overlay.lastSeconds': 'Ostatnie {seconds} s',

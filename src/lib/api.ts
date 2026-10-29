@@ -194,6 +194,22 @@ export interface SavingShard {
   duration: number;
 }
 
+/** The account signed in to the Discord app on this PC, read from Discord itself (no login). */
+export interface DiscordUser {
+  id: string;
+  username: string;
+  displayName: string | null;
+  /** Avatar URL on Discord's CDN. */
+  avatar: string;
+}
+
+export interface Presence {
+  enabled: boolean;
+  connected: boolean;
+  /** Known while connected. */
+  user: DiscordUser | null;
+}
+
 export const api = {
   getSettings: () => invoke<Settings>('get_settings'),
   updateSettings: (patch: Partial<Settings>) => invoke<Settings>('update_settings', { patch }),
@@ -225,7 +241,7 @@ export const api = {
   copyScreenshot: (id: string, crop?: Crop) => invoke<void>('copy_screenshot', { id, crop }),
   saveScreenshotCrop: (id: string, crop: Crop) => invoke<Screenshot>('save_screenshot_crop', { id, crop }),
   revealScreenshot: (id: string) => invoke<void>('reveal_screenshot', { id }),
-  getPresence: () => invoke<{ enabled: boolean; connected: boolean }>('get_presence'),
+  getPresence: () => invoke<Presence>('get_presence'),
   getWaveforms: (id: string, buckets: number) => invoke<Waveform[]>('get_waveforms', { id, buckets }),
   /** Native "Save as" dialog; null when cancelled. */
   chooseExportPath: (suggestedName: string) => invoke<string | null>('choose_export_path', { suggestedName }),

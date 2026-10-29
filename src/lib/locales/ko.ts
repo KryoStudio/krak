@@ -371,6 +371,7 @@ export const ko: Translation = {
   'presence.recording': '게임 녹화 중',
   'presence.button': 'Krak 받기',
   'presence.connected': 'Discord에 연결됨',
+  'presence.connectedAs': '{name}(으)로 연결됨',
   'presence.disconnected': 'Discord가 열려 있지 않아요',
 
   'overlay.lastSeconds': '마지막 {seconds}초',

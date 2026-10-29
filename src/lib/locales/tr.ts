@@ -375,6 +375,7 @@ export const tr: Translation = {
   'presence.recording': 'Oyununu kaydediyor',
   'presence.button': 'Krak’ı indir',
   'presence.connected': 'Discord’a bağlı',
+  'presence.connectedAs': '{name} olarak bağlı',
   'presence.disconnected': 'Discord açık değil',
 
   'overlay.lastSeconds': 'Son {seconds} saniye',

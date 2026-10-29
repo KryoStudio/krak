@@ -13,7 +13,7 @@
   import Select from '$lib/components/Select.svelte';
   import HotkeyInput from '$lib/components/HotkeyInput.svelte';
   import QualityPicker from '$lib/components/QualityPicker.svelte';
-  import { api, native, type Microphone, type ResolvedVideo, type Settings, type StorageInfo } from '$lib/api';
+  import { api, native, type Microphone, type Presence, type ResolvedVideo, type Settings, type StorageInfo } from '$lib/api';
   import { capture, codecName, listMicrophones, memoryFor, resolveVideo, storageInfo, videoLabel } from '$lib/capture.svelte';
   import { GB, formatSize, hasKey, t } from '$lib/i18n.svelte';
   import { languages } from '$lib/locales';
@@ -77,7 +77,8 @@
 
   let recordError = $state('');
   let screenshotError = $state('');
-  let presence = $state<{ enabled: boolean; connected: boolean } | null>(null);
+  let presence = $state<Presence | null>(null);
+  const discordUser = $derived(presence?.user ?? null);
 
   async function setScreenshotHotkey(screenshotHotkey: string) {
     screenshotError = '';
@@ -255,11 +256,30 @@
                   {t('presence.preview')}
                   {#if presence}
                     <span class="presence-state" class:on={presence.connected}>
-                      <span></span>{t(presence.connected ? 'presence.connected' : 'presence.disconnected')}
+                      <span></span>{discordUser
+                        ? t('presence.connectedAs', { name: discordUser.displayName ?? discordUser.username })
+                        : t(presence.connected ? 'presence.connected' : 'presence.disconnected')}
                     </span>
                   {/if}
                 </span>
                 <div class="activity">
+                  <!-- The account of the Discord app on this PC, as Discord gave it: no login. -->
+                  {#if discordUser}
+                    <div class="profile">
+                      <img
+                        src={discordUser.avatar}
+                        alt=""
+                        width="40"
+                        height="40"
+                        referrerpolicy="no-referrer"
+                        onerror={(e) => ((e.currentTarget as HTMLImageElement).style.visibility = 'hidden')}
+                      />
+                      <div class="profile-name">
+                        <strong>{discordUser.displayName ?? discordUser.username}</strong>
+                        {#if discordUser.displayName}<span>{discordUser.username}</span>{/if}
+                      </div>
+                    </div>
+                  {/if}
                   <span class="activity-head">{t('presence.playingLabel')}</span>
                   <div class="activity-row">
                     <div class="activity-art">
@@ -878,6 +898,38 @@
     padding: 16px;
     border-radius: 12px;
     background: #111214;
+  }
+  .profile {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding-bottom: 12px;
+    border-bottom: 1px solid #2a2d33;
+  }
+  .profile img {
+    width: 40px;
+    height: 40px;
+    flex: none;
+    border-radius: 50%;
+    background: #2a2d33;
+  }
+  .profile-name {
+    display: flex;
+    flex-direction: column;
+    gap: 1px;
+    min-width: 0;
+    font-size: 13px;
+    color: #a7afb8;
+  }
+  .profile-name strong {
+    font-size: 15px;
+    color: var(--text);
+  }
+  .profile-name strong,
+  .profile-name span {
+    overflow: hidden;
+    white-space: nowrap;
+    text-overflow: ellipsis;
   }
   .activity-head {
     font-size: 11px;

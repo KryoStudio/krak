@@ -371,6 +371,7 @@ export const zh: Translation = {
   'presence.recording': '正在录制游戏',
   'presence.button': '获取 Krak',
   'presence.connected': '已连接到 Discord',
+  'presence.connectedAs': '已以 {name} 的身份连接',
   'presence.disconnected': 'Discord 未打开',
 
   'overlay.lastSeconds': '最近 {seconds} 秒',

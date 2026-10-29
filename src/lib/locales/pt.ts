@@ -373,6 +373,7 @@ export const pt: Translation = {
   'presence.recording': 'Gravando a partida',
   'presence.button': 'Baixar o Krak',
   'presence.connected': 'Conectado ao Discord',
+  'presence.connectedAs': 'Conectado como {name}',
   'presence.disconnected': 'O Discord não está aberto',
 
   'overlay.lastSeconds': 'Últimos {seconds} segundos',
