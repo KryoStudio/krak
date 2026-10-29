@@ -37,8 +37,11 @@
       on('shard-saving', (clip) =>
         present(
           false,
-          () => t('toast.captured'),
-          () => `${clip.game ?? t('game.desktop')} · ${t('overlay.lastSeconds', { seconds: Math.round(clip.duration) })}`,
+          () => t(clip.extended ? 'toast.extended' : 'toast.captured'),
+          () =>
+            `${clip.game ?? t('game.desktop')} · ${
+              clip.extended ? formatDuration(clip.duration) : t('overlay.lastSeconds', { seconds: Math.round(clip.duration) })
+            }`,
         ),
       ),
       on('screenshot-saved', (shot) =>

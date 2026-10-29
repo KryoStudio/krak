@@ -90,7 +90,9 @@ fn menu(app: &AppHandle) -> tauri::Result<Menu<Wry>> {
 fn on_menu_event(app: &AppHandle, event: MenuEvent) {
     match event.id().as_ref() {
         OPEN_APP => window::show_main(app),
-        CAPTURE_NOW => replay::request_save(app),
+        CAPTURE_NOW => {
+            replay::request_save(app);
+        }
         TOGGLE_RECORDING => recording::toggle(app),
         SCREENSHOT => screenshots::request(app),
         TOGGLE_REPLAY => {

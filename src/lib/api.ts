@@ -15,6 +15,12 @@ export interface Settings {
   recordHotkey: string;
   /** Saves the current frame as a PNG. */
   screenshotHotkey: string;
+  /** Controller buttons held together to keep a shard ("LB+RB"), '' = none. */
+  controllerHotkey: string;
+  /** A short buzz when the controller shortcut keeps a shard, two if it failed. */
+  controllerRumble: boolean;
+  /** A press within this many seconds of the previous one extends that shard (0 = never). */
+  extendSeconds: number;
   /** Show what you play and clip on your Discord profile. */
   discordPresence: boolean;
   /** Exports carry a small "by krak" badge (off by default: no watermark unless asked). */
@@ -192,6 +198,8 @@ export interface SavingShard {
   game: string | null;
   /** Seconds. */
   duration: number;
+  /** The previous shard grows (same file) instead of a new one. */
+  extended: boolean;
 }
 
 /** The account signed in to the Discord app on this PC, read from Discord itself (no login). */
@@ -243,6 +251,8 @@ export const api = {
   revealScreenshot: (id: string) => invoke<void>('reveal_screenshot', { id }),
   getPresence: () => invoke<Presence>('get_presence'),
   getWaveforms: (id: string, buckets: number) => invoke<Waveform[]>('get_waveforms', { id, buckets }),
+  /** Waits (up to 10 s) for controller buttons held together then released: "LB+RB". */
+  captureControllerCombo: () => invoke<string>('capture_controller_combo'),
   /** Native "Save as" dialog; null when cancelled. */
   chooseExportPath: (suggestedName: string) => invoke<string | null>('choose_export_path', { suggestedName }),
   /** Shows a file made by an export (this session) in Explorer. */

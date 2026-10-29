@@ -44,7 +44,9 @@ pub fn plugin() -> TauriPlugin<Wry> {
                 return;
             };
             match action_of(&state.settings(), shortcut) {
-                Some(Action::SaveReplay) => replay::request_save(app),
+                Some(Action::SaveReplay) => {
+                    replay::request_save(app);
+                }
                 Some(Action::ToggleRecording) => recording::toggle(app),
                 Some(Action::Screenshot) => screenshots::request(app),
                 None => {}

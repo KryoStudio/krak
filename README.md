@@ -45,6 +45,7 @@ A clip is called a **shard**. Your library is the **Glacier**.
 - [x] Editor: trim bar, waveforms, volume of each audio track, remembered per clip
 - [x] Export to a file, to the Glacier or to Discord under 10 MB, 50 MB or 500 MB, with an optional "by krak" badge, and 4:3 clips stretched to 16:9
 - [x] Discord Rich Presence, with your Discord profile shown in the app (read from Discord itself, no login)
+- [x] Controller shortcut (Xbox controllers) with a buzz to confirm, and a second press that makes the last shard longer instead of a new one
 - [x] Installer and signed automatic updates
 - [ ] Windows code signing (no SmartScreen warning)
 - [ ] Native AMD and Intel encoders, separate Discord voice track, mouse cursor in clips, choice of the captured screen

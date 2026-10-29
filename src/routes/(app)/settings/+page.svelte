@@ -12,6 +12,7 @@
   import Segmented from '$lib/components/Segmented.svelte';
   import Select from '$lib/components/Select.svelte';
   import HotkeyInput from '$lib/components/HotkeyInput.svelte';
+  import ControllerInput from '$lib/components/ControllerInput.svelte';
   import QualityPicker from '$lib/components/QualityPicker.svelte';
   import { api, native, type Microphone, type Presence, type ResolvedVideo, type Settings, type StorageInfo } from '$lib/api';
   import { capture, codecName, listMicrophones, memoryFor, resolveVideo, storageInfo, videoLabel } from '$lib/capture.svelte';
@@ -153,6 +154,7 @@
   ]);
 
   const buffers = [15, 30, 60, 120, 300].map((v) => ({ value: v, label: v < 60 ? `${v} s` : `${v / 60} min` }));
+  const extendChoices = $derived([0, 5, 10, 20].map((v) => ({ value: v, label: v ? `${v} s` : t('settings.extendOff') })));
   const fpsChoices = $derived(
     [30, 60, 120, 144]
       .filter((f) => !encoder?.refreshRate || f <= encoder.refreshRate + 1 || f === 30 || f === 60)
@@ -320,6 +322,20 @@
               <HotkeyInput value={s.hotkey} onchange={setHotkey} />
             {/snippet}
             {@render row(t('settings.hotkey'), hotkeyError || t('settings.hotkeyHint'), hotkey, hotkeyError ? 'error' : '')}
+            {#snippet controller()}
+              <ControllerInput value={s.controllerHotkey} onchange={(controllerHotkey) => settings.update({ controllerHotkey }).catch(showError)} />
+            {/snippet}
+            {@render row(t('settings.controller'), t('settings.controllerHint'), controller)}
+            {#if s.controllerHotkey}
+              {#snippet rumble()}
+                <Toggle label={t('settings.rumble')} checked={s.controllerRumble} onchange={(v) => set({ controllerRumble: v })} />
+              {/snippet}
+              {@render row(t('settings.rumble'), t('settings.rumbleHint'), rumble)}
+            {/if}
+            {#snippet extend()}
+              <Segmented label={t('settings.extend')} options={extendChoices} value={s.extendSeconds} onchange={(v) => set({ extendSeconds: v })} />
+            {/snippet}
+            {@render row(t('settings.extend'), t('settings.extendHint'), extend)}
             {#snippet buffer()}
               <Segmented label={t('settings.buffer')} options={buffers} value={s.bufferSeconds} onchange={(v) => set({ bufferSeconds: v })} />
             {/snippet}

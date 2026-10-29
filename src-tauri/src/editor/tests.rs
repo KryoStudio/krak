@@ -113,12 +113,15 @@ fn record(dir: &Path, seconds: u32) -> (PathBuf, CaptureStatus) {
     );
     let status = engine.status();
     engine
-        .save(SaveRequest {
-            clips_dir: dir.to_path_buf(),
-            game: None,
-            desktop_label: "Editor test".into(),
-            stamp: Stamp::now(),
-        })
+        .save(
+            SaveRequest {
+                clips_dir: dir.to_path_buf(),
+                game: None,
+                desktop_label: "Editor test".into(),
+                stamp: Stamp::now(),
+            },
+            Duration::ZERO,
+        )
         .expect("save accepted");
     let saved = events
         .wait(Duration::from_secs(30), |e| lock(&e.seen).1.clone())

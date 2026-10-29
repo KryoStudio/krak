@@ -18,14 +18,16 @@ function demoOnly(): boolean {
   return library.demo;
 }
 
-/** A shard was just captured: show it in the Glacier right away, highlighted, and say so. */
+/** A shard was just captured (or extended: the same one, longer): show it in the Glacier right
+ *  away, highlighted, and say so. */
 export function announce(shard: Shard) {
+  const extended = !!library.find(shard.id);
   library.upsert(shard);
   ui.fresh = shard.id;
   setTimeout(() => ui.fresh === shard.id && (ui.fresh = null), 2600);
   toast({
     kind: 'capture',
-    title: t('toast.captured'),
+    title: t(extended ? 'toast.extended' : 'toast.captured'),
     body: `${gameName(shard)} · ${Math.round(shard.duration)} s`,
     action: { label: t('toast.view'), run: () => play(shard) },
   });

@@ -6,6 +6,7 @@
 //! A press is acknowledged at once (the chime, `shard-saving` for the in-game notification):
 //! the moment is kept as soon as the engine took its snapshot, while writing the file can take
 //! seconds (a long replay, a slow disk). Only a failure is heard again, with its own sound.
+//! A press soon after another one (`extendSeconds`) extends that clip (`Engine::save`).
 //! A continuous recording goes on across restarts (`crate::recording`).
 //!
 //! Starting and stopping happen on one control thread: stopping joins the engine's threads,
@@ -44,6 +45,19 @@ struct SavingShard {
     game: Option<String>,
     /// Length of the clip being written, s.
     duration: f64,
+    /// It extends the previous clip (same file, longer).
+    extended: bool,
+}
+
+/// What a press of a clip shortcut did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Press {
+    /// A clip is being written (or the previous one extended).
+    Saving,
+    /// Too close to the previous press: nothing happened.
+    Ignored,
+    /// Nothing will be saved (`capture-failed` says why).
+    Failed,
 }
 
 enum Control {
@@ -193,15 +207,15 @@ pub fn settings_changed(app: &AppHandle, old: &Settings, new: &Settings) {
     }
 }
 
-/// Hotkey / tray / command: saves the replay in the background. The result comes as
-/// `shard-saved` or `capture-failed`.
-pub fn request_save(app: &AppHandle) {
+/// Hotkey / controller / tray / command: saves the replay in the background. The result
+/// comes as `shard-saved` or `capture-failed`.
+pub fn request_save(app: &AppHandle) -> Press {
     let replay = app.state::<Replay>();
     {
         let mut last = lock(&replay.last_press);
         let now = Instant::now();
         if last.is_some_and(|at| now.duration_since(at) < DEBOUNCE) {
-            return;
+            return Press::Ignored;
         }
         *last = Some(now);
     }
@@ -214,18 +228,28 @@ pub fn request_save(app: &AppHandle) {
         desktop_label: i18n::labels(settings.language.as_deref()).desktop.into(),
         stamp: Stamp::now(),
     };
+    let extend_within = Duration::from_secs(u64::from(settings.extend_seconds));
     let result = match lock(&replay.engine).as_ref() {
-        Some(engine) if !replay.is_paused() => engine.save(request),
+        Some(engine) if !replay.is_paused() => engine.save(request, extend_within),
         _ => Err(capture::NOT_READY),
     };
     match result {
-        Ok(duration) => {
+        Ok(saving) => {
             if settings.capture_sound {
                 capture::sound::play_chime();
             }
-            let _ = app.emit(SHARD_SAVING, SavingShard { game, duration });
+            let shard = SavingShard {
+                game,
+                duration: saving.seconds,
+                extended: saving.extended,
+            };
+            let _ = app.emit(SHARD_SAVING, shard);
+            Press::Saving
         }
-        Err(code) => capture_failed(app, code),
+        Err(code) => {
+            capture_failed(app, code);
+            Press::Failed
+        }
     }
 }
 

@@ -7,7 +7,9 @@
 //! - audio: WASAPI loopback of the default output (and the chosen or default microphone when
 //!   enabled) into continuous PCM timelines on the same clock;
 //! - one short-lived thread per save, which mixes and encodes the audio and writes the MP4, at
-//!   background priority (CPU, disk and memory) so a game never waits for it;
+//!   background priority (CPU, disk and memory) so a game never waits for it. A press soon
+//!   after another one (`extend_within`) extends that clip instead: same start, same file,
+//!   up to the new press (`LastClip`);
 //! - during a continuous recording, one more thread that gets every video packet the ring gets
 //!   and encodes the audio as it comes into a growing MP4 (`record`).
 //!
@@ -33,9 +35,9 @@ mod tests;
 mod timeline;
 mod video;
 
-use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
-use std::sync::{Arc, Mutex};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU8, AtomicU32, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -63,6 +65,9 @@ pub const ENCODE_FAILED: &str = "encode_failed";
 
 /// Audio kept beyond the replay window: a clip may start up to one GOP before it.
 const AUDIO_MARGIN_SECONDS: u32 = 3;
+/// An extended clip stays within the replay length plus this (what it holds is kept apart
+/// from the ring's budget while it can still grow).
+const MAX_EXTENSION: i64 = 60 * TICKS_PER_SECOND;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EngineConfig {
@@ -190,6 +195,53 @@ struct Shared {
     recording: AtomicBool,
     /// The video pipeline's desktop copy while it runs (`screenshot`).
     screen: Mutex<Option<screenshot::Source>>,
+    /// The last clip, while a press can still extend it.
+    last_clip: Mutex<Option<LastClip>>,
+    /// Engine clock time after which `last_clip` can go (0: none), read on every frame.
+    last_clip_until: AtomicI64,
+}
+
+/// A clip the next press may extend.
+struct LastClip {
+    /// Engine clock time of the press that made it.
+    pressed: i64,
+    snapshot: Arc<save::Snapshot>,
+    /// Folder, game and name: those of the chain's first press.
+    request: SaveRequest,
+    file: Arc<Written>,
+}
+
+/// The file a save wrote, once it is known.
+#[derive(Default)]
+struct Written {
+    result: Mutex<Option<Result<PathBuf, &'static str>>>,
+    done: Condvar,
+}
+
+impl Written {
+    fn set(&self, result: Result<PathBuf, &'static str>) {
+        *lock(&self.result) = Some(result);
+        self.done.notify_all();
+    }
+
+    /// Waits for the save to finish.
+    fn wait(&self) -> Result<PathBuf, &'static str> {
+        let mut result = lock(&self.result);
+        loop {
+            if let Some(result) = result.as_ref() {
+                return result.clone();
+            }
+            result = self.done.wait(result).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+}
+
+/// What a press got: the clip being written and its length.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Saving {
+    pub seconds: f64,
+    /// It extends the previous clip (the same file, longer).
+    pub extended: bool,
 }
 
 impl Shared {
@@ -214,6 +266,18 @@ impl Shared {
             recorder: Mutex::default(),
             recording: AtomicBool::new(false),
             screen: Mutex::default(),
+            last_clip: Mutex::default(),
+            last_clip_until: AtomicI64::new(0),
+        }
+    }
+
+    /// Lets the last clip go once no press can extend it (called on every frame: one atomic
+    /// read until then).
+    fn forget_last_clip(&self, now: i64) {
+        let until = self.last_clip_until.load(Ordering::Relaxed);
+        if until != 0 && now > until {
+            self.last_clip_until.store(0, Ordering::Relaxed);
+            lock(&self.last_clip).take();
         }
     }
 
@@ -343,9 +407,16 @@ impl Engine {
 
     /// Saves the last `bufferSeconds` (from the keyframe before) in the background: the result
     /// arrives through [`EngineEvents::saved`] / [`EngineEvents::save_failed`]. Fails at once
-    /// with "not_ready" or "empty". Returns the clip's length in seconds: what it holds is
-    /// fixed from here on.
-    pub fn save(&self, request: SaveRequest) -> Result<f64, &'static str> {
+    /// with "not_ready" or "empty". What the clip holds is fixed from here on.
+    ///
+    /// Within `extend_within` of the previous press (same folder and game, the same stream
+    /// still going), the previous clip is extended up to now instead: it keeps its start and
+    /// its file, which is replaced once written.
+    pub fn save(
+        &self,
+        request: SaveRequest,
+        extend_within: Duration,
+    ) -> Result<Saving, &'static str> {
         let shared = &self.shared;
         if lock(&shared.status).state != CaptureState::Ready {
             return Err(NOT_READY);
@@ -359,31 +430,65 @@ impl Engine {
         if video.is_empty() {
             return Err(EMPTY);
         }
-        let frame = TICKS_PER_SECOND / i64::from(params.fps.max(1));
-        let (first, last) = video.iter().fold((i64::MAX, i64::MIN), |(first, last), p| {
-            (first.min(p.pts), last.max(p.pts))
-        });
-        let seconds = (last - first + frame) as f64 / TICKS_PER_SECOND as f64;
-        let snapshot = save::Snapshot {
+        let fresh = save::Snapshot {
             params,
             video,
             game: lock(&shared.game_audio).snapshot(),
             mic: shared.mic_audio.as_ref().map(|m| lock(m).snapshot()),
             audio_bitrate: shared.config.audio_bitrate,
         };
+        let within = i64::try_from(extend_within.as_nanos() / 100).unwrap_or(i64::MAX);
+        let longest = shared.window() + MAX_EXTENSION;
+
+        let mut last = lock(&shared.last_clip);
+        let extension = last
+            .as_ref()
+            .filter(|clip| {
+                now - clip.pressed <= within
+                    && clip.request.game == request.game
+                    && clip.request.clips_dir == request.clips_dir
+            })
+            .and_then(|clip| clip.snapshot.extended(&fresh))
+            .filter(|longer| longer.span() <= longest);
+        let (snapshot, request, previous) = match (extension, last.take()) {
+            (Some(longer), Some(clip)) => (longer, clip.request, Some(clip.file)),
+            _ => (fresh, request, None),
+        };
+        let snapshot = Arc::new(snapshot);
+        let file = Arc::new(Written::default());
+        if within > 0 {
+            *last = Some(LastClip {
+                pressed: now,
+                snapshot: snapshot.clone(),
+                request: request.clone(),
+                file: file.clone(),
+            });
+            shared
+                .last_clip_until
+                .store(now.saturating_add(within), Ordering::Relaxed);
+        }
+        drop(last);
+
+        let saving = Saving {
+            seconds: snapshot.span() as f64 / TICKS_PER_SECOND as f64,
+            extended: previous.is_some(),
+        };
         let events = shared.events.clone();
         std::thread::Builder::new()
             .name("kryo-save".into())
             .spawn(move || {
                 save::in_background();
-                let result = save::write_clip(&snapshot, &request);
+                // An extension replaces the file of the clip it extends, once that one exists.
+                let replacing = previous.and_then(|file| file.wait().ok());
+                let result = save::write_clip(&snapshot, &request, replacing.as_deref());
                 drop(snapshot);
+                file.set(result.clone());
                 match result {
                     Ok(path) => events.saved(&path),
                     Err(code) => events.save_failed(code),
                 }
             })
-            .map(|_| seconds)
+            .map(|_| saving)
             .map_err(|_| WRITE_FAILED)
     }
 

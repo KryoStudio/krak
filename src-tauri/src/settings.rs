@@ -26,6 +26,9 @@ const MAX_BITRATE: u32 = 150;
 /// AAC kbit/s of the stereo tracks.
 pub const AUDIO_BITRATES: [u32; 5] = [128, 160, 192, 256, 320];
 const DEFAULT_AUDIO_BITRATE: u32 = 192;
+/// Seconds within which a press extends the previous clip (0: every press makes its own).
+const EXTEND_CHOICES: [u32; 4] = [0, 5, 10, 20];
+const DEFAULT_EXTEND_SECONDS: u32 = 10;
 /// Storage limit bounds, GB.
 const MIN_STORAGE_GB: f64 = 1.0;
 const MAX_STORAGE_GB: f64 = 100_000.0;
@@ -88,6 +91,14 @@ pub struct Settings {
     /// Starts and stops a continuous recording.
     pub record_hotkey: String,
     pub screenshot_hotkey: String,
+    /// Controller buttons held together to save the replay ("LB+RB", see `gamepad`); empty
+    /// = none.
+    pub controller_hotkey: String,
+    /// A short buzz on the controller when its shortcut keeps a shard (two if it failed).
+    pub controller_rumble: bool,
+    /// A press within this many seconds of the previous one extends that clip instead of
+    /// making a new one; 0 = never.
+    pub extend_seconds: u32,
     pub buffer_seconds: u32,
     pub quality: Quality,
     /// Custom quality only ("auto" = premium's choice).
@@ -139,6 +150,9 @@ pub struct SettingsPatch {
     pub hotkey: Option<String>,
     pub record_hotkey: Option<String>,
     pub screenshot_hotkey: Option<String>,
+    pub controller_hotkey: Option<String>,
+    pub controller_rumble: Option<bool>,
+    pub extend_seconds: Option<f64>,
     pub buffer_seconds: Option<f64>,
     pub fps: Option<f64>,
     pub quality: Option<Quality>,
@@ -181,6 +195,9 @@ impl Settings {
             hotkey: DEFAULT_HOTKEY.into(),
             record_hotkey: DEFAULT_RECORD_HOTKEY.into(),
             screenshot_hotkey: DEFAULT_SCREENSHOT_HOTKEY.into(),
+            controller_hotkey: String::new(),
+            controller_rumble: true,
+            extend_seconds: DEFAULT_EXTEND_SECONDS,
             buffer_seconds: DEFAULT_BUFFER_SECONDS,
             quality: Quality::default(),
             codec: CodecChoice::default(),
@@ -219,6 +236,18 @@ impl Settings {
         }
         if let Some(hotkey) = patch.screenshot_hotkey {
             next.screenshot_hotkey = hotkey.trim().to_string();
+        }
+        if let Some(combo) = patch.controller_hotkey {
+            // Anything that is not a combination of known buttons means none.
+            next.controller_hotkey = crate::gamepad::Combo::parse(&combo)
+                .map(|combo| combo.to_string())
+                .unwrap_or_default();
+        }
+        if let Some(rumble) = patch.controller_rumble {
+            next.controller_rumble = rumble;
+        }
+        if let Some(seconds) = patch.extend_seconds {
+            next.extend_seconds = snap(seconds, &EXTEND_CHOICES, DEFAULT_EXTEND_SECONDS);
         }
         if let Some(seconds) = patch.buffer_seconds {
             next.buffer_seconds = clamp_buffer_seconds(seconds);
@@ -448,6 +477,35 @@ mod tests {
         assert!(!s.sidebar_collapsed && !s.launch_at_startup && s.close_to_tray);
         assert!(!s.microphone && s.capture_sound && s.overlay);
         assert!(s.discord_presence && !s.watermark);
+        assert_eq!(
+            (
+                s.controller_hotkey.as_str(),
+                s.controller_rumble,
+                s.extend_seconds
+            ),
+            ("", true, 10)
+        );
+    }
+
+    #[test]
+    fn checks_the_controller_and_extension_settings() {
+        let s = defaults().merge(patch(
+            r#"{"controllerHotkey": " rb + lb ", "controllerRumble": false, "extendSeconds": 7}"#,
+        ));
+        // Canonical order; the closest offered window.
+        assert_eq!(s.controller_hotkey, "LB+RB");
+        assert!(!s.controller_rumble);
+        assert_eq!(s.extend_seconds, 5);
+        assert_eq!(s.merge(patch(r#"{"extendSeconds": 0}"#)).extend_seconds, 0);
+        assert_eq!(
+            s.merge(patch(r#"{"extendSeconds": 60}"#)).extend_seconds,
+            20
+        );
+        // Not a combination (one button, unknown names, nothing): none.
+        for bad in ["A", "LB+Nope", ""] {
+            let json = serde_json::json!({ "controllerHotkey": bad }).to_string();
+            assert_eq!(s.merge(patch(&json)).controller_hotkey, "", "{bad}");
+        }
     }
 
     #[test]
@@ -474,6 +532,9 @@ mod tests {
         assert_eq!(json["screenshotHotkey"], "Ctrl+F9");
         assert_eq!(json["discordPresence"], true);
         assert_eq!(json["watermark"], false);
+        assert_eq!(json["controllerHotkey"], "");
+        assert_eq!(json["controllerRumble"], true);
+        assert_eq!(json["extendSeconds"], 10);
         let custom = defaults().merge(patch(r#"{"quality": "custom", "resolution": "1440"}"#));
         let json = serde_json::to_value(custom).expect("serializable");
         assert_eq!(

@@ -35,6 +35,8 @@ struct Recorder {
 struct Seen {
     statuses: Vec<CaptureStatus>,
     saved: Option<PathBuf>,
+    /// Every save, in order.
+    saves: Vec<PathBuf>,
     failed: Option<&'static str>,
     recordings: Vec<PathBuf>,
     recording_failed: Option<&'static str>,
@@ -48,7 +50,9 @@ impl EngineEvents for Recorder {
     }
 
     fn saved(&self, path: &Path) {
-        lock(&self.events).saved = Some(path.to_path_buf());
+        let mut seen = lock(&self.events);
+        seen.saved = Some(path.to_path_buf());
+        seen.saves.push(path.to_path_buf());
         self.changed.notify_all();
     }
 
@@ -175,7 +179,7 @@ fn run(label: &str, video: VideoSettings, microphone: bool, software: bool) -> P
         stamp: Stamp::now(),
     };
     let save_started = Instant::now();
-    engine.save(request).expect("save accepted");
+    engine.save(request, Duration::ZERO).expect("save accepted");
     let outcome = recorder.wait(Duration::from_secs(30), |seen| {
         seen.saved.clone().map(Ok).or_else(|| seen.failed.map(Err))
     });
@@ -293,6 +297,90 @@ fn run(label: &str, video: VideoSettings, microphone: bool, software: bool) -> P
 #[ignore = "records the screen (silently); needs a display, GPU and audio (run with --ignored)"]
 fn engine_end_to_end() {
     run("High", video(Quality::High, 60), false, false);
+}
+
+/// Two presses 3 s apart, extending within 10 s: one file, from the first clip's start to the
+/// second press, every frame one tick apart.
+#[test]
+#[ignore = "records the screen (silently); run with --ignored"]
+fn engine_extends_the_previous_clip() {
+    let _com = ComGuard::new();
+    let _mf = MfGuard::new().expect("media foundation");
+    let dir = out_dir().join("extend");
+    let _ = std::fs::remove_dir_all(&dir);
+    let recorder = Arc::new(Recorder::default());
+    let config = EngineConfig {
+        screen_fit: crate::settings::ScreenFit::Screen,
+        video: video(Quality::High, 60),
+        audio_bitrate: 192_000,
+        buffer_seconds: 5,
+        microphone: false,
+        microphone_device: None,
+    };
+    let started = Instant::now();
+    let engine = Engine::start(config, recorder.clone());
+    recorder
+        .wait(Duration::from_secs(10), |seen| {
+            seen.statuses
+                .iter()
+                .any(|s| s.state == CaptureState::Ready)
+                .then_some(())
+        })
+        .expect("engine never became ready");
+    std::thread::sleep(Duration::from_secs(7).saturating_sub(started.elapsed()));
+    let request = || SaveRequest {
+        clips_dir: dir.clone(),
+        game: None,
+        desktop_label: "Extend".into(),
+        stamp: Stamp::now(),
+    };
+    let within = Duration::from_secs(10);
+    let first = engine.save(request(), within).expect("first press");
+    std::thread::sleep(Duration::from_secs(3));
+    let second = engine.save(request(), within).expect("second press");
+    println!("first press {first:?}, second press {second:?}");
+    assert!(!first.extended && second.extended);
+    assert!(
+        (second.seconds - first.seconds - 3.0).abs() < 0.3,
+        "{first:?} then {second:?}"
+    );
+    let paths = recorder
+        .wait(Duration::from_secs(30), |seen| {
+            (seen.saves.len() == 2).then(|| seen.saves.clone())
+        })
+        .expect("both saves");
+    drop(engine);
+    assert_eq!(paths[0], paths[1], "the longer clip replaced the first one");
+    let files: Vec<_> = std::fs::read_dir(&dir)
+        .expect("folder")
+        .filter_map(Result::ok)
+        .map(|e| e.file_name())
+        .collect();
+    assert_eq!(files.len(), 1, "one file, no leftover: {files:?}");
+
+    let info = testing::probe(&paths[1]);
+    println!(
+        "extended clip: {} ({:.2} s)",
+        paths[1].display(),
+        info.duration
+    );
+    assert!(
+        (info.duration - second.seconds).abs() <= 0.3,
+        "file {} s, press said {} s",
+        info.duration,
+        second.seconds
+    );
+    let frames = testing::decode_video_timestamps(&paths[1], false);
+    let frame = TICKS_PER_SECOND / 60;
+    let gaps: Vec<i64> = frames.windows(2).map(|w| w[1] - w[0]).collect();
+    let irregular = gaps.iter().filter(|&&g| (g - frame).abs() > 2_000).count();
+    assert!(irregular * 100 <= gaps.len(), "{irregular} irregular gaps");
+    let (pcm, channels) = testing::decode_audio(&paths[1], 0);
+    let audio_seconds = pcm.len() as f64 / f64::from(channels) / 48_000.0;
+    assert!(
+        (audio_seconds - info.duration).abs() < 0.15,
+        "audio {audio_seconds} s"
+    );
 }
 
 #[test]
@@ -480,7 +568,9 @@ fn engine_records_continuously() {
     drop(image);
 
     // The replay keeps saving clips meanwhile.
-    engine.save(request("Clip")).expect("save accepted");
+    engine
+        .save(request("Clip"), Duration::ZERO)
+        .expect("save accepted");
     let clip = recorder
         .wait(Duration::from_secs(30), |seen| seen.saved.clone())
         .expect("clip saved");
@@ -633,7 +723,7 @@ fn save_keeps_av_sync_with_b_frames() {
             desktop_label: format!("Sync {codec:?}"),
             stamp: Stamp::now(),
         };
-        let path = save::write_clip(&snapshot, &request).expect("write clip");
+        let path = save::write_clip(&snapshot, &request, None).expect("write clip");
 
         // Our demuxer (edit lists applied, like Chromium and ffmpeg).
         let movie = crate::editor::demux::open(&path).expect("demux");
@@ -803,12 +893,15 @@ fn engine_keeps_the_replay_through_a_mode_change() {
     );
 
     engine
-        .save(SaveRequest {
-            clips_dir: out_dir(),
-            game: None,
-            desktop_label: "ModeChange".into(),
-            stamp: Stamp::now(),
-        })
+        .save(
+            SaveRequest {
+                clips_dir: out_dir(),
+                game: None,
+                desktop_label: "ModeChange".into(),
+                stamp: Stamp::now(),
+            },
+            Duration::ZERO,
+        )
         .expect("save accepted");
     let path = match recorder
         .wait(Duration::from_secs(30), |seen| {

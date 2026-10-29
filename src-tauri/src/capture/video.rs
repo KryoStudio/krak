@@ -401,6 +401,7 @@ impl Pipeline {
             }
             timer.wait_until(due(tick));
             let now = clock::now();
+            shared.forget_last_clip(now);
             // Late (busy encoder, starved thread): skip to the latest tick that is due.
             let current = tick.max((now - start) * fps / TICKS_PER_SECOND);
             let late = u64::try_from(current - tick).unwrap_or(0);

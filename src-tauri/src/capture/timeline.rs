@@ -122,6 +122,7 @@ impl AudioTimeline {
             start: self.start,
             chunks: self.chunks.iter().cloned().collect(),
             tail: self.current.clone(),
+            earlier: None,
         }
     }
 
@@ -164,13 +165,31 @@ pub struct AudioSnapshot {
     start: i64,
     chunks: Vec<Arc<[i16]>>,
     tail: Vec<i16>,
+    /// An older snapshot of the same track, for what was trimmed before `start` since.
+    earlier: Option<Box<AudioSnapshot>>,
 }
 
 impl AudioSnapshot {
     /// `frames` interleaved stereo frames from `from`, silence wherever nothing was recorded.
     pub fn read(&self, from: i64, frames: usize) -> Vec<i16> {
         let pieces = self.chunks.iter().map(|c| &c[..]).chain([&self.tail[..]]);
-        read_pieces(self.start, pieces, from, frames)
+        let Some(earlier) = self.earlier.as_deref().filter(|_| from < self.start) else {
+            return read_pieces(self.start, pieces, from, frames);
+        };
+        // Up to our start from the older snapshot, the rest from ours.
+        let head = usize::try_from(self.start - from)
+            .unwrap_or(usize::MAX)
+            .min(frames);
+        let mut out = earlier.read(from, head);
+        out.extend(read_pieces(self.start, pieces, self.start, frames - head));
+        out
+    }
+
+    /// This snapshot, reading what came before its start from `earlier` (an older snapshot of
+    /// the same track): a clip extended past what the track still holds.
+    pub fn after(mut self, earlier: AudioSnapshot) -> Self {
+        self.earlier = Some(Box::new(earlier));
+        self
     }
 }
 
@@ -280,6 +299,36 @@ mod tests {
         assert_eq!((t.start(), t.end()), (48_000 * 3600, 48_000 * 3600));
         t.write(48_000 * 7200, &frames(1, 10), false);
         assert_eq!(t.start(), 48_000 * 7200);
+    }
+
+    #[test]
+    fn reads_across_an_older_snapshot() {
+        let mut t = AudioTimeline::new(0, 48_000 * 600);
+        for i in 0..4 {
+            t.write(
+                i * 24_000,
+                &frames(i16::try_from(i).unwrap() + 1, 24_000),
+                false,
+            );
+        }
+        let earlier = t.snapshot();
+        for i in 4..8 {
+            t.write(
+                i * 24_000,
+                &frames(i16::try_from(i).unwrap() + 1, 24_000),
+                false,
+            );
+        }
+        t.trim(72_000); // the first three chunks are gone from the track...
+        let later = t.snapshot().after(earlier);
+        // ...and come from the older snapshot: one continuous read over both.
+        let out = left(&later.read(10_000, 160_000));
+        assert_eq!(out.len(), 160_000);
+        assert_eq!((out[0], out[13_999], out[14_000]), (1, 1, 2));
+        assert_eq!((out[37_999], out[38_000]), (2, 3));
+        assert_eq!((out[62_000], out[110_000], out[159_999]), (4, 6, 8));
+        // Starting inside the later one: the older one is not needed.
+        assert_eq!(left(&later.read(100_000, 10))[0], 5);
     }
 
     #[test]
