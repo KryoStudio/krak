@@ -1,5 +1,6 @@
-//! MP4/MOV demuxing for the editor: each track's sample table (file offset, size, times, sync
-//! flag) and codec configuration, built on [`crate::mp4`]'s box reader.
+//! MP4/MOV demuxing for the editor: each track's sample table (file offset, size, decode and
+//! composition times, sync flag) and codec configuration (`avcC`, `hvcC`, `av1C`, AAC `esds`,
+//! `colr`), built on [`crate::mp4`]'s box reader.
 //!
 //! Times: samples keep their media times (track timescale); [`Track::time`] maps them to the
 //! movie timeline in 100 ns, applying the edit list the way players do (leading empty edits
@@ -9,7 +10,9 @@
 use std::fs::File;
 use std::path::Path;
 
-use crate::media::{TICKS_PER_SECOND, rescale};
+use crate::media::codec::CodecConfig;
+use crate::media::mp4_writer::Colour;
+use crate::media::{TICKS_PER_SECOND, av1, hevc, rescale};
 use crate::mp4::{self, TrackHeader, be16, be32, be64, boxes, child, descend};
 
 /// Refuses absurd tables (corrupt files) before allocating for them: ~46 h at 60 fps.
@@ -19,6 +22,8 @@ const MAX_SAMPLES: usize = 10_000_000;
 pub struct Sample {
     pub offset: u64,
     pub size: u32,
+    /// Decode time in the track timescale.
+    pub dts: i64,
     /// Composition (presentation) time in the track timescale, before the edit list.
     pub cts: i64,
     /// Media duration in the track timescale (from `stts`).
@@ -35,14 +40,57 @@ pub enum Codec {
         /// Bytes of each NAL length prefix (1, 2 or 4).
         length_size: u8,
     },
+    /// `hvc1` (parameter sets only in `hvcC`) or `hev1` (they may also be in band).
+    Hevc {
+        vps: Vec<Vec<u8>>,
+        sps: Vec<Vec<u8>>,
+        pps: Vec<Vec<u8>>,
+        length_size: u8,
+        in_band: bool,
+    },
+    /// `av01`: the sequence header OBU from `av1C`.
+    Av1 { sequence_header: Vec<u8> },
     /// MPEG-4 / MPEG-2 AAC in `mp4a`.
     Aac {
         asc: Vec<u8>,
         sample_rate: u32,
         channels: u16,
     },
-    /// Anything else (`hvc1`, `avc3`, `Opus`, `.mp3`...), by sample entry type.
+    /// Anything else (`avc3`, `vp09`, `Opus`, `.mp3`...), by sample entry type.
     Other([u8; 4]),
+}
+
+impl Codec {
+    /// The parameter sets as our muxer writes them, when the samples can be copied as they are
+    /// (one set of each, 4-byte NAL lengths, nothing in band).
+    pub fn passthrough_config(&self) -> Option<CodecConfig> {
+        let config = match self {
+            Self::Avc {
+                sps,
+                pps,
+                length_size: 4,
+            } if sps.len() == 1 && pps.len() == 1 => CodecConfig::Avc {
+                sps: sps[0].clone(),
+                pps: pps[0].clone(),
+            },
+            Self::Hevc {
+                vps,
+                sps,
+                pps,
+                length_size: 4,
+                in_band: false,
+            } if vps.len() == 1 && sps.len() == 1 && pps.len() == 1 => CodecConfig::Hevc {
+                vps: vps[0].clone(),
+                sps: sps[0].clone(),
+                pps: pps[0].clone(),
+            },
+            Self::Av1 { sequence_header } => CodecConfig::Av1 {
+                sequence_header: sequence_header.clone(),
+            },
+            _ => return None,
+        };
+        config.info().map(|_| config)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -62,7 +110,13 @@ pub struct Track {
     /// In decode order.
     pub samples: Vec<Sample>,
     /// `cts - dts` varies (B-frames): presentation order differs from decode order.
+    #[allow(
+        dead_code,
+        reason = "informative; checked by the muxer round-trip tests"
+    )]
     pub reordered: bool,
+    /// The sample entry's `colr` (nclx), if any.
+    pub colour: Option<Colour>,
     /// Media time shown at the delay below (track timescale).
     media_start: i64,
     /// Leading empty edits (100 ns).
@@ -148,7 +202,7 @@ fn parse_track(header: TrackHeader, trak: &[u8], movie_timescale: u32) -> Option
         b"soun" => Kind::Audio,
         _ => Kind::Other,
     };
-    let (codec, multiple_entries) = sample_entry(child(stbl, b"stsd")?);
+    let (codec, multiple_entries, colour) = sample_entry(child(stbl, b"stsd")?);
     let (samples, reordered) = sample_table(stbl)?;
 
     let mut delay = 0i64;
@@ -175,24 +229,76 @@ fn parse_track(header: TrackHeader, trak: &[u8], movie_timescale: u32) -> Option
         multiple_entries,
         samples,
         reordered,
+        colour,
         media_start,
         delay,
     })
 }
 
-/// The first sample description, and whether there are more.
-fn sample_entry(stsd: &[u8]) -> (Codec, bool) {
+/// The first sample description, whether there are more, and its `colr` (visual entries).
+fn sample_entry(stsd: &[u8]) -> (Codec, bool, Option<Colour>) {
     let count = be32(stsd, 4).unwrap_or(0);
     let entry = stsd.get(8..).and_then(|e| boxes(e).next());
-    let codec = match entry {
-        Some((kind, body)) => match &kind {
-            b"avc1" => avc_entry(body).unwrap_or(Codec::Other(kind)),
-            b"mp4a" => aac_entry(body).unwrap_or(Codec::Other(kind)),
-            _ => Codec::Other(kind),
-        },
-        None => Codec::Other(*b"none"),
+    let (codec, colour) = match entry {
+        Some((kind, body)) => {
+            let codec = match &kind {
+                b"avc1" => avc_entry(body),
+                b"hvc1" | b"hev1" => hevc_entry(body, &kind == b"hev1"),
+                b"av01" => av1_entry(body),
+                b"mp4a" => aac_entry(body),
+                _ => None,
+            };
+            let colour = matches!(&kind, b"avc1" | b"hvc1" | b"hev1" | b"av01")
+                .then(|| body.get(78..).and_then(colour))
+                .flatten();
+            (codec.unwrap_or(Codec::Other(kind)), colour)
+        }
+        None => (Codec::Other(*b"none"), None),
     };
-    (codec, count > 1)
+    (codec, count > 1, colour)
+}
+
+/// `colr` of type `nclx` among a visual sample entry's child boxes.
+fn colour(children: &[u8]) -> Option<Colour> {
+    let colr = child(children, b"colr")?;
+    if colr.get(..4)? != b"nclx" {
+        return None;
+    }
+    Some(Colour {
+        primaries: be16(colr, 4)?,
+        transfer: be16(colr, 6)?,
+        matrix: be16(colr, 8)?,
+        full_range: colr.get(10)? & 0x80 != 0,
+    })
+}
+
+/// VisualSampleEntry fields, then `hvcC`.
+fn hevc_entry(body: &[u8], hev1: bool) -> Option<Codec> {
+    let hvcc = child(body.get(78..)?, b"hvcC")?;
+    let (sets, length_size) = hevc::read_decoder_config(hvcc)?;
+    let of = |kind: u8| -> Vec<Vec<u8>> {
+        sets.iter()
+            .filter(|s| hevc::nal_type(s) == kind)
+            .cloned()
+            .collect()
+    };
+    if length_size == 3 {
+        return None;
+    }
+    Some(Codec::Hevc {
+        vps: of(hevc::NAL_VPS),
+        sps: of(hevc::NAL_SPS),
+        pps: of(hevc::NAL_PPS),
+        length_size,
+        in_band: hev1,
+    })
+}
+
+/// VisualSampleEntry fields, then `av1C` (4 fixed bytes and the config OBUs).
+fn av1_entry(body: &[u8]) -> Option<Codec> {
+    let av1c = child(body.get(78..)?, b"av1C")?;
+    let sequence_header = av1::find_sequence_header(av1c.get(4..)?)?.to_vec();
+    Some(Codec::Av1 { sequence_header })
 }
 
 /// VisualSampleEntry: 78 bytes of fields, then child boxes (`avcC`, `colr`, `pasp`...).
@@ -427,6 +533,7 @@ fn sample_table(stbl: &[u8]) -> Option<(Vec<Sample>, bool)> {
             samples.push(Sample {
                 offset,
                 size,
+                dts,
                 cts: dts + i64::from(offsets.get(i).copied().unwrap_or(0)),
                 duration: durations[i],
                 sync: sync[i],
@@ -480,18 +587,22 @@ mod tests {
 
     /// 2 s at 30 fps (keyframes at 0 and 1 s) from pts 5 s, plus two 48 kHz audio tracks.
     fn write(options: Options) -> Vec<u8> {
-        let sps = sps_high_1080p();
+        let config = CodecConfig::Avc {
+            sps: sps_high_1080p(),
+            pps: PPS.to_vec(),
+        };
         let frame = TICKS_PER_SECOND / 30;
         let data: Vec<Vec<u8>> = (0..60u8)
             .map(|i| [&4u32.to_be_bytes()[..], &[0x65, i, 1, 2]].concat())
             .collect();
         let video = VideoTrack {
-            sps: &sps,
-            pps: PPS,
+            config: &config,
+            colour: Some(Colour::BT709),
             samples: (0..60)
                 .map(|i| VideoSample {
                     data: &data[i],
                     pts: 5 * TICKS_PER_SECOND + i as i64 * frame,
+                    dts: 5 * TICKS_PER_SECOND + i as i64 * frame,
                     keyframe: i % 30 == 0,
                 })
                 .collect(),
@@ -538,6 +649,8 @@ mod tests {
         };
         assert_eq!((sps[0].clone(), pps[0].as_slice()), (sps_high_1080p(), PPS));
         assert_eq!(*length_size, 4);
+        assert_eq!(video.colour, Some(Colour::BT709));
+        assert!(video.codec.passthrough_config().is_some());
         let keyframes: Vec<usize> = (0..60).filter(|&i| video.samples[i].sync).collect();
         assert_eq!(keyframes, [0, 30]);
         // Timeline starts at the first frame (the writer's origin), 1/30 s apart.
@@ -583,6 +696,7 @@ mod tests {
     fn applies_the_edit_list() {
         let file = write(Options {
             start_offset: TICKS_PER_SECOND / 2,
+            duration: None,
         });
         let movie = movie(&file);
         let video = movie.video().expect("video");
@@ -626,6 +740,7 @@ mod tests {
             multiple_entries: false,
             samples: Vec::new(),
             reordered: false,
+            colour: None,
             media_start: 2112,
             delay: TICKS_PER_SECOND / 2,
         };

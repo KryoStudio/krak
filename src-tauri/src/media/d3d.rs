@@ -30,9 +30,9 @@ use windows::Win32::Graphics::Direct3D11::{
 };
 use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709, DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P709,
-    DXGI_FORMAT, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_NV12, DXGI_MODE_ROTATION,
-    DXGI_MODE_ROTATION_ROTATE90, DXGI_MODE_ROTATION_ROTATE180, DXGI_MODE_ROTATION_ROTATE270,
-    DXGI_RATIONAL, DXGI_SAMPLE_DESC,
+    DXGI_FORMAT, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_NV12, DXGI_FORMAT_P010,
+    DXGI_MODE_ROTATION, DXGI_MODE_ROTATION_ROTATE90, DXGI_MODE_ROTATION_ROTATE180,
+    DXGI_MODE_ROTATION_ROTATE270, DXGI_RATIONAL, DXGI_SAMPLE_DESC,
 };
 use windows::Win32::Graphics::Dxgi::{
     CreateDXGIFactory1, DXGI_ADAPTER_FLAG_SOFTWARE, DXGI_ERROR_NOT_FOUND, IDXGIAdapter1,
@@ -63,6 +63,8 @@ pub struct Display {
     pub adapter_luid: LUID,
     pub adapter_name: String,
     pub vendor_id: u32,
+    /// GDI name of the output ("\\.\DISPLAY1"), NUL-terminated UTF-16.
+    pub device_name: [u16; 32],
     /// Desktop size as shown (already rotated), in pixels.
     pub width: u32,
     pub height: u32,
@@ -108,6 +110,7 @@ pub fn primary_display() -> MediaResult<Display> {
                     adapter_luid: desc.AdapterLuid,
                     adapter_name: utf16(&desc.Description),
                     vendor_id: desc.VendorId,
+                    device_name: out_desc.DeviceName,
                     width: u32::try_from(r.right - r.left).unwrap_or(0),
                     height: u32::try_from(r.bottom - r.top).unwrap_or(0),
                     rotation: out_desc.Rotation,
@@ -116,6 +119,70 @@ pub fn primary_display() -> MediaResult<Display> {
         }
     }
     Err(MediaError::new(NO_DISPLAY))
+}
+
+/// Refresh rate of `display` in Hz: exact (59.94, 119.88...) from the display configuration,
+/// else the whole number GDI reports, else 0.
+pub fn refresh_rate(display: &Display) -> f64 {
+    use windows::Win32::Devices::Display::{
+        DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME, DISPLAYCONFIG_MODE_INFO,
+        DISPLAYCONFIG_PATH_INFO, DISPLAYCONFIG_SOURCE_DEVICE_NAME, DisplayConfigGetDeviceInfo,
+        GetDisplayConfigBufferSizes, QDC_ONLY_ACTIVE_PATHS, QueryDisplayConfig,
+    };
+    use windows::Win32::Graphics::Gdi::{DEVMODEW, ENUM_CURRENT_SETTINGS, EnumDisplaySettingsW};
+    let name = utf16(&display.device_name);
+    // SAFETY: buffers sized by GetDisplayConfigBufferSizes; the device-name request carries its
+    // own size in its header.
+    unsafe {
+        let (mut paths, mut modes) = (0u32, 0u32);
+        if GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &mut paths, &mut modes).is_ok() {
+            let mut path_info = vec![DISPLAYCONFIG_PATH_INFO::default(); paths as usize];
+            let mut mode_info = vec![DISPLAYCONFIG_MODE_INFO::default(); modes as usize];
+            if QueryDisplayConfig(
+                QDC_ONLY_ACTIVE_PATHS,
+                &mut paths,
+                path_info.as_mut_ptr(),
+                &mut modes,
+                mode_info.as_mut_ptr(),
+                None,
+            )
+            .is_ok()
+            {
+                for path in &path_info[..paths as usize] {
+                    let mut source = DISPLAYCONFIG_SOURCE_DEVICE_NAME::default();
+                    source.header.r#type = DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME;
+                    source.header.size =
+                        u32::try_from(std::mem::size_of::<DISPLAYCONFIG_SOURCE_DEVICE_NAME>())
+                            .unwrap_or(0);
+                    source.header.adapterId = path.sourceInfo.adapterId;
+                    source.header.id = path.sourceInfo.id;
+                    if DisplayConfigGetDeviceInfo(&mut source.header) == 0
+                        && utf16(&source.viewGdiDeviceName) == name
+                    {
+                        let rate = path.targetInfo.refreshRate;
+                        if rate.Denominator > 0 && rate.Numerator > 0 {
+                            return f64::from(rate.Numerator) / f64::from(rate.Denominator);
+                        }
+                    }
+                }
+            }
+        }
+        let mut mode = DEVMODEW {
+            dmSize: u16::try_from(std::mem::size_of::<DEVMODEW>()).unwrap_or(0),
+            ..Default::default()
+        };
+        if EnumDisplaySettingsW(
+            windows::core::PCWSTR(display.device_name.as_ptr()),
+            ENUM_CURRENT_SETTINGS,
+            &mut mode,
+        )
+        .as_bool()
+            && mode.dmDisplayFrequency > 1
+        {
+            return f64::from(mode.dmDisplayFrequency);
+        }
+    }
+    0.0
 }
 
 fn utf16(buf: &[u16]) -> String {
@@ -138,6 +205,8 @@ pub fn display_rotation(rotation: DXGI_MODE_ROTATION) -> D3D11_VIDEO_PROCESSOR_R
 }
 
 /// A D3D11 device on one adapter, usable from several threads and by Media Foundation.
+/// Clones share the device.
+#[derive(Clone)]
 pub struct Gpu {
     pub device: ID3D11Device,
     pub context: ID3D11DeviceContext,
@@ -208,6 +277,49 @@ impl Gpu {
                 vendor_id: desc.VendorId,
             })
         }
+    }
+
+    /// A default-usage BGRA texture holding `pixels` (tightly packed rows).
+    #[allow(dead_code, reason = "test sources")]
+    pub fn bgra_texture(
+        &self,
+        width: u32,
+        height: u32,
+        pixels: &[u8],
+    ) -> MediaResult<ID3D11Texture2D> {
+        if pixels.len() < width as usize * height as usize * 4 {
+            return Err(MediaError::new(DEVICE_FAILED));
+        }
+        let desc = D3D11_TEXTURE2D_DESC {
+            Width: width,
+            Height: height,
+            MipLevels: 1,
+            ArraySize: 1,
+            Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Usage: D3D11_USAGE_DEFAULT,
+            BindFlags: windows::Win32::Graphics::Direct3D11::D3D11_BIND_RENDER_TARGET
+                .0
+                .cast_unsigned(),
+            CPUAccessFlags: 0,
+            MiscFlags: 0,
+        };
+        let init = D3D11_SUBRESOURCE_DATA {
+            pSysMem: pixels.as_ptr().cast(),
+            SysMemPitch: width * 4,
+            SysMemSlicePitch: 0,
+        };
+        let mut texture = None;
+        // SAFETY: the descriptor and the initial data (checked size) are valid for the call.
+        unsafe {
+            self.device
+                .CreateTexture2D(&desc, Some(&init), Some(&mut texture))
+                .code(DEVICE_FAILED)?;
+        }
+        texture.ok_or(MediaError::new(DEVICE_FAILED))
     }
 
     /// A default-usage 2D texture. With `zeroed` the content starts black-ish (all zero; for
@@ -284,7 +396,24 @@ impl Nv12Converter {
         rotation: D3D11_VIDEO_PROCESSOR_ROTATION,
         fps: u32,
     ) -> MediaResult<Self> {
-        Self::build(gpu, false, input, output, rotation, fps)
+        Self::build(gpu, false, input, output, rotation, fps, DXGI_FORMAT_NV12)
+    }
+
+    /// [`Self::new`] with P010 output (`ten_bit`) or NV12.
+    pub fn with_output(
+        gpu: &Gpu,
+        input: (u32, u32),
+        output: (u32, u32),
+        rotation: D3D11_VIDEO_PROCESSOR_ROTATION,
+        fps: u32,
+        ten_bit: bool,
+    ) -> MediaResult<Self> {
+        let format = if ten_bit {
+            DXGI_FORMAT_P010
+        } else {
+            DXGI_FORMAT_NV12
+        };
+        Self::build(gpu, false, input, output, rotation, fps, format)
     }
 
     /// NV12 (BT.709 studio range, e.g. decoded video) → NV12 of another size: scaling only.
@@ -296,6 +425,7 @@ impl Nv12Converter {
             output,
             D3D11_VIDEO_PROCESSOR_ROTATION_IDENTITY,
             fps,
+            DXGI_FORMAT_NV12,
         )
     }
 
@@ -306,6 +436,7 @@ impl Nv12Converter {
         output: (u32, u32),
         rotation: D3D11_VIDEO_PROCESSOR_ROTATION,
         fps: u32,
+        output_format: DXGI_FORMAT,
     ) -> MediaResult<Self> {
         let input_format = if nv12_input {
             DXGI_FORMAT_NV12
@@ -336,7 +467,7 @@ impl Nv12Converter {
                 .CheckVideoProcessorFormat(input_format)
                 .code(DEVICE_FAILED)?;
             let output_ok = enumerator
-                .CheckVideoProcessorFormat(DXGI_FORMAT_NV12)
+                .CheckVideoProcessorFormat(output_format)
                 .code(DEVICE_FAILED)?;
             if input_ok & D3D11_VIDEO_PROCESSOR_FORMAT_SUPPORT_INPUT.0.cast_unsigned() == 0
                 || output_ok
@@ -410,7 +541,22 @@ impl Nv12Converter {
         }
     }
 
-    /// Converts `src` (BGRA, the input size) into `dst` (NV12 render target, the output size).
+    /// Takes the picture from `rect` of the source (scaled to the output) from now on.
+    #[allow(dead_code, reason = "camera motion in the encoder tests")]
+    pub fn set_source_rect(&mut self, gpu: &Gpu, rect: RECT) {
+        // SAFETY: our processor; the rectangle lies within the input size (caller's contract).
+        unsafe {
+            gpu.video_context.VideoProcessorSetStreamSourceRect(
+                &self.processor,
+                0,
+                true,
+                Some(&rect),
+            );
+        }
+    }
+
+    /// Converts `src` (BGRA, the input size) into `dst` (NV12/P010 render target, the output
+    /// size).
     pub fn convert(
         &mut self,
         gpu: &Gpu,
@@ -513,21 +659,31 @@ fn rect((width, height): (u32, u32)) -> RECT {
     }
 }
 
-/// Copies NV12 textures back to system memory (tightly packed: Y plane then interleaved UV).
+/// Copies NV12 (or P010) textures back to system memory (tightly packed: Y plane then
+/// interleaved UV; P010 samples are 2 bytes, little-endian, value in the top 10 bits).
 pub struct Nv12Readback {
     staging: ID3D11Texture2D,
     width: u32,
     height: u32,
+    bytes_per_sample: usize,
 }
 
 impl Nv12Readback {
     pub fn new(gpu: &Gpu, width: u32, height: u32) -> MediaResult<Self> {
+        Self::with_format(gpu, width, height, false)
+    }
+
+    pub fn with_format(gpu: &Gpu, width: u32, height: u32, ten_bit: bool) -> MediaResult<Self> {
         let desc = D3D11_TEXTURE2D_DESC {
             Width: width,
             Height: height,
             MipLevels: 1,
             ArraySize: 1,
-            Format: DXGI_FORMAT_NV12,
+            Format: if ten_bit {
+                DXGI_FORMAT_P010
+            } else {
+                DXGI_FORMAT_NV12
+            },
             SampleDesc: DXGI_SAMPLE_DESC {
                 Count: 1,
                 Quality: 0,
@@ -548,15 +704,20 @@ impl Nv12Readback {
             staging: staging.ok_or(MediaError::new(DEVICE_FAILED))?,
             width,
             height,
+            bytes_per_sample: if ten_bit { 2 } else { 1 },
         })
     }
 
-    /// Reads `src` (NV12, same size) into `out` (resized to width * height * 3 / 2).
+    /// Reads `src` (same size and format) into `out` (resized to width * height * 3 / 2
+    /// samples).
     pub fn read(&self, gpu: &Gpu, src: &ID3D11Texture2D, out: &mut Vec<u8>) -> MediaResult<()> {
-        let (w, h) = (self.width as usize, self.height as usize);
+        let (w, h) = (
+            self.width as usize * self.bytes_per_sample,
+            self.height as usize,
+        );
         out.resize(w * h * 3 / 2, 0);
         // SAFETY: Map/Unmap are paired; reads stay within RowPitch * (h + h / 2) bytes, which is
-        // the mapped NV12 layout (UV plane right after the Y plane, same pitch).
+        // the mapped NV12/P010 layout (UV plane right after the Y plane, same pitch).
         unsafe {
             gpu.context.CopyResource(&self.staging, src);
             let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();

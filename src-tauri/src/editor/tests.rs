@@ -24,12 +24,15 @@ use super::mapped::MappedFile;
 use super::pcm::Pcm;
 use super::transcode::Options;
 use super::{CANCELLED, Gains, INVALID_RANGE, Progress, TrackKind, decode, probe};
+use crate::capture::VideoSettings;
 use crate::capture::{
     CaptureState, CaptureStatus, Engine, EngineConfig, EngineEvents, SaveRequest, Stamp,
 };
+use crate::media::codec::CodecConfig;
 use crate::media::mf::media_type;
+use crate::media::mp4_writer::Colour;
 use crate::media::{ComGuard, MfGuard, TICKS_PER_SECOND, rescale, testing};
-use crate::settings::Quality;
+use crate::settings::{CodecChoice, Quality, Resolution};
 use crate::state::lock;
 
 /// Latest status, and the save outcome.
@@ -79,10 +82,18 @@ impl Events {
 fn record(dir: &Path, seconds: u32) -> (PathBuf, CaptureStatus) {
     let events = Arc::new(Events::default());
     let config = EngineConfig {
-        fps: 60,
-        quality: Quality::High,
+        video: VideoSettings {
+            quality: Quality::High,
+            codec: CodecChoice::Auto,
+            resolution: Resolution::Native,
+            fps: 60,
+            bitrate: 40,
+            ten_bit: true,
+        },
+        audio_bitrate: 160_000,
         buffer_seconds: seconds,
         microphone: true,
+        microphone_device: None,
     };
     let started = Instant::now();
     let engine = Engine::start(config, events.clone());
@@ -128,19 +139,18 @@ fn with_test_audio(clip: &Path, dir: &Path) -> PathBuf {
     let movie = demux::open(clip).expect("demux");
     let file = MappedFile::open(clip).expect("map");
     let video = movie.video().expect("video");
-    let demux::Codec::Avc { sps, pps, .. } = &video.codec else {
-        panic!("not H.264");
-    };
+    let config = video.codec.passthrough_config().expect("copyable video");
     let last = video.samples.last().expect("frames");
     let video = VideoTrack {
-        sps: &sps[0],
-        pps: &pps[0],
+        config: &config,
+        colour: video.colour,
         samples: (0..video.samples.len())
             .map(|i| {
                 let s = &video.samples[i];
                 VideoSample {
                     data: file.slice(s.offset, s.size).expect("sample"),
                     pts: video.sample_time(i),
+                    dts: video.time(s.dts),
                     keyframe: s.sync,
                 }
             })
@@ -348,11 +358,13 @@ fn decode_all_frames(path: &Path) -> (usize, i64) {
     }
 }
 
-/// Index of the first video frame at or after `time` (timeline, within 1 ms).
+/// Index (decode order) of the first video frame presented at or after `time` (timeline,
+/// within 1 ms).
 fn frame_at(movie: &Movie, time: i64) -> usize {
     let video = movie.video().expect("video");
     (0..video.samples.len())
-        .find(|&i| video.sample_time(i) >= time - TICKS_PER_SECOND / 1000)
+        .filter(|&i| video.sample_time(i) >= time - TICKS_PER_SECOND / 1000)
+        .min_by_key(|&i| video.sample_time(i))
         .expect("a frame")
 }
 
@@ -745,6 +757,7 @@ fn editor_end_to_end() {
                 software_decoding: true,
                 software_encoder: true,
                 gpu_scaling: false,
+                no_nvenc: false,
             },
         ),
     ] {
@@ -944,12 +957,7 @@ fn synthetic_clip(path: &Path) {
     use crate::media::mp4_writer::{
         self, AudioTrack, Options as MuxOptions, VideoSample, VideoTrack,
     };
-    let config = H264Config {
-        width: SYN_W,
-        height: SYN_H,
-        fps: SYN_FPS,
-        bitrate: 8_000_000,
-    };
+    let config = H264Config::new(SYN_W, SYN_H, SYN_FPS, 8_000_000);
     let mut encoder = H264Encoder::software(config).expect("encoder");
     let mut packets = Vec::new();
     for k in 0..SYN_FRAMES {
@@ -961,7 +969,7 @@ fn synthetic_clip(path: &Path) {
         );
     }
     encoder.drain(&mut packets).expect("drain");
-    let (sps, pps) = encoder.parameter_sets().expect("parameter sets");
+    let video_config = encoder.codec_config().expect("parameter sets");
     let seconds = SYN_FRAMES as usize / SYN_FPS as usize;
     let mut pcm = vec![0i16; 48_000 * seconds * 2];
     for beep in 0..seconds * 4 {
@@ -980,13 +988,14 @@ fn synthetic_clip(path: &Path) {
     };
     let stream = aac::encode(&pcm, config).expect("aac");
     let video = VideoTrack {
-        sps,
-        pps,
+        config: &video_config,
+        colour: Some(Colour::BT709),
         samples: packets
             .iter()
             .map(|p| VideoSample {
                 data: &p.data,
                 pts: p.pts,
+                dts: p.dts,
                 keyframe: p.keyframe,
             })
             .collect(),
@@ -1153,11 +1162,16 @@ fn editor_timing_synthetic() {
             got, expected,
             "frame n shows source frame {first_frame} + 2n"
         );
+        // Media Foundation ignores edit lists: with B-frames its timestamps start at the
+        // reorder lead-in (audio is shifted the same way, see mp4_writer), so they are compared
+        // from the first one.
+        let t0 = frames[0].0;
         assert!(
-            frames
-                .iter()
-                .enumerate()
-                .all(|(n, &(t, _))| (t - n as i64 * TICKS_PER_SECOND / 30).abs() < 10),
+            frames.iter().enumerate().all(|(n, &(t, _))| (t
+                - t0
+                - n as i64 * TICKS_PER_SECOND / 30)
+                .abs()
+                < 10),
             "30 fps timestamps"
         );
         let pcm = our_audio(&e.path, "", 0.0, end - start);
@@ -1416,4 +1430,329 @@ fn editor_third_party() {
     }
     println!("failures: {failures:?}");
     let _ = std::fs::remove_dir_all(&out);
+}
+
+// ---- HEVC and AV1 sources ----
+
+/// The beep track of the synthetic clips (20 ms at 1 kHz every 0.25 s of the video's
+/// timeline), AAC. Audio starts at the first video decode time, `lead_in` (100 ns) before the
+/// first picture (the muxer's convention with B-frames).
+fn beep_track(seconds: usize, lead_in: i64) -> crate::media::aac::AacStream {
+    use crate::media::aac::{self, AacConfig};
+    let offset = usize::try_from(rescale(lead_in, TICKS_PER_SECOND, 48_000)).unwrap_or(0);
+    let mut pcm = vec![0i16; (48_000 * seconds + offset) * 2];
+    for beep in 0..seconds * 4 {
+        for i in 0..960 {
+            let v = ((2.0 * std::f64::consts::PI * 1000.0 * i as f64 / 48_000.0).sin() * 10_000.0)
+                as i16;
+            let at = (offset + beep * 12_000 + i) * 2;
+            pcm[at] = v;
+            pcm[at + 1] = v;
+        }
+    }
+    let config = AacConfig {
+        sample_rate: 48_000,
+        channels: 2,
+        bitrate: 160_000,
+    };
+    aac::encode(&pcm, config).expect("aac")
+}
+
+fn write_clip(
+    path: &Path,
+    config: &CodecConfig,
+    packets: &[(Vec<u8>, i64, i64, bool)],
+    fps: u32,
+    seconds: usize,
+) {
+    use crate::media::mp4_writer::{
+        self, AudioTrack, Options as MuxOptions, VideoSample, VideoTrack,
+    };
+    let lead_in = packets.first().map_or(0, |p| p.1 - p.2);
+    let stream = beep_track(seconds, lead_in);
+    let video = VideoTrack {
+        config,
+        colour: Some(Colour::BT709),
+        samples: packets
+            .iter()
+            .map(|(data, pts, dts, key)| VideoSample {
+                data,
+                pts: *pts,
+                dts: *dts,
+                keyframe: *key,
+            })
+            .collect(),
+        last_duration: TICKS_PER_SECOND / i64::from(fps),
+    };
+    let audio = AudioTrack {
+        name: "Game",
+        sample_rate: 48_000,
+        channels: 2,
+        bitrate: 160_000,
+        asc: &stream.asc,
+        frames: stream.frames.iter().map(Vec::as_slice).collect(),
+    };
+    mp4_writer::write_file(path, &video, &[audio], &MuxOptions::default(), true).expect("mux");
+}
+
+/// The synthetic pattern (frame index in binary) encoded by NVENC HEVC with B-frames.
+fn synthetic_hevc_clip(path: &Path) {
+    use crate::media::d3d::{self, Gpu};
+    use crate::media::nvenc::{self, NvencEncoder, RateControl};
+    use windows::Win32::Graphics::Direct3D11::{
+        D3D11_BIND_RENDER_TARGET, D3D11_SUBRESOURCE_DATA, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT,
+    };
+    use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_NV12, DXGI_SAMPLE_DESC};
+    let display = d3d::primary_display().expect("display");
+    let gpu = Gpu::new(&display.adapter).expect("gpu");
+    let mut settings = nvenc::bench::settings(crate::media::codec::VideoCodec::Hevc, false, 5);
+    (settings.width, settings.height, settings.fps, settings.gop) = (SYN_W, SYN_H, SYN_FPS, 60);
+    settings.b_frames = 3;
+    settings.b_ref = nvenc::BRef::Middle;
+    settings.lookahead = 8;
+    settings.rate = RateControl::Vbr {
+        average: 8_000_000,
+        max: 12_000_000,
+    };
+    let mut encoder = NvencEncoder::new(&gpu, settings).expect("nvenc hevc");
+    let mut packets = Vec::new();
+    for k in 0..SYN_FRAMES {
+        let pixels = pattern(k);
+        let desc = D3D11_TEXTURE2D_DESC {
+            Width: SYN_W,
+            Height: SYN_H,
+            MipLevels: 1,
+            ArraySize: 1,
+            Format: DXGI_FORMAT_NV12,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Usage: D3D11_USAGE_DEFAULT,
+            BindFlags: D3D11_BIND_RENDER_TARGET.0.cast_unsigned(),
+            CPUAccessFlags: 0,
+            MiscFlags: 0,
+        };
+        // NV12 initial data: the UV plane right after the Y plane, same pitch.
+        let init = D3D11_SUBRESOURCE_DATA {
+            pSysMem: pixels.as_ptr().cast(),
+            SysMemPitch: SYN_W,
+            SysMemSlicePitch: 0,
+        };
+        let mut texture = None;
+        // SAFETY: valid descriptor and data (w * h * 3/2 bytes).
+        unsafe {
+            gpu.device
+                .CreateTexture2D(&desc, Some(&init), Some(&mut texture))
+                .expect("texture");
+        }
+        let pts = i64::from(k) * TICKS_PER_SECOND / i64::from(SYN_FPS);
+        encoder
+            .encode(&texture.expect("texture"), pts, &mut packets)
+            .expect("encode");
+    }
+    encoder.finish(&mut packets).expect("finish");
+    let packets: Vec<_> = packets
+        .into_iter()
+        .map(|p| (p.data, p.pts, p.dts, p.keyframe))
+        .collect();
+    write_clip(path, &encoder.config().clone(), &packets, SYN_FPS, 5);
+}
+
+/// An AV1 clip from an SVT-AV1 stream (`KRYO_AV1_SAMPLE`: raw OBUs, 1280x720 at 30 fps, made by
+/// the quality tooling with ffmpeg/PyAV) plus the beep track. `None` without the sample.
+fn av1_clip(path: &Path) -> Option<u32> {
+    use crate::media::av1;
+    let raw = std::fs::read(std::env::var_os("KRYO_AV1_SAMPLE")?).expect("AV1 sample");
+    // Temporal units start with a temporal delimiter.
+    let mut units: Vec<Vec<u8>> = Vec::new();
+    for obu in av1::obus(&raw) {
+        if obu.kind == av1::OBU_TEMPORAL_DELIMITER || units.is_empty() {
+            units.push(Vec::new());
+        }
+        units.last_mut().expect("unit").extend_from_slice(obu.bytes);
+    }
+    let sequence_header = av1::find_sequence_header(&raw)?.to_vec();
+    let frame = TICKS_PER_SECOND / 30;
+    let packets: Vec<_> = units
+        .iter()
+        .enumerate()
+        .map(|(k, unit)| {
+            let sample = av1::to_sample(unit);
+            let t = k as i64 * frame;
+            (
+                sample.data,
+                t,
+                t,
+                sample.key_frame && sample.sequence_header.is_some(),
+            )
+        })
+        .collect();
+    assert!(packets[0].3, "starts with a key frame");
+    let config = CodecConfig::Av1 { sequence_header };
+    write_clip(path, &config, &packets, 30, packets.len().div_ceil(30));
+    Some(packets.len() as u32)
+}
+
+/// Presentation-order position of the first frame shown at or after timeline 0.
+fn presented_index(movie: &Movie) -> usize {
+    let video = movie.video().expect("video");
+    let first = frame_at(movie, 0);
+    let t = video.sample_time(first);
+    (0..video.samples.len())
+        .filter(|&i| video.sample_time(i) < t)
+        .count()
+}
+
+fn codec_of(path: &Path) -> String {
+    let movie = demux::open(path).expect("demux");
+    match &movie.video().expect("video").codec {
+        demux::Codec::Avc { .. } => "h264".into(),
+        demux::Codec::Hevc { .. } => "hevc".into(),
+        demux::Codec::Av1 { .. } => "av1".into(),
+        other => format!("{other:?}"),
+    }
+}
+
+#[test]
+#[ignore = "needs NVENC (HEVC), Windows' HEVC/AV1 decoders and KRYO_AV1_SAMPLE; run with --ignored"]
+fn editor_hevc_and_av1_sources() {
+    let _com = ComGuard::new();
+    let _mf = MfGuard::new().expect("media foundation");
+    let dir = std::env::var_os("KRYO_EDITOR_OUT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| std::env::temp_dir().join("kryo-editor-e2e"))
+        .join("codecs");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("dir");
+    let unity = Gains {
+        game: 1.0,
+        mic: 1.0,
+    };
+    let exports = dir.join("exports");
+
+    // HEVC with B-frames: every frame decodes in order.
+    let hevc = dir.join("Synthetic HEVC.mp4");
+    synthetic_hevc_clip(&hevc);
+    let indices = decoded_indices(&hevc);
+    assert_eq!(indices.len(), SYN_FRAMES as usize);
+    assert!(indices.iter().enumerate().all(|(k, &(_, i))| i == k as u32));
+    let info = probe::probe(&hevc).expect("probe");
+    assert_eq!((info.width, info.height, info.fps), (SYN_W, SYN_H, 60.0));
+    // Copy: the HEVC samples are kept (B-frames, edit list), the shown frame is the source's.
+    for (start, shown) in [(1.5, 90u32), (1.508, 91), (2.0, 120)] {
+        let r = run(
+            &hevc,
+            start,
+            4.0,
+            unity,
+            copy_to("edit"),
+            Options::default(),
+            None,
+        );
+        let copy = r
+            .exported
+            .unwrap_or_else(|c| panic!("hevc copy {start}: {c}"));
+        assert!(!copy.reencoded, "passthrough");
+        assert_eq!(codec_of(&copy.path), "hevc");
+        let movie = demux::open(&copy.path).expect("demux");
+        let mf = decoded_indices(&copy.path);
+        let first = presented_index(&movie);
+        println!(
+            "hevc copy from {start}: {} frames decode, first shown = source {} ({})",
+            mf.len(),
+            mf[first].1,
+            copy.detail
+        );
+        assert_eq!(mf[first].1, shown);
+        let frames: Vec<u32> = mf.iter().map(|f| f.1).collect();
+        assert!(frames.windows(2).all(|w| w[1] == w[0] + 1), "no hole");
+        let pcm = our_audio(&copy.path, "", 0.0, 4.0 - start);
+        let beep = expected_beep(start);
+        let onset = first_onset_after(&pcm, beep);
+        assert!(
+            (onset - beep).abs() < 0.0002,
+            "hevc copy beep at {onset} instead of {beep}"
+        );
+    }
+    // Discord: always H.264, re-encoded.
+    let r = run(
+        &hevc,
+        1.0,
+        3.0,
+        unity,
+        Destination::Discord {
+            dir: exports.clone(),
+            max_bytes: 250_000,
+        },
+        Options::default(),
+        None,
+    );
+    let d = r.exported.expect("hevc discord");
+    println!("hevc discord: {} bytes, {}", d.size, d.detail);
+    assert!(d.reencoded && d.size <= 250_000 * 95 / 100);
+    assert_eq!(codec_of(&d.path), "h264");
+    let frames = decoded_indices(&d.path);
+    let got: Vec<u32> = frames.iter().map(|f| f.1).collect();
+    let expected: Vec<u32> = (0..got.len() as u32).map(|n| 60 + 2 * n).collect();
+    assert_eq!(got, expected, "30 fps from 1.0 s");
+    // Waveform of the beep track.
+    let waves = crate::editor::waveform::waveforms(&hevc, 20).expect("waveforms");
+    assert_eq!(waves.len(), 1);
+    assert_eq!(
+        (waves[0].name.as_str(), waves[0].kind),
+        ("Game", TrackKind::Game)
+    );
+    assert_eq!(waves[0].peaks.len(), 64, "clamped to 64 buckets");
+    let loud = waves[0].peaks.iter().filter(|&&p| p > 0.2).count();
+    println!(
+        "hevc waveform: {loud}/64 buckets with a beep, max {:.3}",
+        waves[0].peaks.iter().copied().fold(0.0, f32::max)
+    );
+    assert!(loud >= 16, "beeps every 0.25 s show up");
+
+    // AV1 (Turing has no AV1 encoder: an SVT-AV1 stream).
+    let av1 = dir.join("Sample AV1.mp4");
+    let Some(count) = av1_clip(&av1) else {
+        println!("KRYO_AV1_SAMPLE not set: AV1 part skipped");
+        return;
+    };
+    let info = probe::probe(&av1).expect("probe av1");
+    println!("av1 probe: {info:?}");
+    assert_eq!((info.width, info.height, info.fps), (1280, 720, 30.0));
+    let (decoded, _) = decode_all_frames(&av1);
+    assert_eq!(decoded, count as usize, "every AV1 frame decodes (MF)");
+    let r = run(
+        &av1,
+        0.0,
+        1.5,
+        unity,
+        copy_to("edit"),
+        Options::default(),
+        None,
+    );
+    let copy = r.exported.expect("av1 copy");
+    assert!(!copy.reencoded);
+    assert_eq!(codec_of(&copy.path), "av1");
+    let (decoded, _) = decode_all_frames(&copy.path);
+    println!("av1 copy: {} bytes, {decoded} frames decode", copy.size);
+    assert_eq!(decoded, 45);
+    let r = run(
+        &av1,
+        0.0,
+        1.5,
+        unity,
+        Destination::Discord {
+            dir: exports,
+            max_bytes: 100_000_000,
+        },
+        Options::default(),
+        None,
+    );
+    let d = r.exported.expect("av1 discord");
+    println!("av1 discord: {} bytes, {}", d.size, d.detail);
+    assert!(d.reencoded, "AV1 is re-encoded even when it would fit");
+    assert_eq!(codec_of(&d.path), "h264");
+    let (decoded, _) = decode_all_frames(&d.path);
+    assert!((44..=46).contains(&decoded), "{decoded}");
 }

@@ -6,16 +6,12 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use crate::media::mp4_writer;
-use crate::names;
+use crate::{i18n, names};
 
 /// Discord exports older than this are deleted when the next one starts.
 pub const EXPORT_MAX_AGE: Duration = Duration::from_secs(24 * 3600);
 /// Candidates tried before giving up on a free name.
 pub const MAX_ATTEMPTS: u32 = 999;
-/// Every copy suffix the app ever wrote (both languages), so re-editing a copy does not stack
-/// them: "clip (edit) (edit).mp4" becomes "clip (edit) (2).mp4".
-const LABELS: [&str; 2] = ["edit", "montage"];
-
 /// The stem of a copy of `stem`, candidate number `n` (1 = no number).
 pub fn copy_stem(stem: &str, label: &str, n: u32) -> String {
     let base = strip_copy_suffix(stem);
@@ -26,7 +22,8 @@ pub fn copy_stem(stem: &str, label: &str, n: u32) -> String {
     }
 }
 
-/// "clip (edit)", "clip (montage) (3)" -> "clip".
+/// "clip (edit)", "clip (montage) (3)" -> "clip". Every language's suffix is recognized, so
+/// re-editing a copy does not stack them: "clip (edit) (edit).mp4" becomes "clip (edit) (2).mp4".
 fn strip_copy_suffix(stem: &str) -> &str {
     let mut base = stem;
     // An optional " (N)" after the label.
@@ -35,11 +32,11 @@ fn strip_copy_suffix(stem: &str) -> &str {
         && !digits.is_empty()
         && digits.len() <= 3
         && digits.bytes().all(|b| b.is_ascii_digit())
-        && LABELS.iter().any(|l| head.ends_with(&format!(" ({l})")))
+        && i18n::edited_suffixes().any(|l| head.ends_with(&format!(" ({l})")))
     {
         base = head;
     }
-    for label in LABELS {
+    for label in i18n::edited_suffixes() {
         if let Some(head) = base.strip_suffix(&format!(" ({label})"))
             && !head.trim().is_empty()
         {
@@ -62,7 +59,7 @@ pub fn free_copy_path(source: &Path, label: &str, first: u32) -> Option<(PathBuf
 
 /// File name (without extension) of a Discord export of the clip `stem`.
 pub fn export_stem(stem: &str) -> String {
-    names::sanitize_title(stem).unwrap_or_else(|| "Kryo Shard".to_string())
+    names::sanitize_title(stem).unwrap_or_else(|| "Krak".to_string())
 }
 
 /// `<dir>/<stem>.mp4`, then `<stem> (2).mp4`...
@@ -147,7 +144,7 @@ mod tests {
     #[test]
     fn names_discord_exports() {
         assert_eq!(export_stem("Ace: clutch?"), "Ace clutch");
-        assert_eq!(export_stem("CON"), "Kryo Shard");
+        assert_eq!(export_stem("CON"), "Krak");
         let dir = Path::new(r"C:\cache\exports");
         assert_eq!(export_path(dir, "Ace", 1), dir.join("Ace.mp4"));
         assert_eq!(export_path(dir, "Ace", 2), dir.join("Ace (2).mp4"));

@@ -16,7 +16,7 @@ use windows::core::{BSTR, HSTRING};
 
 use super::demux::{self, Codec, Movie, Track};
 use super::{AudioTrackInfo, ShardInfo, TrackKind, UNSUPPORTED};
-use crate::media::{TICKS_PER_SECOND, avc};
+use crate::media::{TICKS_PER_SECOND, av1, avc, hevc};
 
 pub fn probe(path: &Path) -> Result<ShardInfo, &'static str> {
     if let Some(movie) = demux::open(path)
@@ -67,14 +67,25 @@ fn from_movie(movie: &Movie) -> Option<ShardInfo> {
     })
 }
 
-/// Coded size from the SPS when it is H.264, else the track header's.
+/// Picture size from the parameter sets (H.264 SPS, HEVC SPS, AV1 sequence header), else the
+/// track header's.
 pub fn video_size(video: &Track) -> (u32, u32) {
-    if let Codec::Avc { sps, .. } = &video.codec
-        && let Some(info) = sps.first().and_then(|s| avc::parse_sps(s))
-    {
-        return (info.width, info.height);
-    }
-    (video.header.width, video.header.height)
+    let from_sets = match &video.codec {
+        Codec::Avc { sps, .. } => sps
+            .first()
+            .and_then(|s| avc::parse_sps(s))
+            .map(|i| (i.width, i.height)),
+        Codec::Hevc { sps, .. } => sps
+            .first()
+            .and_then(|s| hevc::parse_sps(s))
+            .map(|i| (i.width, i.height)),
+        Codec::Av1 { sequence_header } => av1::obus(sequence_header)
+            .next()
+            .and_then(|obu| av1::parse_sequence_header(obu.payload()))
+            .map(|i| (i.width, i.height)),
+        _ => None,
+    };
+    from_sets.unwrap_or((video.header.width, video.header.height))
 }
 
 /// Frame rate from the median sample duration (robust to a few irregular frames).

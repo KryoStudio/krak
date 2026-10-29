@@ -1,7 +1,12 @@
 //! Video re-encoding: the Media Foundation Source Reader decodes on the GPU (the same device as
 //! the encoder, through its DXGI device manager) and, with advanced video processing, scales
 //! to the output size and NV12; frames before `start` are dropped, the rest go to the H.264
-//! encoder (the adapter's hardware encoder, else Microsoft's software one).
+//! encoder: native NVENC with its slowest, best tools when the GPU has it (quality per byte
+//! matters most under a Discord limit), else the adapter's Media Foundation encoder, else
+//! Microsoft's software one. Output is always H.264 (plays everywhere), in decode order.
+//!
+//! HEVC and AV1 sources decode only when Windows has their decoders (the HEVC / AV1 Video
+//! Extensions): without them the export fails with `unsupported_codec`.
 //!
 //! Fallbacks, each tested with [`Options`]: when the reader cannot resize, frames are scaled
 //! with the video processor ([`Nv12Converter::scaler`]); system-memory frames (software
@@ -34,11 +39,15 @@ use windows::Win32::System::Com::StructuredStorage::PROPVARIANT;
 use windows::core::{GUID, HSTRING, Interface};
 
 use super::plan::{TOLERANCE, VideoTarget};
-use super::{CANCELLED, EXPORT_FAILED, Span, UNSUPPORTED, media_failure};
-use crate::media::avc::VideoPacket;
+use super::{CANCELLED, EXPORT_FAILED, Span, UNSUPPORTED, UNSUPPORTED_CODEC, media_failure};
+use crate::capture::encoders;
+use crate::media::codec::{CodecConfig, VideoCodec, VideoPacket};
 use crate::media::d3d::{Gpu, Nv12Converter, Nv12Readback};
 use crate::media::h264::{Frame, H264Config, H264Encoder, Vendor};
 use crate::media::mf::{media_type, pack};
+use crate::media::nvenc::{
+    BRef, Multipass, NvencEncoder, NvencSettings, RateControl, Shape, Tuning,
+};
 use crate::media::{Code, MediaError, MediaResult, TICKS_PER_SECOND, rescale};
 
 /// How long the encoder may refuse input before the export fails.
@@ -49,6 +58,8 @@ const VIDEO_STREAM: u32 = MF_SOURCE_READER_FIRST_VIDEO_STREAM.0.cast_unsigned();
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Options {
     pub software_encoder: bool,
+    /// Media Foundation instead of native NVENC.
+    pub no_nvenc: bool,
     /// Never ask the reader to resize: scale with the video processor.
     pub gpu_scaling: bool,
     /// No D3D manager for the reader: system-memory frames.
@@ -68,8 +79,8 @@ pub struct Timing {
 }
 
 pub struct Encoded {
-    pub sps: Vec<u8>,
-    pub pps: Vec<u8>,
+    pub config: CodecConfig,
+    /// Decode order.
     pub packets: Vec<VideoPacket>,
     /// Duration of one output frame (100 ns).
     pub frame: i64,
@@ -102,21 +113,13 @@ pub fn transcode(job: Job, gpu: &Gpu, progress: &Span) -> Result<Encoded, &'stat
         options,
     } = job;
     let fail = |what: &'static str| move |err: MediaError| media_failure(what, err);
-    let config = H264Config {
-        width: target.width,
-        height: target.height,
-        fps: target.fps.max(1),
-        bitrate: target.bitrate.max(100_000),
-    };
-    let mut encoder = if options.software_encoder {
-        H264Encoder::software(config)
-    } else {
-        H264Encoder::hardware(gpu, config).or_else(|err| {
-            eprintln!("kryo-shard: export: no hardware encoder ({err}), using software");
-            H264Encoder::software(config)
-        })
-    }
-    .map_err(fail("encoder"))?;
+    let config = H264Config::new(
+        target.width,
+        target.height,
+        target.fps.max(1),
+        target.bitrate.max(100_000),
+    );
+    let mut encoder = ExportEncoder::open(gpu, config, options).map_err(fail("encoder"))?;
 
     let mut reader = Reader::open(source, gpu, options).map_err(fail("reader"))?;
     let calibration = match timing.first_media {
@@ -125,7 +128,14 @@ pub fn transcode(job: Job, gpu: &Gpu, progress: &Span) -> Result<Encoded, &'stat
     };
     reader
         .select_output((target.width, target.height), options.gpu_scaling)
-        .map_err(fail("reader output"))?;
+        .map_err(|err| {
+            if err.code == UNSUPPORTED_CODEC {
+                eprintln!("krak: export: Windows cannot decode this video ({err})");
+                UNSUPPORTED_CODEC
+            } else {
+                media_failure("reader output", err)
+            }
+        })?;
     let to_reader = |t: i64| t - timing.shift + calibration;
     let to_timeline = |ts: i64| ts - calibration + timing.shift;
     reader.seek(to_reader(start)).map_err(fail("seek"))?;
@@ -199,25 +209,117 @@ pub fn transcode(job: Job, gpu: &Gpu, progress: &Span) -> Result<Encoded, &'stat
     }
     drop(emit);
     encoder.drain(&mut packets).map_err(fail("drain"))?;
-    let (sps, pps) = encoder
-        .parameter_sets()
-        .map(|(s, p)| (s.to_vec(), p.to_vec()))
-        .ok_or(EXPORT_FAILED)?;
+    let config = encoder.config().ok_or(EXPORT_FAILED)?;
     if packets.is_empty() || !packets[0].keyframe {
-        eprintln!("kryo-shard: export: no usable video between {start} and {end}");
+        eprintln!("krak: export: no usable video between {start} and {end}");
         return Err(EXPORT_FAILED);
     }
-    packets.sort_by_key(|p| p.pts);
     progress.set(1.0);
     Ok(Encoded {
-        sps,
-        pps,
+        config,
         packets,
         frame: out_frame,
-        encoder: encoder.name().to_string(),
+        encoder: encoder.name(),
         vendor: encoder.vendor(),
         path: frames.path,
     })
+}
+
+/// NVENC settings for an export: the strongest tools (speed matters little, quality per byte
+/// a lot), 2-second GOPs, VBR at the planned average.
+pub fn export_settings(config: H264Config, b_ref_middle: bool, lookahead: bool) -> NvencSettings {
+    NvencSettings {
+        codec: VideoCodec::H264,
+        width: config.width,
+        height: config.height,
+        fps: config.fps,
+        ten_bit: false,
+        input_ten_bit: false,
+        preset: 7,
+        tuning: Tuning::HighQuality,
+        rate: RateControl::Vbr {
+            average: config.bitrate,
+            max: config.bitrate.saturating_mul(2),
+        },
+        vbv: 0,
+        multipass: Multipass::Full,
+        b_frames: 3,
+        b_ref: if b_ref_middle {
+            BRef::Middle
+        } else {
+            BRef::Off
+        },
+        lookahead: if lookahead { 20 } else { 0 },
+        spatial_aq: Some(0),
+        temporal_aq: lookahead,
+        gop: config.fps.max(1) * 2,
+        // One encoder per export: the preset decides.
+        shape: Shape::default(),
+    }
+}
+
+/// The export's H.264 encoder.
+enum ExportEncoder {
+    Nvenc(Box<NvencEncoder>),
+    MediaFoundation(H264Encoder),
+}
+
+impl ExportEncoder {
+    fn open(gpu: &Gpu, config: H264Config, options: Options) -> MediaResult<Self> {
+        if options.software_encoder {
+            return H264Encoder::software(config).map(Self::MediaFoundation);
+        }
+        if !options.no_nvenc
+            && let Some(support) = encoders::capabilities(gpu).h264
+        {
+            let settings = export_settings(config, support.b_ref_middle, support.lookahead);
+            match NvencEncoder::new(gpu, settings) {
+                Ok(encoder) => return Ok(Self::Nvenc(Box::new(encoder))),
+                Err(err) => eprintln!("krak: export: NVENC failed ({err})"),
+            }
+        }
+        H264Encoder::hardware(gpu, config)
+            .or_else(|err| {
+                eprintln!("krak: export: no hardware encoder ({err}), using software");
+                H264Encoder::software(config)
+            })
+            .map(Self::MediaFoundation)
+    }
+
+    fn wants_textures(&self) -> bool {
+        match self {
+            Self::Nvenc(_) => true,
+            Self::MediaFoundation(encoder) => encoder.wants_textures(),
+        }
+    }
+
+    fn drain(&mut self, out: &mut Vec<VideoPacket>) -> MediaResult<()> {
+        match self {
+            Self::Nvenc(encoder) => encoder.finish(out),
+            Self::MediaFoundation(encoder) => encoder.drain(out),
+        }
+    }
+
+    fn config(&self) -> Option<CodecConfig> {
+        match self {
+            Self::Nvenc(encoder) => Some(encoder.config().clone()),
+            Self::MediaFoundation(encoder) => encoder.codec_config(),
+        }
+    }
+
+    fn name(&self) -> String {
+        match self {
+            Self::Nvenc(_) => "NVENC H.264 (P7, 2-pass)".to_string(),
+            Self::MediaFoundation(encoder) => encoder.name().to_string(),
+        }
+    }
+
+    fn vendor(&self) -> Vendor {
+        match self {
+            Self::Nvenc(_) => Vendor::Nvidia,
+            Self::MediaFoundation(encoder) => encoder.vendor(),
+        }
+    }
 }
 
 /// Output frame timing of a re-encode: slot `n` is at `start + n / fps` and shows the source
@@ -262,13 +364,22 @@ impl Slots {
 
 /// Feeds one frame, waiting while an asynchronous encoder is busy (never drops frames).
 fn submit(
-    encoder: &mut H264Encoder,
+    encoder: &mut ExportEncoder,
     frame: Frame,
     pts: i64,
     packets: &mut Vec<VideoPacket>,
     progress: &Span,
 ) -> Result<(), &'static str> {
     let fail = |err| media_failure("encode", err);
+    let encoder = match encoder {
+        ExportEncoder::Nvenc(nvenc) => {
+            let Frame::Texture(texture) = frame else {
+                return Err(EXPORT_FAILED);
+            };
+            return nvenc.encode(texture, pts, packets).map_err(fail);
+        }
+        ExportEncoder::MediaFoundation(encoder) => encoder,
+    };
     let deadline = Instant::now() + STALL_TIMEOUT;
     loop {
         if encoder
@@ -282,7 +393,7 @@ fn submit(
             return Err(CANCELLED);
         }
         if Instant::now() > deadline {
-            eprintln!("kryo-shard: export: the encoder stopped accepting frames");
+            eprintln!("krak: export: the encoder stopped accepting frames");
             return Err(EXPORT_FAILED);
         }
         // Input pool exhausted: give the encoder a moment to release textures.
@@ -400,9 +511,10 @@ impl Reader {
                     .SetCurrentMediaType(VIDEO_STREAM, None, &build(Some(size))?)
                     .is_ok();
             if !scaled {
+                // No decoder for the native format (HEVC/AV1 without the Store extensions).
                 self.reader
                     .SetCurrentMediaType(VIDEO_STREAM, None, &build(None)?)
-                    .code(UNSUPPORTED)?;
+                    .code(UNSUPPORTED_CODEC)?;
             }
         }
         self.refresh()

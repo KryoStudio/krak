@@ -26,7 +26,7 @@ impl ComGuard {
         // that initialization is not ours to undo.
         let initialized = hr.is_ok();
         if !initialized && hr != RPC_E_CHANGED_MODE {
-            eprintln!("kryo-shard: CoInitializeEx failed: {hr:?}");
+            eprintln!("krak: CoInitializeEx failed: {hr:?}");
         }
         Self { initialized }
     }

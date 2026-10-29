@@ -3,7 +3,8 @@
 //! Tracks: with the microphone on, "Mix" (game + mic, clipped, the main track), "Game" and
 //! "Microphone" (mono), passed to the muxer in that order (it writes the main track last, see
 //! `mp4_writer`); otherwise a single "Game" track. Audio covers exactly the video range
-//! (silence where nothing was recorded).
+//! (silence where nothing was recorded), from the first video decode time: with B-frames the
+//! muxer's edit list hides the reorder delay on every track (see `mp4_writer`).
 
 use std::io::ErrorKind;
 use std::path::PathBuf;
@@ -14,11 +15,10 @@ use super::ring::StreamParams;
 use super::timeline::{self, AudioSnapshot, SAMPLE_RATE};
 use super::{EMPTY, ENCODE_FAILED, WRITE_FAILED, pcm};
 use crate::media::aac::{self, AacConfig, AacStream};
-use crate::media::avc::VideoPacket;
-use crate::media::mp4_writer::{self, AudioTrack, Options, VideoSample, VideoTrack};
+use crate::media::codec::VideoPacket;
+use crate::media::mp4_writer::{self, AudioTrack, Colour, Options, VideoSample, VideoTrack};
 use crate::media::{ComGuard, MfGuard, TICKS_PER_SECOND};
 
-const STEREO_BITRATE: u32 = 160_000;
 const MIC_BITRATE: u32 = 96_000;
 /// Name collisions (another clip in the same second) retried before giving up.
 const MAX_ATTEMPTS: u32 = 20;
@@ -41,6 +41,8 @@ pub(super) struct Snapshot {
     pub game: AudioSnapshot,
     /// Present when the microphone setting is on (silent if it could not be opened).
     pub mic: Option<AudioSnapshot>,
+    /// AAC bitrate of the stereo tracks (Mix, Game), bit/s.
+    pub audio_bitrate: u32,
 }
 
 struct Track {
@@ -56,6 +58,7 @@ fn tracks(
     mic: Option<&AudioSnapshot>,
     start: i64,
     frames: usize,
+    stereo_bitrate: u32,
 ) -> Vec<Track> {
     let position = timeline::position(start);
     let game = game.read(position, frames);
@@ -63,7 +66,7 @@ fn tracks(
         name,
         pcm,
         channels: 2,
-        bitrate: STEREO_BITRATE,
+        bitrate: stereo_bitrate,
     };
     match mic {
         Some(mic) => {
@@ -98,7 +101,7 @@ fn encode(tracks: &[Track]) -> Result<Vec<AacStream>, &'static str> {
                         bitrate: track.bitrate,
                     };
                     aac::encode(&track.pcm, config).map_err(|err| {
-                        eprintln!("kryo-shard: AAC encoding failed: {err}");
+                        eprintln!("krak: AAC encoding failed: {err}");
                         ENCODE_FAILED
                     })
                 })
@@ -115,30 +118,38 @@ pub(super) fn write_clip(
     snapshot: &Snapshot,
     request: &SaveRequest,
 ) -> Result<PathBuf, &'static str> {
-    let (Some(first), Some(last)) = (snapshot.video.first(), snapshot.video.last()) else {
+    if snapshot.video.is_empty() {
         return Err(EMPTY);
-    };
+    }
     let frame = TICKS_PER_SECOND / i64::from(snapshot.params.fps.max(1));
-    let end = last.pts + frame;
-    let frames =
-        usize::try_from(timeline::position(end) - timeline::position(first.pts)).unwrap_or(0);
-    let tracks = tracks(&snapshot.game, snapshot.mic.as_ref(), first.pts, frames);
-    let encoded = encode(&tracks)?;
-
     let video = VideoTrack {
-        sps: &snapshot.params.sps,
-        pps: &snapshot.params.pps,
+        config: &snapshot.params.config,
+        colour: Some(Colour::BT709),
         samples: snapshot
             .video
             .iter()
             .map(|p| VideoSample {
                 data: &p.data,
                 pts: p.pts,
+                dts: p.dts,
                 keyframe: p.keyframe,
             })
             .collect(),
         last_duration: frame,
     };
+    // Audio from the first decode time to the end of the last picture (module docs).
+    let origin = video.origin();
+    let frames =
+        usize::try_from(timeline::position(video.presentation_end()) - timeline::position(origin))
+            .unwrap_or(0);
+    let tracks = tracks(
+        &snapshot.game,
+        snapshot.mic.as_ref(),
+        origin,
+        frames,
+        snapshot.audio_bitrate,
+    );
+    let encoded = encode(&tracks)?;
     let audio: Vec<AudioTrack> = tracks
         .iter()
         .zip(&encoded)
@@ -171,7 +182,7 @@ pub(super) fn write_clip(
             // Another clip took the name in the meantime: next number.
             Err(err) if err.kind() == ErrorKind::AlreadyExists => number = n + 1,
             Err(err) => {
-                eprintln!("kryo-shard: cannot write {}: {err}", path.display());
+                eprintln!("krak: cannot write {}: {err}", path.display());
                 return Err(WRITE_FAILED);
             }
         }
@@ -193,15 +204,22 @@ mod tests {
 
         // 0.25 s .. 1.25 s of video.
         let start = TICKS_PER_SECOND / 4;
-        let only_game = tracks(&game.snapshot(), None, start, 48_000);
+        let only_game = tracks(&game.snapshot(), None, start, 48_000, 192_000);
         assert_eq!(only_game.len(), 1);
         assert_eq!((only_game[0].name, only_game[0].channels), ("Game", 2));
+        assert_eq!(only_game[0].bitrate, 192_000);
         assert_eq!(only_game[0].pcm.len(), 96_000);
         // Game audio ends at 1 s: the rest is silence.
         assert_eq!(only_game[0].pcm[2 * 35_999], 1000);
         assert_eq!(only_game[0].pcm[2 * 36_000], 0);
 
-        let all = tracks(&game.snapshot(), Some(&mic.snapshot()), start, 48_000);
+        let all = tracks(
+            &game.snapshot(),
+            Some(&mic.snapshot()),
+            start,
+            48_000,
+            256_000,
+        );
         let names: Vec<&str> = all.iter().map(|t| t.name).collect();
         assert_eq!(names, ["Mix", "Game", "Microphone"]);
         assert_eq!(
@@ -214,7 +232,7 @@ mod tests {
         assert_eq!(all[2].pcm[12_000], 20_000);
         let mut loud = AudioTimeline::new(0, 48_000 * 60);
         loud.write(0, &vec![30_000; 96_000], false);
-        let clipped = tracks(&loud.snapshot(), Some(&loud.snapshot()), 0, 10);
+        let clipped = tracks(&loud.snapshot(), Some(&loud.snapshot()), 0, 10, 160_000);
         assert_eq!(clipped[0].pcm[0], i16::MAX);
     }
 }

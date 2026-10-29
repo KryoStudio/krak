@@ -270,6 +270,7 @@ mod tests {
     mod windows_only {
         use super::super::*;
         use crate::media::avc::tests::{PPS, sps_high_1080p};
+        use crate::media::codec::CodecConfig;
         use crate::media::mp4_writer::{self, AudioTrack, Options, VideoSample, VideoTrack};
         use crate::media::{ComGuard, MfGuard, TICKS_PER_SECOND, testing};
 
@@ -296,14 +297,18 @@ mod tests {
                 bitrate: 160_000,
             };
             let stream = imp::encode(&pcm, config, delay, &mut |_| true).expect("encode");
-            let sps = sps_high_1080p();
+            let config = CodecConfig::Avc {
+                sps: sps_high_1080p(),
+                pps: PPS.to_vec(),
+            };
             let idr = [0, 0, 0, 2, 0x65, 0x88];
             let video = VideoTrack {
-                sps: &sps,
-                pps: PPS,
+                config: &config,
+                colour: None,
                 samples: vec![VideoSample {
                     data: &idr,
                     pts: 0,
+                    dts: 0,
                     keyframe: true,
                 }],
                 last_duration: TICKS_PER_SECOND * 2,
@@ -340,6 +345,32 @@ mod tests {
                 let _ = std::fs::remove_dir_all(&dir);
             }
             (left, right, stream.frames.len(), decoded.len() / 2)
+        }
+
+        /// Which bitrates the Windows AAC encoder takes (it documents 96..192 kbit/s).
+        #[test]
+        #[ignore = "needs the Media Foundation AAC encoder; run with --ignored"]
+        fn probes_accepted_bitrates() {
+            let _com = ComGuard::new();
+            let _mf = MfGuard::new().expect("mf");
+            let pcm = burst();
+            for kbps in [96, 128, 160, 192, 256, 320] {
+                let config = AacConfig {
+                    sample_rate: 48_000,
+                    channels: 2,
+                    bitrate: kbps * 1000,
+                };
+                match encode(&pcm, config) {
+                    Ok(stream) => {
+                        let bytes: usize = stream.frames.iter().map(Vec::len).sum();
+                        println!(
+                            "{kbps} kbit/s: ok, {:.0} kbit/s measured",
+                            bytes as f64 * 8.0 / 2.0 / 1000.0
+                        );
+                    }
+                    Err(err) => println!("{kbps} kbit/s: refused ({err})"),
+                }
+            }
         }
 
         #[test]

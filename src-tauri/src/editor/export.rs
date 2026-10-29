@@ -1,13 +1,19 @@
 //! One export, start to finish (runs on the export thread, COM and Media Foundation ready).
 //!
-//! Copy: H.264 MP4 sources keep their compressed video (from the keyframe at or before
-//! `start`, an edit list hides the extra frames); other sources are re-encoded at their own
-//! size. Every audio track is decoded, gained, re-mixed and re-encoded (AAC).
+//! Copy: H.264, HEVC and AV1 MP4 sources keep their compressed video (from the keyframe at or
+//! before `start` in decode order, B-frames included; an edit list hides the extra pictures);
+//! other sources are re-encoded to H.264 at their own size. Every audio track is decoded,
+//! gained, re-mixed and re-encoded (AAC).
 //!
-//! Discord: one mixed AAC track at 128 kbit/s. The passthrough is kept if it fits under 95 %
-//! of the limit; otherwise the video is re-encoded for the budget (see [`plan::discord_target`]),
-//! and once more at 85 % (or less, by the measured overshoot: [`plan::retry_factor`]) if that
-//! still does not fit.
+//! Discord: always H.264 (every Discord client plays it), one mixed AAC track at 128 kbit/s.
+//! An H.264 passthrough is kept if it fits under 95 % of the limit; otherwise (and for HEVC/AV1
+//! sources) the video is re-encoded for the budget (see [`plan::discord_target`]), and once more
+//! at 85 % (or less, by the measured overshoot: [`plan::retry_factor`]) if that still does not
+//! fit.
+//!
+//! Timing: media time zero of an output is its first video decode time, which comes before the
+//! first picture when there are B-frames; audio is taken from that instant too, and the
+//! muxer's edit list hides the difference on every track (see `mp4_writer`).
 
 use std::fs::{self, File};
 use std::io::{self, BufWriter, ErrorKind, Write};
@@ -27,9 +33,10 @@ use super::{
     UNSUPPORTED, WRITE_FAILED, media_failure,
 };
 use crate::media::aac::{self, AacConfig, AacStream};
+use crate::media::codec::{CodecConfig, VideoCodec};
 use crate::media::d3d::{self, Gpu};
-use crate::media::mp4_writer::{self, AudioTrack, Options, VideoSample, VideoTrack};
-use crate::media::{ComGuard, MfGuard, TICKS_PER_SECOND, avc, rescale};
+use crate::media::mp4_writer::{self, AudioTrack, Colour, Options, VideoSample, VideoTrack};
+use crate::media::{ComGuard, MfGuard, TICKS_PER_SECOND, rescale};
 
 /// Shortest export (the UI keeps at least 0.5 s).
 const MIN_SECONDS: f64 = 0.1;
@@ -103,7 +110,7 @@ impl Source {
 
     fn from_movie(path: &Path, movie: Movie) -> Result<Self, &'static str> {
         let file = MappedFile::open(path).map_err(|err| {
-            eprintln!("kryo-shard: export: cannot map {}: {err}", path.display());
+            eprintln!("krak: export: cannot map {}: {err}", path.display());
             EXPORT_FAILED
         })?;
         let video = movie.video().ok_or(UNSUPPORTED)?;
@@ -164,10 +171,7 @@ impl Source {
                     .checked_sub(k + 1)
                     .and_then(|i| reader_audio.get(i))
                 else {
-                    eprintln!(
-                        "kryo-shard: export: audio track {} skipped",
-                        track.header.id
-                    );
+                    eprintln!("krak: export: audio track {} skipped", track.header.id);
                     continue;
                 };
                 Decoder::Reader {
@@ -239,26 +243,16 @@ impl Source {
         })
     }
 
-    /// The H.264 track when its samples can be copied as they are.
-    fn passthrough(&self) -> Option<(&Track, &[u8], &[u8], &MappedFile)> {
+    /// The video track when its samples can be copied as they are (H.264, HEVC or AV1 with
+    /// the parameter sets our muxer writes), with them.
+    fn passthrough(&self) -> Option<(&Track, CodecConfig, &MappedFile)> {
         let video = self.movie.as_ref()?.video()?;
         let file = self.file.as_ref()?;
-        let Codec::Avc {
-            sps,
-            pps,
-            length_size,
-        } = &video.codec
-        else {
+        if video.multiple_entries {
             return None;
-        };
-        // The muxer writes one SPS/PPS and 4-byte NAL lengths, in decode = presentation order.
-        let simple = sps.len() == 1
-            && pps.len() == 1
-            && *length_size == 4
-            && !video.reordered
-            && !video.multiple_entries
-            && avc::parse_sps(&sps[0]).is_some();
-        simple.then(|| (video, sps[0].as_slice(), pps[0].as_slice(), file))
+        }
+        let config = video.codec.passthrough_config()?;
+        Some((video, config, file))
     }
 }
 
@@ -287,6 +281,38 @@ pub fn export(
             progress,
         ),
     }
+}
+
+/// Every audio track of the clip at `path`, decoded over the whole clip (48 kHz, stereo or
+/// mono), main track first (the order and names `probe_shard` reports).
+pub fn decode_all_audio(
+    path: &Path,
+    progress: &Progress,
+) -> Result<Vec<(SourceTrack, Pcm)>, &'static str> {
+    let source = Source::open(path)?;
+    let end = if source.duration > 0.0 {
+        (source.duration * TICKS_PER_SECOND as f64).round() as i64
+    } else {
+        0
+    };
+    let count = source.audio.len().max(1) as f64;
+    let mut out = Vec::with_capacity(source.audio.len());
+    for (n, track) in source.audio.iter().enumerate() {
+        progress.check()?;
+        let span = progress.span(n as f64 / count, (n + 1) as f64 / count);
+        let pcm = match &track.decoder {
+            Decoder::Aac(index) => {
+                let movie = source.movie.as_ref().ok_or(EXPORT_FAILED)?;
+                let file = source.file.as_ref().ok_or(EXPORT_FAILED)?;
+                decode::aac_track(file, &movie.tracks[*index], 0, end, &span)?
+            }
+            Decoder::Reader { stream, shift } => {
+                decode::reader_track(&source.path, *stream, *shift, 0, end, &span)?
+            }
+        };
+        out.push((track.track.clone(), pcm));
+    }
+    Ok(out)
 }
 
 /// Validated `start..end` in 100 ns.
@@ -320,63 +346,84 @@ fn clamp_gains(gains: Gains) -> (f32, f32) {
 
 /// Video samples of a passthrough, from the mapped source.
 struct Passthrough<'a> {
-    sps: &'a [u8],
-    pps: &'a [u8],
+    config: CodecConfig,
+    colour: Option<Colour>,
     samples: Vec<VideoSample<'a>>,
     last_duration: i64,
     cut: Cut,
-    /// Timeline time just after the last kept frame.
-    end: i64,
+}
+
+impl Passthrough<'_> {
+    fn track(&self) -> VideoTrack<'_> {
+        VideoTrack {
+            config: &self.config,
+            colour: self.colour,
+            samples: self
+                .samples
+                .iter()
+                .map(|s| VideoSample {
+                    data: s.data,
+                    pts: s.pts,
+                    dts: s.dts,
+                    keyframe: s.keyframe,
+                })
+                .collect(),
+            last_duration: self.last_duration,
+        }
+    }
+
+    /// The edit list: from the requested start (first picture + offset) to the end of the last
+    /// picture asked for.
+    fn options(&self) -> Options {
+        let first = self.samples.first().map_or(0, |s| s.pts);
+        let shown_from = first + self.cut.offset;
+        Options {
+            start_offset: self.cut.offset,
+            duration: Some((self.cut.video_end - shown_from).max(1)),
+        }
+    }
 }
 
 fn passthrough_video<'a>(
     video: &Track,
-    sps: &'a [u8],
-    pps: &'a [u8],
+    config: CodecConfig,
     file: &'a MappedFile,
     start: i64,
     end: i64,
 ) -> Result<Passthrough<'a>, &'static str> {
-    let times: Vec<i64> = (0..video.samples.len())
+    let pts: Vec<i64> = (0..video.samples.len())
         .map(|i| video.sample_time(i))
         .collect();
+    let dts: Vec<i64> = video.samples.iter().map(|s| video.time(s.dts)).collect();
     let sync: Vec<bool> = video.samples.iter().map(|s| s.sync).collect();
-    let cut = plan::passthrough_cut(&times, &sync, start, end).ok_or(INVALID_RANGE)?;
+    let fps = probe::track_fps(video);
+    let frame = if fps > 0.0 {
+        (TICKS_PER_SECOND as f64 / fps).round() as i64
+    } else {
+        TICKS_PER_SECOND / 30
+    };
+    let cut = plan::passthrough_cut(&pts, &dts, &sync, frame, start, end).ok_or(INVALID_RANGE)?;
     let samples = (cut.first..cut.end)
         .map(|i| {
             let s = &video.samples[i];
             Some(VideoSample {
                 data: file.slice(s.offset, s.size)?,
-                pts: times[i],
+                pts: pts[i],
+                dts: dts[i],
                 keyframe: s.sync,
             })
         })
         .collect::<Option<Vec<_>>>()
         .ok_or_else(|| {
-            eprintln!("kryo-shard: export: video samples outside the file");
+            eprintln!("krak: export: video samples outside the file");
             EXPORT_FAILED
         })?;
-    // A zero last duration (some writers) would drop the frame: use the previous one's.
-    let last = &video.samples[cut.end - 1];
-    let duration = match last.duration {
-        0 => video.samples[..cut.end - 1]
-            .last()
-            .map_or(0, |s| s.duration),
-        d => d,
-    };
-    let last_duration = rescale(
-        i64::from(duration),
-        i64::from(video.header.timescale),
-        TICKS_PER_SECOND,
-    )
-    .max(1);
     Ok(Passthrough {
-        sps,
-        pps,
+        config,
+        colour: video.colour,
         samples,
-        last_duration,
+        last_duration: frame,
         cut,
-        end: times[cut.end - 1] + last_duration,
     })
 }
 
@@ -390,59 +437,55 @@ fn copy(
     progress: &Progress,
 ) -> Result<Exported, &'static str> {
     let plan = plan::audio_plan(&source_tracks(source), false);
-    if let Some((video, sps, pps, file)) = source.passthrough() {
-        let video = passthrough_video(video, sps, pps, file, start, end)?;
-        // Audio covers the kept frames; the edit list hides the same lead-in on every track.
+    if let Some((video, config, file)) = source.passthrough() {
+        let video = passthrough_video(video, config, file, start, end)?;
+        // Audio covers the kept pictures from the first decode time; the edit list hides the
+        // same lead-in on every track.
         let tracks = audio(
             source,
             &plan,
             video.cut.origin,
-            video.end,
+            video.cut.video_end,
             gains,
             false,
             progress.span(0.0, 0.6),
         )?;
-        let track = VideoTrack {
-            sps: video.sps,
-            pps: video.pps,
-            samples: video.samples,
-            last_duration: video.last_duration,
-        };
-        let options = Options {
-            start_offset: video.cut.offset,
-        };
         let (path, size) = write_copy(
             &source.path,
             label,
-            &track,
+            &video.track(),
             &tracks,
-            &options,
+            &video.options(),
             progress.span(0.6, 1.0),
         )?;
         return Ok(Exported {
             path,
             size,
             reencoded: false,
-            detail: format!("passthrough, offset {} ms", video.cut.offset / 10_000),
+            detail: format!(
+                "passthrough {}, offset {} ms",
+                video.config.codec().name(),
+                video.cut.offset / 10_000
+            ),
         });
     }
     let target = plan::copy_target(source.size, source.fps, source.bitrate);
-    let tracks = audio(
-        source,
-        &plan,
-        start,
-        end,
-        gains,
-        false,
-        progress.span(0.0, 0.15),
-    )?;
     let encoded = reencode(
         source,
         start,
         end,
         target,
         options,
-        progress.span(0.15, 0.9),
+        progress.span(0.0, 0.75),
+    )?;
+    let tracks = audio(
+        source,
+        &plan,
+        start - encoded.lead_in(),
+        end,
+        gains,
+        false,
+        progress.span(0.75, 0.9),
     )?;
     let track = encoded_track(&encoded);
     let (path, size) = write_copy(
@@ -484,10 +527,14 @@ fn discord(
     let fits = |size: u64| size as f64 <= max_bytes as f64 * plan::DISCORD_PASSTHROUGH;
     let plan = plan::audio_plan(&source_tracks(source), true);
 
-    if let Some((video, sps, pps, file)) = source.passthrough() {
-        let video = passthrough_video(video, sps, pps, file, start, end)?;
+    // Discord always gets H.264: other codecs are re-encoded.
+    let h264 = source
+        .passthrough()
+        .filter(|(_, config, _)| config.codec() == VideoCodec::H264);
+    if let Some((video, config, file)) = h264 {
+        let video = passthrough_video(video, config, file, start, end)?;
         let video_bytes: u64 = video.samples.iter().map(|s| s.data.len() as u64).sum();
-        let seconds = (video.end - video.cut.origin) as f64 / TICKS_PER_SECOND as f64;
+        let seconds = (video.cut.video_end - video.cut.origin) as f64 / TICKS_PER_SECOND as f64;
         let audio_bytes = f64::from(plan::DISCORD_AUDIO_BITRATE) / 8.0 * seconds;
         // Clearly too big: skip straight to the re-encode.
         if fits(((video_bytes as f64 + audio_bytes) * 0.98) as u64) {
@@ -495,20 +542,13 @@ fn discord(
                 source,
                 &plan,
                 video.cut.origin,
-                video.end,
+                video.cut.video_end,
                 gains,
                 true,
                 progress.span(0.0, 0.5),
             )?;
-            let track = VideoTrack {
-                sps: video.sps,
-                pps: video.pps,
-                samples: video.samples,
-                last_duration: video.last_duration,
-            };
-            let options = Options {
-                start_offset: video.cut.offset,
-            };
+            let track = video.track();
+            let options = video.options();
             let size = measure(&track, &tracks, &options)?;
             if fits(size) {
                 let (path, size) = write_discord(
@@ -530,32 +570,39 @@ fn discord(
     }
 
     let seconds = (end - start) as f64 / TICKS_PER_SECOND as f64;
-    let tracks = audio(
-        source,
-        &plan,
-        start,
-        end,
-        gains,
-        true,
-        progress.span(0.0, 0.1),
-    )?;
+    // Decoded once the video says where its media time starts (its reorder lead-in).
+    let mut tracks: Option<(i64, Vec<EncodedAudio>)> = None;
     let mut factor = 1.0;
     for attempt in 0..2 {
         let target = plan::discord_target(source.size, source.fps, seconds, max_bytes, factor)?;
-        progress.rewind(0.1);
+        progress.rewind(0.0);
         let encoded = reencode(
             source,
             start,
             end,
             target,
             options,
-            progress.span(0.1, 0.95),
+            progress.span(0.0, 0.85),
         )?;
+        let lead_in = encoded.lead_in();
+        if tracks.as_ref().is_none_or(|(at, _)| *at != lead_in) {
+            let decoded = audio(
+                source,
+                &plan,
+                start - lead_in,
+                end,
+                gains,
+                true,
+                progress.span(0.85, 0.95),
+            )?;
+            tracks = Some((lead_in, decoded));
+        }
+        let tracks = &tracks.as_ref().ok_or(EXPORT_FAILED)?.1;
         let track = encoded_track(&encoded);
-        let size = measure(&track, &tracks, &Options::default())?;
+        let size = measure(&track, tracks, &Options::default())?;
         let video_bytes: u64 = encoded.packets.iter().map(|p| p.data.len() as u64).sum();
         eprintln!(
-            "kryo-shard: export: attempt {}: {} → {size} bytes (limit {max_bytes})",
+            "krak: export: attempt {}: {} → {size} bytes (limit {max_bytes})",
             attempt + 1,
             describe(&encoded, target)
         );
@@ -565,7 +612,7 @@ fn discord(
                 dir,
                 &stem,
                 &track,
-                &tracks,
+                tracks,
                 &Options::default(),
                 progress.span(0.95, 1.0),
             )?;
@@ -622,18 +669,27 @@ fn reencode(
 
 fn encoded_track(encoded: &Encoded) -> VideoTrack<'_> {
     VideoTrack {
-        sps: &encoded.sps,
-        pps: &encoded.pps,
+        config: &encoded.config,
+        colour: Some(Colour::BT709),
         samples: encoded
             .packets
             .iter()
             .map(|p| VideoSample {
                 data: &p.data,
                 pts: p.pts,
+                dts: p.dts,
                 keyframe: p.keyframe,
             })
             .collect(),
         last_duration: encoded.frame,
+    }
+}
+
+impl Encoded {
+    /// How long the first decode time comes before the first picture (B-frame reordering):
+    /// the output's audio must start that much earlier (module docs).
+    fn lead_in(&self) -> i64 {
+        self.packets.first().map_or(0, |p| (p.pts - p.dts).max(0))
     }
 }
 
@@ -785,7 +841,7 @@ fn measure(
     options: &Options,
 ) -> Result<u64, &'static str> {
     mp4_writer::write(&mut io::sink(), video, &muxer_tracks(audio), options).map_err(|err| {
-        eprintln!("kryo-shard: export: cannot mux: {err}");
+        eprintln!("krak: export: cannot mux: {err}");
         EXPORT_FAILED
     })
 }
@@ -852,7 +908,7 @@ fn write_error(path: &Path, err: &io::Error, progress: &Span) -> &'static str {
     if progress.check().is_err() {
         return CANCELLED;
     }
-    eprintln!("kryo-shard: export: cannot write {}: {err}", path.display());
+    eprintln!("krak: export: cannot write {}: {err}", path.display());
     WRITE_FAILED
 }
 
@@ -930,15 +986,19 @@ mod tests {
     use std::sync::atomic::AtomicBool;
 
     fn video(sps: &[u8], data: &[u8]) -> VideoTrack<'static> {
-        let sps: &'static [u8] = Box::leak(sps.to_vec().into_boxed_slice());
+        let config: &'static CodecConfig = Box::leak(Box::new(CodecConfig::Avc {
+            sps: sps.to_vec(),
+            pps: PPS.to_vec(),
+        }));
         let data: &'static [u8] = Box::leak(data.to_vec().into_boxed_slice());
         VideoTrack {
-            sps,
-            pps: PPS,
+            config,
+            colour: Some(Colour::BT709),
             samples: (0..30)
                 .map(|i| VideoSample {
                     data,
                     pts: i * TICKS_PER_SECOND / 30,
+                    dts: i * TICKS_PER_SECOND / 30,
                     keyframe: i == 0,
                 })
                 .collect(),

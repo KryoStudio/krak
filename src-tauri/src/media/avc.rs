@@ -1,6 +1,8 @@
 //! H.264 bitstream helpers (pure Rust): Annex-B parsing, Annex-B → AVCC conversion with SPS/PPS
 //! extraction, a small SPS reader and the `avcC` decoder configuration record.
 
+use super::bits::{BitReader, unescape};
+
 /// NAL unit types we care about.
 pub const NAL_IDR: u8 = 5;
 pub const NAL_SPS: u8 = 7;
@@ -41,16 +43,6 @@ fn push_nal<'a>(nals: &mut Vec<&'a [u8]>, nal: &'a [u8]) {
     if end > 0 {
         nals.push(&nal[..end]);
     }
-}
-
-/// One encoded picture, ready for MP4.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct VideoPacket {
-    /// AVCC (4-byte NAL lengths), without SPS/PPS/AUD.
-    pub data: Vec<u8>,
-    /// Presentation (= decode, no B-frames) time, 100 ns.
-    pub pts: i64,
-    pub keyframe: bool,
 }
 
 /// One encoded picture converted to MP4 form.
@@ -263,63 +255,6 @@ fn skip_scaling_list(r: &mut BitReader, size: usize) -> Option<()> {
         }
     }
     Some(())
-}
-
-/// Removes emulation prevention bytes (`00 00 03` → `00 00`).
-fn unescape(data: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(data.len());
-    let mut zeros = 0;
-    for &b in data {
-        if zeros >= 2 && b == 3 {
-            zeros = 0;
-            continue;
-        }
-        zeros = if b == 0 { zeros + 1 } else { 0 };
-        out.push(b);
-    }
-    out
-}
-
-struct BitReader<'a> {
-    data: &'a [u8],
-    pos: usize,
-}
-
-impl<'a> BitReader<'a> {
-    fn new(data: &'a [u8]) -> Self {
-        Self { data, pos: 0 }
-    }
-
-    fn bit(&mut self) -> Option<u32> {
-        let byte = *self.data.get(self.pos / 8)?;
-        let bit = (byte >> (7 - self.pos % 8)) & 1;
-        self.pos += 1;
-        Some(u32::from(bit))
-    }
-
-    fn bits(&mut self, n: u32) -> Option<u32> {
-        (0..n).try_fold(0u32, |acc, _| Some((acc << 1) | self.bit()?))
-    }
-
-    /// Unsigned Exp-Golomb.
-    fn ue(&mut self) -> Option<u32> {
-        let mut zeros = 0;
-        while self.bit()? == 0 {
-            zeros += 1;
-            if zeros > 31 {
-                return None;
-            }
-        }
-        let rest = self.bits(zeros)?;
-        ((1u64 << zeros) - 1 + u64::from(rest)).try_into().ok()
-    }
-
-    /// Signed Exp-Golomb.
-    fn se(&mut self) -> Option<i32> {
-        let k = i64::from(self.ue()?);
-        let value = if k % 2 == 1 { (k + 1) / 2 } else { -(k / 2) };
-        i32::try_from(value).ok()
-    }
 }
 
 /// `AVCDecoderConfigurationRecord` (the payload of an `avcC` box), 4-byte NAL lengths.

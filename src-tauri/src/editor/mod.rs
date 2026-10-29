@@ -6,7 +6,8 @@
 //!   which audio tracks to write), [`pcm`] the gain/mix/resampling maths;
 //! - [`decode`] decodes audio (AAC with the Media Foundation decoder, anything else with the
 //!   Source Reader), [`transcode`] re-encodes video (hardware decode → GPU scaling → H.264);
-//! - [`export`] puts it together, [`naming`] picks output paths, [`probe`] answers the UI.
+//! - [`export`] puts it together, [`naming`] picks output paths, [`probe`] answers the UI,
+//!   [`waveform`] draws the timeline's audio lanes.
 //!
 //! Exports run on a dedicated thread (COM/MF initialised there), one at a time; every loop
 //! checks the cancel flag and partial outputs are deleted on cancel or failure.
@@ -27,6 +28,8 @@ pub mod probe;
 mod tests;
 #[cfg(windows)]
 pub mod transcode;
+#[cfg(windows)]
+pub mod waveform;
 
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -44,6 +47,8 @@ pub const INVALID_RANGE: &str = "invalid_range";
 /// Malformed request (Discord export without a usable `maxBytes`).
 pub const INVALID_REQUEST: &str = "invalid_request";
 pub const UNSUPPORTED: &str = "unsupported";
+/// The clip's video codec cannot be decoded on this PC (HEVC/AV1 without Windows' extensions).
+pub const UNSUPPORTED_CODEC: &str = "unsupported_codec";
 pub const TOO_LONG: &str = "too_long";
 pub const EXPORT_FAILED: &str = "export_failed";
 pub const WRITE_FAILED: &str = "write_failed";
@@ -278,7 +283,7 @@ pub fn media_failure(what: &str, err: MediaError) -> &'static str {
     if err.code == CANCELLED {
         return CANCELLED;
     }
-    eprintln!("kryo-shard: export: {what}: {err}");
+    eprintln!("krak: export: {what}: {err}");
     EXPORT_FAILED
 }
 

@@ -6,8 +6,9 @@ use std::path::Path;
 use crate::names;
 
 /// Executables (lowercase stems) that are the desktop, not a game.
-const DESKTOP_PROCESSES: [&str; 15] = [
+const DESKTOP_PROCESSES: [&str; 16] = [
     "explorer",
+    "krak",
     "kryo-shard",
     "searchhost",
     "searchapp",
@@ -323,6 +324,7 @@ mod tests {
             r"C:\Windows\System32\ApplicationFrameHost.exe",
             r"C:\Windows\System32\LockApp.exe",
             r"C:\Windows\System32\dwm.exe",
+            r"C:\Users\me\AppData\Local\Krak\krak.exe",
             r"C:\Program Files\Kryo Shard\kryo-shard.exe",
         ] {
             assert_eq!(name(exe, &["Something"]), None, "{exe}");

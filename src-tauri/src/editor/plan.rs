@@ -8,39 +8,79 @@ use crate::media::TICKS_PER_SECOND;
 /// Times this close count as equal (float seconds from the UI, rounding of timescales).
 pub const TOLERANCE: i64 = TICKS_PER_SECOND / 1000;
 
-/// The video samples a passthrough keeps: `first..end` (decode = presentation order).
+/// The video samples a passthrough keeps: `first..end` in decode order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Cut {
     pub first: usize,
     pub end: usize,
-    /// Timeline time of `first`: the output's time zero.
+    /// Timeline decode time of `first`: the output's media time zero (audio starts there).
     pub origin: i64,
-    /// What the edit list hides: playback starts at `origin + offset` = the requested start.
+    /// What the edit list hides after the first presented picture: playback starts at
+    /// `pts[first] + offset` = the requested start.
     pub offset: i64,
+    /// Timeline end of the last picture shown before `end` (the edit list stops there).
+    pub video_end: i64,
 }
 
-/// Keeps from the keyframe at or before `start` to the last frame that starts before `end`.
-/// `times` are presentation times in decode order (no reordering), `sync` the keyframe flags.
-pub fn passthrough_cut(times: &[i64], sync: &[bool], start: i64, end: i64) -> Option<Cut> {
-    let first = (0..times.len())
+/// Keeps from the keyframe at or before `start` to the last picture that starts before `end`,
+/// in decode order, extended so that the kept pictures form one run in presentation order
+/// (with B-frames, an anchor picture is decoded before the B-frames shown ahead of it).
+/// `pts`/`dts` are timeline times in decode order, `sync` the keyframe flags, `frame` the
+/// source frame duration (for the last picture). `None` when nothing can be kept, or the
+/// source is not cut-friendly here (a picture after the keyframe in decode order shown before
+/// it: an open GOP).
+pub fn passthrough_cut(
+    pts: &[i64],
+    dts: &[i64],
+    sync: &[bool],
+    frame: i64,
+    start: i64,
+    end: i64,
+) -> Option<Cut> {
+    let n = pts.len();
+    let first = (0..n)
         .rev()
-        .find(|&i| sync[i] && times[i] <= start + TOLERANCE)
+        .find(|&i| sync[i] && pts[i] <= start + TOLERANCE)
         // Nothing before `start` (the video begins later): from the first keyframe.
-        .or_else(|| (0..times.len()).find(|&i| sync[i]))?;
-    let end_index = (first..times.len())
-        .find(|&i| times[i] >= end - TOLERANCE)
-        .unwrap_or(times.len());
-    // Nothing to show: no frame left at or after `start`.
-    if end_index <= first || times[end_index - 1] < start - TOLERANCE {
+        .or_else(|| (0..n).find(|&i| sync[i]))?;
+    let shown = |i: usize| pts[i] < end - TOLERANCE;
+    let last_needed = (first..n).rev().find(|&i| shown(i))?;
+    let mut stop = last_needed + 1;
+    let mut max_pts = pts[first..stop].iter().copied().max()?;
+    while stop < n && pts[stop] < max_pts {
+        max_pts = max_pts.max(pts[stop]);
+        stop += 1;
+    }
+    let kept = &pts[first..stop];
+    let min_pts = kept.iter().copied().min()?;
+    if min_pts < pts[first] {
+        return None; // open GOP
+    }
+    // No other picture of the source may fall inside the kept run.
+    let inside = |&t: &i64| t >= min_pts && t <= max_pts;
+    if pts[..first].iter().chain(&pts[stop..]).any(inside) {
         return None;
     }
-    let origin = times[first];
-    let offset = start - origin;
+    // Nothing to show: no picture left at or after `start`.
+    let last_shown = kept
+        .iter()
+        .copied()
+        .filter(|&t| t < end - TOLERANCE)
+        .max()?;
+    if last_shown < start - TOLERANCE {
+        return None;
+    }
+    let next = pts.iter().copied().filter(|&t| t > last_shown).min();
+    let video_end = next.map_or(last_shown + frame.max(1), |t| {
+        t.min(last_shown + 2 * frame.max(1))
+    });
+    let offset = start - pts[first];
     Some(Cut {
         first,
-        end: end_index,
-        origin,
+        end: stop,
+        origin: dts[first],
         offset: if offset > TOLERANCE { offset } else { 0 },
+        video_end,
     })
 }
 
@@ -291,67 +331,112 @@ mod tests {
     const S: i64 = TICKS_PER_SECOND;
     const FRAME: i64 = S / 60;
 
-    /// 6 s at 60 fps with a keyframe every second, like the capture engine writes.
+    /// 6 s at 60 fps with a keyframe every second, no reordering.
     fn clip() -> (Vec<i64>, Vec<bool>) {
         let times: Vec<i64> = (0..360).map(|i| i * S / 60).collect();
         let sync = (0..360).map(|i| i % 60 == 0).collect();
         (times, sync)
     }
 
+    fn cut(times: &[i64], sync: &[bool], start: i64, end: i64) -> Option<Cut> {
+        passthrough_cut(times, times, sync, FRAME, start, end)
+    }
+
     #[test]
     fn cuts_from_the_keyframe_before_start() {
         let (times, sync) = clip();
-        let cut = passthrough_cut(&times, &sync, S, S * 7 / 2).expect("cut");
+        let c = cut(&times, &sync, S, S * 7 / 2).expect("cut");
         assert_eq!(
-            cut,
+            c,
             Cut {
                 first: 60,
                 end: 210,
                 origin: S,
-                offset: 0
+                offset: 0,
+                video_end: S * 7 / 2,
             }
         );
         // Start between keyframes: back to the previous one, the edit list hides the rest.
-        let cut = passthrough_cut(&times, &sync, S * 3 / 2, S * 7 / 2).expect("cut");
-        assert_eq!((cut.first, cut.origin, cut.offset), (60, S, S / 2));
-        assert_eq!(cut.end, 210, "the frame at 3.5 s is not kept");
+        let c = cut(&times, &sync, S * 3 / 2, S * 7 / 2).expect("cut");
+        assert_eq!((c.first, c.origin, c.offset), (60, S, S / 2));
+        assert_eq!(c.end, 210, "the frame at 3.5 s is not kept");
         // Start a hair before a keyframe (float seconds): that keyframe, no offset.
-        let cut = passthrough_cut(&times, &sync, 2 * S - 3, 3 * S).expect("cut");
-        assert_eq!((cut.first, cut.offset), (120, 0));
+        let c = cut(&times, &sync, 2 * S - 3, 3 * S).expect("cut");
+        assert_eq!((c.first, c.offset), (120, 0));
         // A frame starting just under `end` is kept, one at `end` (within tolerance) is not.
-        let cut = passthrough_cut(&times, &sync, 0, 2 * S + FRAME / 2).expect("cut");
-        assert_eq!((cut.first, cut.end), (0, 121));
-        let cut = passthrough_cut(&times, &sync, 0, 2 * S + 5).expect("cut");
-        assert_eq!(cut.end, 120);
+        let c = cut(&times, &sync, 0, 2 * S + FRAME / 2).expect("cut");
+        assert_eq!((c.first, c.end), (0, 121));
+        let c = cut(&times, &sync, 0, 2 * S + 5).expect("cut");
+        assert_eq!(c.end, 120);
         // Until the end of the clip; a 1-tick offset is rounding, not an edit.
-        let cut = passthrough_cut(&times, &sync, 5 * S + S / 4, 10 * S).expect("cut");
-        assert_eq!((cut.first, cut.end, cut.offset), (300, 360, S / 4));
-        let cut = passthrough_cut(&times, &sync, 5 * S + 1, 10 * S).expect("cut");
-        assert_eq!(cut.offset, 0);
+        let c = cut(&times, &sync, 5 * S + S / 4, 10 * S).expect("cut");
+        assert_eq!((c.first, c.end, c.offset), (300, 360, S / 4));
+        let c = cut(&times, &sync, 5 * S + 1, 10 * S).expect("cut");
+        assert_eq!(c.offset, 0);
     }
 
     #[test]
     fn cut_edge_cases() {
         let (times, sync) = clip();
+        assert_eq!(cut(&times, &sync, 7 * S, 8 * S), None, "past the end");
         assert_eq!(
-            passthrough_cut(&times, &sync, 7 * S, 8 * S),
-            None,
-            "past the end"
-        );
-        assert_eq!(
-            passthrough_cut(&times, &sync, 6 * S, 8 * S),
+            cut(&times, &sync, 6 * S, 8 * S),
             None,
             "after the last frame"
         );
-        assert_eq!(passthrough_cut(&[], &[], 0, S), None);
+        assert_eq!(cut(&[], &[], 0, S), None);
         // Video starting after `start` (empty edit): from its first keyframe, no offset.
         let late: Vec<i64> = times.iter().map(|t| t + S / 10).collect();
-        let cut = passthrough_cut(&late, &sync, 0, S).expect("cut");
-        assert_eq!((cut.first, cut.origin, cut.offset), (0, S / 10, 0));
+        let c = cut(&late, &sync, 0, S).expect("cut");
+        assert_eq!((c.first, c.origin, c.offset), (0, S / 10, 0));
         // Edit-listed source: samples before time zero have negative times.
         let shifted: Vec<i64> = times.iter().map(|t| t - S / 2).collect();
-        let cut = passthrough_cut(&shifted, &sync, 0, S).expect("cut");
-        assert_eq!((cut.first, cut.origin, cut.offset), (0, -S / 2, S / 2));
+        let c = cut(&shifted, &sync, 0, S).expect("cut");
+        assert_eq!((c.first, c.origin, c.offset), (0, -S / 2, S / 2));
+    }
+
+    /// Decode order of a B-pyramid stream (as NVENC makes it), presentation times at 60 fps:
+    /// I0 P4 B2 B1 B3 P8 B6 B5 B7 ... with an IDR every 12 frames (P11 B9 B10 before it), decode
+    /// times 3 frames earlier.
+    fn b_frames(count: i64) -> (Vec<i64>, Vec<i64>, Vec<bool>) {
+        let mut order = Vec::new();
+        for gop in (0..count).step_by(12) {
+            order.extend([0, 4, 2, 1, 3, 8, 6, 5, 7, 11, 9, 10].map(|f| gop + f));
+        }
+        let pts: Vec<i64> = order.iter().map(|&f| f * FRAME).collect();
+        let dts = (0..order.len() as i64).map(|n| (n - 3) * FRAME).collect();
+        let sync = order.iter().map(|&f| f % 12 == 0).collect();
+        (pts, dts, sync)
+    }
+
+    #[test]
+    fn cuts_b_frame_streams_in_decode_order() {
+        let (pts, dts, sync) = b_frames(48);
+        let frame_of = |c: &Cut| -> Vec<i64> {
+            let mut f: Vec<i64> = pts[c.first..c.end].iter().map(|t| t / FRAME).collect();
+            f.sort_unstable();
+            f
+        };
+        // 13.5 .. 18.5 frames: from IDR 12; frame 18 is the last one shown, decoded after P20,
+        // so P20 and B17 B19 come too (one run: 12..=20); the edit list stops after frame 18.
+        let c =
+            passthrough_cut(&pts, &dts, &sync, FRAME, 27 * FRAME / 2, 37 * FRAME / 2).expect("cut");
+        assert_eq!(c.first, 12);
+        assert_eq!(frame_of(&c), (12..=20).collect::<Vec<_>>());
+        assert_eq!(c.origin, dts[12]);
+        assert_eq!(c.offset, 27 * FRAME / 2 - 12 * FRAME);
+        assert_eq!(c.video_end, 19 * FRAME);
+        // Ending right before an IDR: exactly the GOP.
+        let c = passthrough_cut(&pts, &dts, &sync, FRAME, 0, 12 * FRAME).expect("cut");
+        assert_eq!((c.first, c.end, c.offset), (0, 12, 0));
+        assert_eq!(c.video_end, 12 * FRAME);
+        // An open GOP (a picture decoded after the keyframe but shown before it) is refused.
+        let mut open = pts.clone();
+        open[13] = 11 * FRAME - 1;
+        assert_eq!(
+            passthrough_cut(&open, &dts, &sync, FRAME, 13 * FRAME, 20 * FRAME),
+            None
+        );
     }
 
     #[test]

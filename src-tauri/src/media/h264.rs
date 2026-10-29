@@ -1,4 +1,5 @@
-//! H.264 encoding over Media Foundation.
+//! H.264 encoding over Media Foundation: the fallback when the native NVENC backend
+//! (`super::nvenc`) is not available (AMD, Intel, older NVIDIA drivers), and the software path.
 //!
 //! - Hardware: the encoder MFT of the capture adapter (NVENC, AMF, Quick Sync...), found with
 //!   `MFTEnum2` filtered by adapter LUID. These MFTs are asynchronous: they ask for input
@@ -8,9 +9,10 @@
 //! - Software: Microsoft's H.264 encoder MFT (synchronous), fed system-memory NV12.
 //!
 //! Both are configured the same way: High profile, no B-frames (output order = input order,
-//! pts = dts), one keyframe per second (GOP = fps), low latency, peak-constrained VBR
-//! (max = 1.5 × mean), BT.709 limited range signalled in the media types so the SPS VUI is
-//! right. Output is converted to AVCC with SPS/PPS kept aside (see [`super::avc`]).
+//! pts = dts), one keyframe per second (GOP = fps), quality over speed (low-latency mode off:
+//! it tunes the encoder for streaming), peak-constrained VBR (max = `max_bitrate`), BT.709
+//! limited range signalled in the media types so the SPS VUI is right. Output is converted to
+//! AVCC with SPS/PPS kept aside (see [`super::avc`]).
 
 use std::time::{Duration, Instant};
 
@@ -21,33 +23,34 @@ use windows::Win32::Graphics::Direct3D11::{
 };
 use windows::Win32::Media::MediaFoundation::{
     CLSID_MSH264EncoderMFT, CODECAPI_AVEncCommonMaxBitRate, CODECAPI_AVEncCommonMeanBitRate,
-    CODECAPI_AVEncCommonRateControlMode, CODECAPI_AVEncMPVDefaultBPictureCount,
-    CODECAPI_AVEncMPVGOPSize, CODECAPI_AVEncMPVProfile, CODECAPI_AVLowLatencyMode, ICodecAPI,
-    IMFActivate, IMFAttributes, IMFDXGIBuffer, IMFMediaEventGenerator, IMFMediaType, IMFSample,
-    IMFShutdown, IMFTransform, IMFVideoSampleAllocatorEx, MEError, METransformDrainComplete,
-    METransformHaveOutput, METransformNeedInput, MF_E_NO_EVENTS_AVAILABLE, MF_E_NOTACCEPTING,
-    MF_E_SAMPLEALLOCATOR_EMPTY, MF_E_TRANSFORM_STREAM_CHANGE, MF_EVENT_FLAG_NO_WAIT, MF_EVENT_TYPE,
-    MF_MT_AVG_BITRATE, MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE, MF_MT_INTERLACE_MODE,
-    MF_MT_MPEG_SEQUENCE_HEADER, MF_MT_MPEG2_PROFILE, MF_MT_PIXEL_ASPECT_RATIO, MF_MT_SUBTYPE,
-    MF_MT_TRANSFER_FUNCTION, MF_MT_VIDEO_NOMINAL_RANGE, MF_MT_VIDEO_PRIMARIES, MF_MT_YUV_MATRIX,
-    MF_SA_D3D11_AWARE, MF_SA_D3D11_BINDFLAGS, MF_SA_D3D11_USAGE, MF_TRANSFORM_ASYNC,
-    MF_TRANSFORM_ASYNC_UNLOCK, MFCreateAttributes, MFCreateVideoSampleAllocatorEx,
-    MFMediaType_Video, MFNominalRange_16_235, MFSampleExtension_CleanPoint,
-    MFT_CATEGORY_VIDEO_ENCODER, MFT_ENUM_ADAPTER_LUID, MFT_ENUM_FLAG_HARDWARE,
-    MFT_ENUM_FLAG_SORTANDFILTER, MFT_ENUM_HARDWARE_VENDOR_ID_Attribute,
-    MFT_FRIENDLY_NAME_Attribute, MFT_MESSAGE_COMMAND_DRAIN, MFT_MESSAGE_COMMAND_FLUSH,
-    MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, MFT_MESSAGE_NOTIFY_END_OF_STREAM,
-    MFT_MESSAGE_NOTIFY_END_STREAMING, MFT_MESSAGE_NOTIFY_START_OF_STREAM,
-    MFT_MESSAGE_SET_D3D_MANAGER, MFT_REGISTER_TYPE_INFO, MFTEnum2, MFVideoFormat_H264,
-    MFVideoFormat_NV12, MFVideoInterlace_Progressive, MFVideoPrimaries_BT709, MFVideoTransFunc_709,
-    MFVideoTransferMatrix_BT709, eAVEncCommonRateControlMode_PeakConstrainedVBR,
-    eAVEncH264VProfile_High,
+    CODECAPI_AVEncCommonQualityVsSpeed, CODECAPI_AVEncCommonRateControlMode,
+    CODECAPI_AVEncMPVDefaultBPictureCount, CODECAPI_AVEncMPVGOPSize, CODECAPI_AVEncMPVProfile,
+    CODECAPI_AVLowLatencyMode, ICodecAPI, IMFActivate, IMFAttributes, IMFDXGIBuffer,
+    IMFMediaEventGenerator, IMFMediaType, IMFSample, IMFShutdown, IMFTransform,
+    IMFVideoSampleAllocatorEx, MEError, METransformDrainComplete, METransformHaveOutput,
+    METransformNeedInput, MF_E_NO_EVENTS_AVAILABLE, MF_E_NOTACCEPTING, MF_E_SAMPLEALLOCATOR_EMPTY,
+    MF_E_TRANSFORM_STREAM_CHANGE, MF_EVENT_FLAG_NO_WAIT, MF_EVENT_TYPE, MF_MT_AVG_BITRATE,
+    MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE, MF_MT_INTERLACE_MODE, MF_MT_MPEG_SEQUENCE_HEADER,
+    MF_MT_MPEG2_PROFILE, MF_MT_PIXEL_ASPECT_RATIO, MF_MT_SUBTYPE, MF_MT_TRANSFER_FUNCTION,
+    MF_MT_VIDEO_NOMINAL_RANGE, MF_MT_VIDEO_PRIMARIES, MF_MT_YUV_MATRIX, MF_SA_D3D11_AWARE,
+    MF_SA_D3D11_BINDFLAGS, MF_SA_D3D11_USAGE, MF_TRANSFORM_ASYNC, MF_TRANSFORM_ASYNC_UNLOCK,
+    MFCreateAttributes, MFCreateVideoSampleAllocatorEx, MFMediaType_Video, MFNominalRange_16_235,
+    MFSampleExtension_CleanPoint, MFSampleExtension_DecodeTimestamp, MFT_CATEGORY_VIDEO_ENCODER,
+    MFT_ENUM_ADAPTER_LUID, MFT_ENUM_FLAG_HARDWARE, MFT_ENUM_FLAG_SORTANDFILTER,
+    MFT_ENUM_HARDWARE_VENDOR_ID_Attribute, MFT_FRIENDLY_NAME_Attribute, MFT_MESSAGE_COMMAND_DRAIN,
+    MFT_MESSAGE_COMMAND_FLUSH, MFT_MESSAGE_NOTIFY_BEGIN_STREAMING,
+    MFT_MESSAGE_NOTIFY_END_OF_STREAM, MFT_MESSAGE_NOTIFY_END_STREAMING,
+    MFT_MESSAGE_NOTIFY_START_OF_STREAM, MFT_MESSAGE_SET_D3D_MANAGER, MFT_REGISTER_TYPE_INFO,
+    MFTEnum2, MFVideoFormat_H264, MFVideoFormat_NV12, MFVideoInterlace_Progressive,
+    MFVideoPrimaries_BT709, MFVideoTransFunc_709, MFVideoTransferMatrix_BT709,
+    eAVEncCommonRateControlMode_PeakConstrainedVBR, eAVEncH264VProfile_High,
 };
 use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance, CoTaskMemFree};
 use windows::Win32::System::Variant::{VARIANT, VT_BOOL, VT_UI4};
 use windows::core::{GUID, Interface};
 
-pub use super::avc::VideoPacket;
+use super::codec::CodecConfig;
+pub use super::codec::VideoPacket;
 use super::d3d::{Gpu, VENDOR_AMD, VENDOR_INTEL, VENDOR_NVIDIA};
 use super::mf::{OutputAlloc, media_type, memory_sample, pack, sample_bytes, string_attr};
 use super::{Code, MediaError, MediaResult, TICKS_PER_SECOND, avc};
@@ -69,6 +72,24 @@ pub struct H264Config {
     pub fps: u32,
     /// Mean bitrate in bits/s.
     pub bitrate: u32,
+    /// Peak bitrate in bits/s.
+    pub max_bitrate: u32,
+    /// Streaming tuning (what this app used before 0.2: kept to compare qualities in tests).
+    pub low_latency: bool,
+}
+
+impl H264Config {
+    /// Quality-first settings for a mean `bitrate`, peaks up to 1.5 times it.
+    pub fn new(width: u32, height: u32, fps: u32, bitrate: u32) -> Self {
+        Self {
+            width,
+            height,
+            fps,
+            bitrate,
+            max_bitrate: bitrate.saturating_add(bitrate / 2),
+            low_latency: false,
+        }
+    }
 }
 
 /// Who makes the encoder.
@@ -291,6 +312,15 @@ impl H264Encoder {
     /// SPS and PPS (no start codes), known once the first keyframe came out.
     pub fn parameter_sets(&self) -> Option<(&[u8], &[u8])> {
         Some((self.sps.as_deref()?, self.pps.as_deref()?))
+    }
+
+    /// The parameter sets as the muxer and the ring want them.
+    pub fn codec_config(&self) -> Option<CodecConfig> {
+        let (sps, pps) = self.parameter_sets()?;
+        Some(CodecConfig::Avc {
+            sps: sps.to_vec(),
+            pps: pps.to_vec(),
+        })
     }
 
     /// Waits up to `timeout` for an asynchronous encoder to ask for input, collecting its output
@@ -520,9 +550,14 @@ impl H264Encoder {
     fn push_packet(&mut self, sample: &IMFSample, out: &mut Vec<VideoPacket>) -> MediaResult<()> {
         let bytes = sample_bytes(sample).code(ENCODE_FAILED)?;
         // SAFETY: attribute reads on a sample we own.
-        let (pts, clean_point) = unsafe {
+        let (pts, dts, clean_point) = unsafe {
+            let pts = sample.GetSampleTime().unwrap_or(0);
             (
-                sample.GetSampleTime().unwrap_or(0),
+                pts,
+                // Only set by encoders that reorder (we ask for no B-frames).
+                sample
+                    .GetUINT64(&MFSampleExtension_DecodeTimestamp)
+                    .map_or(pts, u64::cast_signed),
                 sample.GetUINT32(&MFSampleExtension_CleanPoint).unwrap_or(0) != 0,
             )
         };
@@ -537,7 +572,9 @@ impl H264Encoder {
             out.push(VideoPacket {
                 data: unit.avcc,
                 pts,
+                dts: dts.min(pts),
                 keyframe: unit.idr || clean_point,
+                clean_end: dts >= pts,
             });
         }
         Ok(())
@@ -593,6 +630,11 @@ impl Drop for H264Encoder {
             }
         }
     }
+}
+
+/// Whether `gpu`'s adapter has a Media Foundation hardware H.264 encoder.
+pub fn has_hardware(gpu: &Gpu) -> bool {
+    enum_hardware(gpu).is_ok_and(|list| !list.is_empty())
 }
 
 /// Hardware NV12 → H.264 encoders bound to `gpu`'s adapter, best first.
@@ -678,7 +720,7 @@ fn apply_codec_settings(api: &ICodecAPI, config: H264Config) {
     set_u32(&CODECAPI_AVEncCommonMeanBitRate, config.bitrate);
     set_u32(
         &CODECAPI_AVEncCommonMaxBitRate,
-        config.bitrate.saturating_add(config.bitrate / 2),
+        config.max_bitrate.max(config.bitrate),
     );
     set_u32(&CODECAPI_AVEncMPVGOPSize, config.fps.max(1));
     set_u32(&CODECAPI_AVEncMPVDefaultBPictureCount, 0);
@@ -686,7 +728,11 @@ fn apply_codec_settings(api: &ICodecAPI, config: H264Config) {
         &CODECAPI_AVEncMPVProfile,
         eAVEncH264VProfile_High.0.cast_unsigned(),
     );
-    set_bool(&CODECAPI_AVLowLatencyMode, true);
+    set_bool(&CODECAPI_AVLowLatencyMode, config.low_latency);
+    if !config.low_latency {
+        // 0 = fastest .. 100 = best quality (the legacy settings left the default).
+        set_u32(&CODECAPI_AVEncCommonQualityVsSpeed, 100);
+    }
 }
 
 /// Frame size/rate, progressive, square pixels and BT.709 limited range.
@@ -836,12 +882,7 @@ mod tests {
             );
             let gpu = d3d::Gpu::new(&display.adapter).expect("gpu");
             let fps = if software { 30 } else { 60 };
-            let config = H264Config {
-                width: 1280,
-                height: 720,
-                fps,
-                bitrate: 6_000_000,
-            };
+            let config = H264Config::new(1280, 720, fps, 6_000_000);
             let mut encoder = if software {
                 H264Encoder::software(config)
             } else {
@@ -929,6 +970,7 @@ mod tests {
                 packets.windows(2).all(|w| w[1].pts > w[0].pts),
                 "pts must increase"
             );
+            assert!(packets.iter().all(|p| p.dts == p.pts), "no reordering");
             let (sps, pps) = encoder.parameter_sets().expect("parameter sets");
             println!(
                 "SPS {}

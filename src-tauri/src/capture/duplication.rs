@@ -30,6 +30,8 @@ pub struct Duplication {
     pub modern: bool,
     width: u32,
     height: u32,
+    /// Display refresh rate (Hz) of the duplicated mode, 0 when unknown.
+    refresh: f64,
     in_system_memory: bool,
     /// The first frame after creation always carries the full image.
     fresh: bool,
@@ -58,6 +60,10 @@ impl Duplication {
             modern,
             width: desc.ModeDesc.Width,
             height: desc.ModeDesc.Height,
+            refresh: match desc.ModeDesc.RefreshRate {
+                r if r.Denominator > 0 => f64::from(r.Numerator) / f64::from(r.Denominator),
+                _ => 0.0,
+            },
             in_system_memory: desc.DesktopImageInSystemMemory.as_bool(),
             fresh: true,
         })
@@ -66,6 +72,11 @@ impl Duplication {
     /// Size of the duplicated (unrotated) desktop image.
     pub fn size(&self) -> (u32, u32) {
         (self.width, self.height)
+    }
+
+    /// Refresh rate of the display mode (Hz), 0 when unknown.
+    pub fn refresh(&self) -> f64 {
+        self.refresh
     }
 
     /// Non-blocking poll. On a new image, copies it into `target` (BGRA, `size()`) and releases

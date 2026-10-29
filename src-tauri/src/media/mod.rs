@@ -6,14 +6,20 @@
 //! Foundation and the QPC clock (`capture::clock`).
 
 pub mod aac;
+pub mod av1;
 pub mod avc;
+pub(crate) mod bits;
+pub mod codec;
 #[cfg(windows)]
 pub mod d3d;
 #[cfg(windows)]
 pub mod h264;
+pub mod hevc;
 #[cfg(windows)]
 pub(crate) mod mf;
 pub mod mp4_writer;
+#[cfg(windows)]
+pub mod nvenc;
 #[cfg(all(test, windows))]
 pub mod testing;
 

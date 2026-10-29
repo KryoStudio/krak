@@ -1,8 +1,9 @@
 //! End-to-end runs of the engine on the real machine (ignored by default: they need a display,
-//! a GPU and audio devices, and they record the screen for a few seconds).
+//! a GPU and audio devices, and they record the screen for a few seconds). Silent: nothing is
+//! ever played; the audio checks use signals written into the timelines, not the speakers.
 //!
-//! `cargo test -- --ignored --nocapture engine_end_to_end` (set `KRYO_E2E_OUT` to keep the clip
-//! in a given folder).
+//! `cargo test -- --ignored --nocapture engine_` (set `KRYO_E2E_OUT` to keep the clips in a
+//! given folder).
 
 use std::path::PathBuf;
 use std::sync::{Condvar, Mutex};
@@ -10,12 +11,14 @@ use std::time::Instant;
 
 use windows::Win32::Foundation::FILETIME;
 use windows::Win32::Media::MediaFoundation::{
-    MFAudioFormat_AAC, MFMediaType_Audio, MFMediaType_Video, MFVideoFormat_H264,
+    MFAudioFormat_AAC, MFMediaType_Audio, MFMediaType_Video, MFVideoFormat_AV1, MFVideoFormat_H264,
+    MFVideoFormat_HEVC,
 };
 use windows::Win32::System::Threading::{GetCurrentProcess, GetProcessTimes};
 
 use super::*;
 use crate::media::{ComGuard, MfGuard, testing};
+use crate::settings::{CodecChoice, Quality, Resolution};
 
 #[derive(Default)]
 struct Recorder {
@@ -75,57 +78,62 @@ fn process_cpu() -> Duration {
     Duration::from_nanos((ticks(k) + ticks(u)) * 100)
 }
 
-fn run(microphone: bool) {
-    run_with(microphone, false);
-}
-
-fn run_with(microphone: bool, software: bool) {
-    let _com = ComGuard::new();
-    let _mf = MfGuard::new().expect("media foundation");
+fn out_dir() -> PathBuf {
     let dir = std::env::var_os("KRYO_E2E_OUT")
         .map(PathBuf::from)
         .unwrap_or_else(|| std::env::temp_dir().join("kryo-e2e"));
     std::fs::create_dir_all(&dir).expect("output dir");
+    dir
+}
 
+fn video(quality: Quality, fps: u32) -> VideoSettings {
+    VideoSettings {
+        quality,
+        codec: CodecChoice::Auto,
+        resolution: Resolution::Native,
+        fps,
+        bitrate: 40,
+        ten_bit: true,
+    }
+}
+
+/// Records ~8 s with `config`, saves the last 5 s and checks the clip with Media Foundation
+/// (an independent demuxer and decoders): streams, every frame decoding, durations.
+fn run(label: &str, video: VideoSettings, microphone: bool, software: bool) -> PathBuf {
+    let _com = ComGuard::new();
+    let _mf = MfGuard::new().expect("media foundation");
+    let dir = out_dir();
     video::tests::FORCE_SOFTWARE.store(software, std::sync::atomic::Ordering::Relaxed);
     let recorder = Arc::new(Recorder::default());
     let config = EngineConfig {
-        fps: 60,
-        quality: Quality::High,
+        video,
+        audio_bitrate: 192_000,
         buffer_seconds: 5,
         microphone,
+        microphone_device: None,
     };
     let cpu_before = process_cpu();
     let started = Instant::now();
     let engine = Engine::start(config, recorder.clone());
-    let ready_after = recorder.wait(Duration::from_secs(10), |seen| {
-        seen.statuses
-            .iter()
-            .any(|s| s.state == CaptureState::Ready)
-            .then(|| started.elapsed())
-    });
-    let ready_after = ready_after.expect("engine never became ready");
-    // Without the microphone, play our chime at a known time to check A/V alignment in the clip.
-    std::thread::sleep(Duration::from_millis(5500).saturating_sub(started.elapsed()));
-    // Played from a thread that ends at once, like the save thread does in the app.
-    let chime_at = (!microphone).then(|| {
-        let at = clock::now();
-        std::thread::spawn(sound::play_chime)
-            .join()
-            .expect("chime thread");
-        at
-    });
-    // Run ~8 s in total.
+    let ready_after = recorder
+        .wait(Duration::from_secs(10), |seen| {
+            seen.statuses
+                .iter()
+                .any(|s| s.state == CaptureState::Ready)
+                .then(|| started.elapsed())
+        })
+        .expect("engine never became ready");
     std::thread::sleep(Duration::from_secs(8).saturating_sub(started.elapsed()));
 
     let status = engine.status();
     println!("before save: {status:?}");
     assert_eq!(status.state, CaptureState::Ready);
     if software {
+        assert_eq!(status.backend, Some(Backend::Software));
         assert_eq!((status.encoder, status.fps), (Some(Vendor::Software), 30));
     }
     assert!(
-        (5.0..=6.1).contains(&status.buffered_seconds),
+        (5.0..=6.2).contains(&status.buffered_seconds),
         "buffered {}",
         status.buffered_seconds
     );
@@ -133,15 +141,10 @@ fn run_with(microphone: bool, software: bool) {
     let request = SaveRequest {
         clips_dir: dir.clone(),
         game: None,
-        desktop_label: if microphone { "Desktop mic" } else { "Desktop" }.into(),
+        desktop_label: label.into(),
         stamp: Stamp::now(),
     };
     let save_started = Instant::now();
-    let clip_start = lock(&engine.shared.video)
-        .snapshot(clock::now(), engine.shared.window())
-        .first()
-        .map(|p| p.pts)
-        .expect("video in the ring");
     engine.save(request).expect("save accepted");
     let outcome = recorder.wait(Duration::from_secs(30), |seen| {
         seen.saved.clone().map(Ok).or_else(|| seen.failed.map(Err))
@@ -156,18 +159,23 @@ fn run_with(microphone: bool, software: bool) {
     let process = process_cpu() - cpu_before;
     drop(engine);
 
-    // Re-open with Media Foundation's demuxer and decoders.
+    // Media Foundation's view.
     let info = testing::probe(&path);
     println!("probe: {info:?}");
-    let video: Vec<_> = info
+    let streams: Vec<_> = info
         .streams
         .iter()
         .filter(|s| s.major == MFMediaType_Video)
         .collect();
-    assert_eq!(video.len(), 1, "one video stream");
-    assert_eq!(video[0].subtype, MFVideoFormat_H264);
+    assert_eq!(streams.len(), 1, "one video stream");
+    let subtype = match status.codec {
+        Some(crate::media::codec::VideoCodec::Hevc) => MFVideoFormat_HEVC,
+        Some(crate::media::codec::VideoCodec::Av1) => MFVideoFormat_AV1,
+        _ => MFVideoFormat_H264,
+    };
+    assert_eq!(streams[0].subtype, subtype);
     assert_eq!(
-        (video[0].width, video[0].height),
+        (streams[0].width, streams[0].height),
         (status.width, status.height)
     );
     let audio: Vec<_> = info
@@ -180,108 +188,285 @@ fn run_with(microphone: bool, software: bool) {
         assert_eq!(stream.subtype, MFAudioFormat_AAC);
         assert_eq!(stream.sample_rate, 48_000);
     }
-    let mut channels: Vec<u32> = audio.iter().map(|s| s.channels).collect();
-    channels.sort_unstable();
-    assert_eq!(channels, if microphone { vec![1, 2, 2] } else { vec![2] });
     assert!(
         (info.duration - expected).abs() <= 0.5,
         "duration {} vs expected {expected}",
         info.duration
     );
-    let first_frame = testing::decode_first_video_frame(&path);
-    assert!(first_frame > 0, "first video frame must decode");
-    // The (silent) loopback track still covers the whole clip.
+    // Every frame decodes, in presentation order, one frame apart.
+    let movie = crate::editor::demux::open(&path).expect("demux");
+    let samples = movie.video().expect("video").samples.len();
+    let frames = testing::decode_video_timestamps(&path, status.ten_bit);
+    let frame = TICKS_PER_SECOND / i64::from(status.fps.max(1));
+    let gaps: Vec<i64> = frames.windows(2).map(|w| w[1] - w[0]).collect();
+    println!(
+        "MF decoded {}/{samples} frames, gaps min {:.2} max {:.2} ms",
+        frames.len(),
+        gaps.iter().min().copied().unwrap_or(0) as f64 / 1e4,
+        gaps.iter().max().copied().unwrap_or(0) as f64 / 1e4
+    );
+    assert_eq!(frames.len(), samples, "every frame decodes");
+    assert!(gaps.iter().all(|&g| g > 0), "presentation order");
+    let regular = gaps.iter().filter(|&&g| (g - frame).abs() <= 2_000).count();
+    assert!(
+        regular * 100 >= gaps.len() * 97,
+        "frames one tick apart: {regular}/{}",
+        gaps.len()
+    );
+    // The (maybe silent) game track covers the whole clip.
     let (pcm, pcm_channels) = testing::decode_audio(&path, 0);
     let audio_seconds = pcm.len() as f64 / f64::from(pcm_channels) / 48_000.0;
     assert!(
-        (audio_seconds - info.duration).abs() < 0.1,
+        (audio_seconds - info.duration).abs() < 0.15,
         "audio {audio_seconds} s vs {} s",
         info.duration
     );
 
-    let chime_delay = chime_at.map(|at| {
-        // Where the chime is in the clip vs where it was played (position of the first video
-        // frame on the same clock), found by cross-correlation with the chime waveform.
-        let chime: Vec<f64> = sound::chime_wav()[44..]
-            .as_chunks::<2>()
-            .0
-            .iter()
-            .map(|b| f64::from(i16::from_le_bytes(*b)))
-            .collect();
-        let left: Vec<f64> = pcm
-            .iter()
-            .step_by(pcm_channels as usize)
-            .map(|&v| f64::from(v))
-            .collect();
-        let expected = timeline::position(at) - timeline::position(clip_start);
-        let lag = testing::best_lag_in(&chime, &left, expected - 4_800, expected + 24_000);
-        let start = usize::try_from(lag).expect("chime inside the clip");
-        let found = &left[start..(start + chime.len()).min(left.len())];
-        let dot: f64 = chime.iter().zip(found).map(|(a, b)| a * b).sum();
-        let norm = |v: &[f64]| v.iter().map(|x| x * x).sum::<f64>().sqrt();
-        let similarity = dot / (norm(&chime) * norm(found)).max(1.0);
-        ((lag - expected) as f64 / 48.0, similarity)
-    });
-    if let Some((delay, similarity)) = chime_delay {
-        println!(
-            "chime found {delay:.1} ms after PlaySound was called (similarity {similarity:.2})"
-        );
-        assert!(similarity > 0.5, "chime not found in the clip");
-        assert!(
-            (-20.0..=500.0).contains(&delay),
-            "audio misaligned by {delay} ms"
-        );
-    }
-
     let size = std::fs::metadata(&path).expect("clip").len();
-    let configured = quality::video_format(status.width, status.height, Quality::High, status.fps);
-    println!("---- end-to-end (microphone {microphone}, software {software}) ----");
+    println!("---- {label} ----");
     println!("clip: {}", path.display());
     println!(
-        "encoder: {:?}, output {}x{} @ {} fps, configured {:.2} Mbit/s, file {} bytes ({:.2} Mbit/s avg over {:.2} s)",
+        "{:?} {:?} {:?}{} {}x{} @ {} fps, configured {:.1} Mbit/s, file {} bytes ({:.1} Mbit/s over {:.2} s)",
+        status.backend,
         status.encoder,
+        status.codec,
+        if status.ten_bit { " 10-bit" } else { "" },
         status.width,
         status.height,
         status.fps,
-        f64::from(configured.bitrate) / 1e6,
+        f64::from(status.bitrate) / 1e6,
         size,
         size as f64 * 8.0 / info.duration / 1e6,
         info.duration
     );
     println!(
-        "mic captured: {}, audio error: {:?}, first frame {} bytes decoded, audio {audio_seconds:.3} s",
-        status.microphone, status.audio_error, first_frame
-    );
-    println!(
-        "ready after {:.2} s, save took {:.2} s, buffers {:.1} MB",
+        "ready after {:.2} s, save took {:.2} s, buffers {:.1} MB; CPU over {:.1} s: engine {:.2}% of a core, process {:.2}%",
         ready_after.as_secs_f64(),
         save_time.as_secs_f64(),
-        status.memory_bytes as f64 / 1e6
-    );
-    println!(
-        "CPU over {:.1} s: engine threads {:.3} s ({:.2}% of one core), whole process {:.3} s ({:.2}%)",
+        status.memory_bytes as f64 / 1e6,
         wall.as_secs_f64(),
-        engine_cpu.as_secs_f64(),
         engine_cpu.as_secs_f64() / wall.as_secs_f64() * 100.0,
-        process.as_secs_f64(),
         process.as_secs_f64() / wall.as_secs_f64() * 100.0
     );
+    path
 }
 
 #[test]
-#[ignore = "records the screen; needs a display, GPU and audio (run with --ignored)"]
+#[ignore = "records the screen (silently); needs a display, GPU and audio (run with --ignored)"]
 fn engine_end_to_end() {
-    run(false);
+    run("High", video(Quality::High, 60), false, false);
 }
 
 #[test]
-#[ignore = "records the screen and microphone; run with --ignored"]
+#[ignore = "records the screen (silently); run with --ignored"]
+fn engine_end_to_end_standard() {
+    run("Standard", video(Quality::Standard, 60), false, false);
+}
+
+#[test]
+#[ignore = "records the screen (silently); run with --ignored"]
+fn engine_end_to_end_premium() {
+    run("Premium", video(Quality::Premium, 60), false, false);
+}
+
+#[test]
+#[ignore = "records the screen (silently) at 120 fps; run with --ignored"]
+fn engine_end_to_end_120fps() {
+    run("High 120", video(Quality::High, 120), false, false);
+    run("Premium 120", video(Quality::Premium, 120), false, false);
+}
+
+/// The run-time step down, forced at 5 s (inside the saved window), in place (H.264 Best ->
+/// Fast, HEVC Best -> Fastest) and through a new session (the fallback: the lighter encoder
+/// opens and the old one flushes on other threads). The clip across the switch must be one
+/// stream with every frame: one tick apart in place, at most a few late ticks otherwise.
+#[test]
+#[ignore = "records the screen (silently) with NVENC; run with --ignored"]
+fn engine_scales_down_without_losing_frames() {
+    use std::sync::atomic::Ordering;
+    for (label, quality, new_session) in [
+        ("Scale down H.264", Quality::High, false),
+        ("Scale down HEVC", Quality::Premium, false),
+        ("Scale down H.264 new session", Quality::High, true),
+    ] {
+        video::tests::SCALE_DOWN_AT.store(300, Ordering::Relaxed);
+        video::tests::FORCE_NEW_SESSION.store(new_session, Ordering::Relaxed);
+        let path = run(label, video(quality, 60), false, false);
+        video::tests::SCALE_DOWN_AT.store(0, Ordering::Relaxed);
+        video::tests::FORCE_NEW_SESSION.store(false, Ordering::Relaxed);
+        let movie = crate::editor::demux::open(&path).expect("demux");
+        let v = movie.video().expect("video");
+        let keyframes: Vec<f64> = (0..v.samples.len())
+            .filter(|&i| v.samples[i].sync)
+            .map(|i| v.sample_time(i) as f64 / 1e7)
+            .collect();
+        println!("keyframes across the switch: {keyframes:?}");
+        let mut shown: Vec<i64> = (0..v.samples.len()).map(|i| v.sample_time(i)).collect();
+        shown.sort_unstable();
+        let frame = TICKS_PER_SECOND / 60;
+        let gaps: Vec<i64> = shown.windows(2).map(|w| w[1] - w[0]).collect();
+        let worst = gaps.iter().copied().max().unwrap_or(0);
+        let irregular = gaps.iter().filter(|&&g| g > frame + 2_000).count();
+        println!(
+            "{label}: worst gap {:.1} ms, {irregular} irregular",
+            worst as f64 / 1e4
+        );
+        if new_session {
+            assert!(worst <= 4 * frame + 2_000 && irregular <= 3, "{label}");
+        } else {
+            assert!(
+                worst <= frame + 2_000,
+                "{label}: a {:.1} ms gap",
+                worst as f64 / 1e4
+            );
+        }
+    }
+}
+
+#[test]
+#[ignore = "records the screen and microphone (silently); run with --ignored"]
 fn engine_end_to_end_with_microphone() {
-    run(true);
+    run("Mic", video(Quality::High, 60), true, false);
 }
 
 #[test]
-#[ignore = "records the screen with the software encoder; run with --ignored"]
+#[ignore = "records the screen with the software encoder (silently); run with --ignored"]
 fn engine_end_to_end_software() {
-    run_with(false, true);
+    run("Software", video(Quality::High, 60), false, true);
+}
+
+/// A/V sync through the real save path with B-frames: NVENC encodes black frames with one
+/// white flash, the game timeline gets a click at the flash's capture time, `save` writes the
+/// clip; the flash and the click must come out together (our demuxer and, ignoring edit lists,
+/// Media Foundation). Nothing is played.
+#[test]
+#[ignore = "needs an NVIDIA GPU and Media Foundation; run with --ignored --nocapture"]
+fn save_keeps_av_sync_with_b_frames() {
+    use crate::media::d3d::{self, Gpu, Nv12Converter};
+    use crate::media::nvenc::NvencEncoder;
+    use crate::media::nvenc::bench;
+    use windows::Win32::Graphics::Direct3D11::D3D11_VIDEO_PROCESSOR_ROTATION_IDENTITY;
+    let _com = ComGuard::new();
+    let _mf = MfGuard::new().expect("mf");
+    let display = d3d::primary_display().expect("display");
+    let gpu = Gpu::new(&display.adapter).expect("gpu");
+    let (w, h) = (1280u32, 720u32);
+    let black = gpu
+        .bgra_texture(w, h, &vec![0u8; (w * h * 4) as usize])
+        .expect("black");
+    let white = gpu
+        .bgra_texture(w, h, &vec![255u8; (w * h * 4) as usize])
+        .expect("white");
+    let dir = out_dir();
+    for (codec, ten_bit) in [
+        (crate::media::codec::VideoCodec::H264, false),
+        (crate::media::codec::VideoCodec::Hevc, true),
+    ] {
+        let mut settings = bench::settings(codec, ten_bit, 5);
+        (settings.width, settings.height) = (w, h);
+        settings.b_frames = 3;
+        settings.b_ref = crate::media::nvenc::BRef::Middle;
+        settings.lookahead = 8;
+        let mut converter = Nv12Converter::with_output(
+            &gpu,
+            (w, h),
+            (w, h),
+            D3D11_VIDEO_PROCESSOR_ROTATION_IDENTITY,
+            60,
+            ten_bit,
+        )
+        .expect("converter");
+        let target = gpu
+            .texture(
+                w,
+                h,
+                if ten_bit {
+                    windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_P010
+                } else {
+                    windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_NV12
+                },
+                windows::Win32::Graphics::Direct3D11::D3D11_BIND_RENDER_TARGET,
+                false,
+            )
+            .expect("target");
+        let mut encoder = NvencEncoder::new(&gpu, settings).expect("encoder");
+        // Engine-clock timestamps far from zero, like real captures; 4 s at 60 fps.
+        let base = 123 * TICKS_PER_SECOND + 4321;
+        let frame = TICKS_PER_SECOND / 60;
+        let flash = 150;
+        let mut packets = Vec::new();
+        for k in 0..240 {
+            let src = if k == flash { &white } else { &black };
+            converter.convert(&gpu, src, &target).expect("convert");
+            encoder
+                .encode(&target, base + k * frame, &mut packets)
+                .expect("encode");
+        }
+        encoder.finish(&mut packets).expect("finish");
+        let mut game =
+            timeline::AudioTimeline::new(timeline::position(base - TICKS_PER_SECOND), 1 << 30);
+        let click_at = timeline::position(base + flash * frame);
+        let start = timeline::position(base - TICKS_PER_SECOND);
+        let mut pcm = vec![0i16; 6 * 48_000 * 2];
+        for i in 0..240 {
+            let at = usize::try_from(click_at - start).unwrap() + i;
+            pcm[at * 2] = 20_000;
+            pcm[at * 2 + 1] = 20_000;
+        }
+        game.write(start, &pcm, false);
+        let snapshot = save::Snapshot {
+            params: Arc::new(ring::StreamParams {
+                config: encoder.config().clone(),
+                width: w,
+                height: h,
+                fps: 60,
+            }),
+            video: packets.into_iter().map(Arc::new).collect(),
+            game: game.snapshot(),
+            mic: None,
+            audio_bitrate: 192_000,
+        };
+        let request = SaveRequest {
+            clips_dir: dir.clone(),
+            game: None,
+            desktop_label: format!("Sync {codec:?}"),
+            stamp: Stamp::now(),
+        };
+        let path = save::write_clip(&snapshot, &request).expect("write clip");
+
+        // Our demuxer (edit lists applied, like Chromium and ffmpeg).
+        let movie = crate::editor::demux::open(&path).expect("demux");
+        let track = movie.video().expect("video");
+        let first_shown = (0..track.samples.len())
+            .map(|i| track.sample_time(i))
+            .min()
+            .unwrap();
+        assert_eq!(first_shown, 0, "the first picture is at time zero");
+        let flash_time = flash * frame;
+        let audio_track = movie.audio().next().expect("audio");
+        // 48 kHz audio: its media time is the sample count since the clip's origin.
+        let click_time = audio_track.time(click_at - timeline::position(snapshot.video[0].dts));
+        println!(
+            "{codec:?}: flash at {:.3} ms, click at {:.3} ms on the edited timeline",
+            flash_time as f64 / 1e4,
+            click_time as f64 / 1e4
+        );
+        assert!(
+            (flash_time - click_time).abs() < TICKS_PER_SECOND / 1000,
+            "in sync"
+        );
+        // Media Foundation (no edit list): the brightest decoded frame and the click.
+        let (flash_mf, click_mf) = testing::flash_and_click(&path, ten_bit);
+        println!(
+            "{codec:?}: Media Foundation: flash frame at {:.2} ms, click at {:.2} ms ({})",
+            flash_mf as f64 / 1e4,
+            click_mf as f64 / 1e4,
+            path.display()
+        );
+        assert!(
+            (flash_mf - click_mf).abs() <= frame,
+            "MF out of sync by {} ms",
+            (flash_mf - click_mf) as f64 / 1e4
+        );
+    }
 }

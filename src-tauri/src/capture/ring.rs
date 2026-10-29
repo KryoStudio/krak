@@ -1,16 +1,21 @@
-//! Video replay ring: encoded packets for the last `window` (100 ns) and a bit more, trimmed by
-//! whole GOPs so it always starts with a keyframe.
+//! Video replay ring: encoded packets (decode order) for the last `window` (100 ns) and a bit
+//! more, trimmed by whole GOPs so it always starts with a keyframe.
+//!
+//! With B-frames, decode order differs from presentation order inside a GOP, but GOPs are
+//! closed (every keyframe is an IDR/key frame presented before everything decoded after it),
+//! so cutting before a keyframe never leaves a reference behind. A clip ends at the last
+//! packet marked `clean_end`: every picture presented before it has been output, so the end
+//! has no hole either.
 
 use std::collections::VecDeque;
 use std::sync::Arc;
 
-use crate::media::avc::VideoPacket;
+use crate::media::codec::{CodecConfig, VideoPacket};
 
 /// What a saved clip needs besides the packets.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StreamParams {
-    pub sps: Vec<u8>,
-    pub pps: Vec<u8>,
+    pub config: CodecConfig,
     pub width: u32,
     pub height: u32,
     pub fps: u32,
@@ -28,8 +33,8 @@ impl VideoRing {
         self.params.clone()
     }
 
-    /// Sets the stream the next packets belong to. Packets of a different stream (other SPS,
-    /// size...) cannot share a file, so they are dropped.
+    /// Sets the stream the next packets belong to. Packets of a different stream (other
+    /// parameter sets, size...) cannot share a file, so they are dropped.
     pub fn set_params(&mut self, params: StreamParams) {
         if self.params.as_deref() != Some(&params) {
             self.clear();
@@ -58,9 +63,9 @@ impl VideoRing {
             return;
         }
         if let Some(last) = self.packets.back()
-            && packet.pts <= last.pts
+            && packet.dts <= last.dts
         {
-            return; // never goes back in time
+            return; // decode order never goes back
         }
         self.bytes += packet.data.len();
         self.packets.push_back(packet);
@@ -83,45 +88,38 @@ impl VideoRing {
         }
     }
 
-    /// Index of the packet a clip of the last `window` ending at `now` starts from: the last
-    /// keyframe at or before `now - window`, else the oldest packet (always a keyframe).
-    fn start_index(&self, now: i64, window: i64) -> Option<usize> {
-        if self.packets.is_empty() {
-            return None;
-        }
+    /// `start..end` (decode order) of a clip of the last `window` ending at `now`: from the
+    /// last keyframe presented at or before `now - window` (else the oldest packet, always a
+    /// keyframe) to the last clean end presented at or before `now`.
+    fn range(&self, now: i64, window: i64) -> Option<(usize, usize)> {
         let cutoff = now - window;
-        Some(
-            self.packets
-                .iter()
-                .rposition(|p| p.keyframe && p.pts <= cutoff)
-                .unwrap_or(0),
-        )
+        let start = self
+            .packets
+            .iter()
+            .rposition(|p| p.keyframe && p.pts <= cutoff)
+            .unwrap_or(0);
+        let end = (start..self.packets.len())
+            .rev()
+            .find(|&i| self.packets[i].clean_end && self.packets[i].pts <= now)?;
+        Some((start, end + 1))
     }
 
     /// The packets of a clip of the last `window` ending at `now` (cheap: shared packets).
     pub fn snapshot(&self, now: i64, window: i64) -> Vec<Arc<VideoPacket>> {
-        let Some(start) = self.start_index(now, window) else {
+        let Some((start, end)) = self.range(now, window) else {
             return Vec::new();
         };
-        self.packets
-            .range(start..)
-            .take_while(|p| p.pts <= now)
-            .cloned()
-            .collect()
+        self.packets.range(start..end).cloned().collect()
     }
 
-    /// Length (100 ns) of the clip `snapshot` would give, counting `frame` for the last packet.
+    /// Length (100 ns) of the clip `snapshot` would give, counting `frame` for the last picture.
     pub fn span(&self, now: i64, window: i64, frame: i64) -> i64 {
-        let Some(start) = self.start_index(now, window) else {
+        let Some((start, end)) = self.range(now, window) else {
             return 0;
         };
-        let first = self.packets[start].pts;
-        let last = self
-            .packets
-            .range(start..)
-            .take_while(|p| p.pts <= now)
-            .last()
-            .map_or(first, |p| p.pts);
+        let clip = self.packets.range(start..end);
+        let first = clip.clone().map(|p| p.pts).min().unwrap_or(0);
+        let last = clip.map(|p| p.pts).max().unwrap_or(first);
         last - first + frame
     }
 }
@@ -132,12 +130,14 @@ mod tests {
 
     const S: i64 = 10_000_000;
 
-    /// 10 fps packets with a keyframe every second, 100 bytes each.
+    /// 10 fps packets with a keyframe every second, 100 bytes each (no reordering).
     fn packet(i: i64) -> Arc<VideoPacket> {
         Arc::new(VideoPacket {
             data: vec![0; 100],
             pts: i * S / 10,
+            dts: i * S / 10,
             keyframe: i % 10 == 0,
+            clean_end: true,
         })
     }
 
@@ -202,8 +202,10 @@ mod tests {
     #[test]
     fn new_stream_parameters_clear_the_ring() {
         let params = |w| StreamParams {
-            sps: vec![0x67, 1],
-            pps: vec![0x68, 2],
+            config: CodecConfig::Avc {
+                sps: vec![0x67, 1],
+                pps: vec![0x68, 2],
+            },
             width: w,
             height: 720,
             fps: 60,
@@ -217,5 +219,106 @@ mod tests {
         ring.set_params(params(1920));
         assert_eq!(ring.len(), 0);
         assert_eq!(ring.params().map(|p| p.width), Some(1920));
+    }
+
+    /// The stream NVENC makes with 3 B-frames (B-pyramid, measured): presentation order
+    /// I0 B1 B2 B3 P4..., decode order I0 P4 B2 B1 B3 P8 B6 B5 B7..., an IDR every 12 frames
+    /// (closed GOPs: the B-frames before an IDR are decoded before it), decode times shifted by
+    /// 3 frames. `clean_end` marks the packets after which every earlier picture has been
+    /// output. Frame `f` lasts S/10.
+    fn b_frame_stream(frames: i64) -> Vec<Arc<VideoPacket>> {
+        let mut order = Vec::new();
+        for gop in (0..frames).step_by(12) {
+            order.push(gop);
+            for anchor in (gop + 4..gop + 12).step_by(4).chain([gop + 11]) {
+                let previous = *order.iter().filter(|&&f| f >= gop).max().unwrap_or(&gop);
+                if anchor <= previous || anchor >= frames {
+                    continue;
+                }
+                order.push(anchor);
+                let between: Vec<i64> = (previous + 1..anchor).collect();
+                match between.len() {
+                    3 => order.extend([between[1], between[0], between[2]]),
+                    _ => order.extend(between),
+                }
+            }
+        }
+        let mut max = i64::MIN;
+        order
+            .iter()
+            .enumerate()
+            .map(|(n, &f)| {
+                max = max.max(f);
+                Arc::new(VideoPacket {
+                    data: vec![0; 100],
+                    pts: f * S / 10,
+                    dts: (n as i64 - 3) * S / 10,
+                    keyframe: f % 12 == 0,
+                    clean_end: max == n as i64,
+                })
+            })
+            .collect()
+    }
+
+    #[test]
+    fn b_frame_stream_fixture_is_consistent() {
+        let packets = b_frame_stream(36);
+        let frames: Vec<i64> = packets.iter().take(13).map(|p| p.pts * 10 / S).collect();
+        assert_eq!(frames, [0, 4, 2, 1, 3, 8, 6, 5, 7, 11, 9, 10, 12]);
+        assert!(packets.iter().all(|p| p.dts <= p.pts));
+        assert!(packets.windows(2).all(|w| w[1].dts > w[0].dts));
+    }
+
+    /// Presentation-order frame numbers of a snapshot.
+    fn presented(clip: &[Arc<VideoPacket>]) -> Vec<i64> {
+        let mut frames: Vec<i64> = clip.iter().map(|p| p.pts * 10 / S).collect();
+        frames.sort_unstable();
+        frames
+    }
+
+    #[test]
+    fn trims_and_snapshots_b_frame_streams_without_holes() {
+        let packets = b_frame_stream(60);
+        let mut ring = VideoRing::default();
+        // Stop right after P20 was output (B18 B17 B19 not yet): the clip must end with B15,
+        // the last packet after which frames 0..=16 have all been output.
+        for p in packets.iter().take(18) {
+            ring.push(p.clone(), 100 * S, usize::MAX);
+        }
+        let now = 2 * S;
+        let clip = ring.snapshot(now, 100 * S);
+        let frames = presented(&clip);
+        assert_eq!(frames, (0..=16).collect::<Vec<_>>(), "no hole");
+        assert!(clip.last().is_some_and(|p| p.clean_end));
+        assert_eq!(
+            ring.span(now, 100 * S, S / 10),
+            *frames.last().unwrap() * S / 10 + S / 10
+        );
+
+        // A long run with a 2.5 s window: trimmed by whole GOPs (keyframe first), snapshots
+        // start at the keyframe before the window and present every frame once.
+        let mut ring = VideoRing::default();
+        for p in &packets {
+            ring.push(p.clone(), 25 * S / 10, usize::MAX);
+        }
+        assert!(ring.packets.front().is_some_and(|p| p.keyframe));
+        let now = 6 * S;
+        let clip = ring.snapshot(now, 25 * S / 10);
+        assert!(clip[0].keyframe);
+        let frames = presented(&clip);
+        let first = frames[0];
+        assert!(
+            first * S / 10 <= now - 25 * S / 10,
+            "starts before the window"
+        );
+        assert_eq!(
+            frames,
+            (first..first + frames.len() as i64).collect::<Vec<_>>()
+        );
+        assert!(clip.windows(2).all(|w| w[1].dts > w[0].dts));
+        // Out-of-order arrivals (by decode time) are refused.
+        let before = ring.len();
+        ring.push(packets[10].clone(), 25 * S / 10, usize::MAX);
+        assert_eq!(ring.len(), before);
     }
 }

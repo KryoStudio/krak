@@ -1,26 +1,31 @@
-//! Audio threads: WASAPI shared-mode capture of the default output (loopback) or the default
-//! microphone into a 48 kHz stereo timeline.
+//! Audio threads: WASAPI shared-mode capture of the default output (loopback) or a microphone
+//! (the one chosen in the settings, else the Windows default) into a 48 kHz stereo timeline.
 //!
 //! We ask WASAPI for 48 kHz / stereo / 16-bit with its own converter (AUTOCONVERTPCM); if the
 //! device refuses, we take its mix format and convert ourselves (`pcm::Converter`). The stream is
 //! polled every 10 ms. The timeline keeps advancing with silence when nothing arrives (loopback
 //! is silent while nothing plays), and the stream is reopened when the device disappears or the
-//! default device changes (checked every 2 s).
+//! default device changes (checked every 2 s). A chosen microphone that disappears falls back
+//! to the default one until it comes back.
 
 use std::time::{Duration, Instant};
 
+use serde::Serialize;
+use windows::Win32::Devices::FunctionDiscovery::PKEY_Device_FriendlyName;
 use windows::Win32::Foundation::ERROR_NOT_FOUND;
 use windows::Win32::Media::Audio::{
     AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY, AUDCLNT_BUFFERFLAGS_SILENT, AUDCLNT_SHAREMODE_SHARED,
     AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM, AUDCLNT_STREAMFLAGS_LOOPBACK,
-    AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY, EDataFlow, IAudioCaptureClient, IAudioClient,
-    IMMDevice, IMMDeviceEnumerator, MMDeviceEnumerator, WAVE_FORMAT_PCM, WAVEFORMATEX,
-    WAVEFORMATEXTENSIBLE, eCapture, eConsole, eRender,
+    AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY, DEVICE_STATE_ACTIVE, EDataFlow, IAudioCaptureClient,
+    IAudioClient, IMMDevice, IMMDeviceEnumerator, MMDeviceEnumerator, WAVE_FORMAT_PCM,
+    WAVEFORMATEX, WAVEFORMATEXTENSIBLE, eCapture, eConsole, eRender,
 };
 use windows::Win32::Media::KernelStreaming::{KSDATAFORMAT_SUBTYPE_PCM, WAVE_FORMAT_EXTENSIBLE};
 use windows::Win32::Media::Multimedia::{KSDATAFORMAT_SUBTYPE_IEEE_FLOAT, WAVE_FORMAT_IEEE_FLOAT};
+use windows::Win32::System::Com::STGM_READ;
+use windows::Win32::System::Com::StructuredStorage::{PropVariantClear, PropVariantToStringAlloc};
 use windows::Win32::System::Com::{CLSCTX_ALL, CoCreateInstance, CoTaskMemFree};
-use windows::core::HRESULT;
+use windows::core::{HRESULT, HSTRING};
 
 use super::pcm::{Converter, SampleKind, SourceFormat};
 use super::timeline::{self, CHANNELS, SAMPLE_RATE};
@@ -82,13 +87,17 @@ pub(super) fn run(source: Source, shared: &Shared) {
         });
     };
 
+    let wanted = match source {
+        Source::Microphone => shared.config.microphone_device.as_deref(),
+        Source::Loopback => None,
+    };
     let mut stream: Option<Stream> = None;
     let mut retry_at = Instant::now();
     let mut check_at = Instant::now() + DEVICE_CHECK;
     let mut packets: Vec<Packet> = Vec::new();
     loop {
         if stream.is_none() && Instant::now() >= retry_at {
-            match Stream::open(source) {
+            match Stream::open(source, wanted) {
                 Ok(opened) => {
                     stream = Some(opened);
                     report(None, true);
@@ -102,12 +111,12 @@ pub(super) fn run(source: Source, shared: &Shared) {
         if let Some(open) = &mut stream {
             if let Err(err) = open.read(&mut packets) {
                 // Usually AUDCLNT_E_DEVICE_INVALIDATED (device unplugged or reconfigured).
-                eprintln!("kryo-shard: {source:?} stream lost: {err}");
+                eprintln!("krak: {source:?} stream lost: {err}");
                 stream = None;
                 retry_at = Instant::now();
             } else if Instant::now() >= check_at {
                 check_at = Instant::now() + DEVICE_CHECK;
-                if open.default_device_changed() {
+                if open.should_reopen() {
                     stream = None;
                     retry_at = Instant::now();
                 }
@@ -135,6 +144,10 @@ struct Stream {
     enumerator: IMMDeviceEnumerator,
     flow: EDataFlow,
     device_id: Option<String>,
+    /// The chosen device (microphone setting), `None` for the default one.
+    wanted: Option<String>,
+    /// The chosen device was missing: this is the default one meanwhile.
+    fallback: bool,
     /// `None` when WASAPI already delivers 48 kHz stereo i16.
     converter: Option<Converter>,
     frame_bytes: usize,
@@ -142,24 +155,28 @@ struct Stream {
 }
 
 impl Stream {
-    fn open(source: Source) -> Result<Self, &'static str> {
+    fn open(source: Source, chosen_id: Option<&str>) -> Result<Self, &'static str> {
         let failure = source.failure();
         let flow = source.flow();
         // SAFETY: COM calls on objects created here; the mix format is freed after use.
         unsafe {
             let enumerator: IMMDeviceEnumerator =
                 CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL).map_err(|_| failure)?;
-            let device = enumerator
-                .GetDefaultAudioEndpoint(flow, eConsole)
-                .map_err(|err| {
-                    if err.code() == HRESULT::from_win32(ERROR_NOT_FOUND.0)
-                        && source == Source::Microphone
-                    {
-                        "no_microphone"
-                    } else {
-                        failure
-                    }
-                })?;
+            let chosen = chosen_id.and_then(|id| active_device(&enumerator, id));
+            let fallback = chosen_id.is_some() && chosen.is_none();
+            let device = match chosen {
+                Some(device) => Ok(device),
+                None => enumerator.GetDefaultAudioEndpoint(flow, eConsole),
+            }
+            .map_err(|err| {
+                if err.code() == HRESULT::from_win32(ERROR_NOT_FOUND.0)
+                    && source == Source::Microphone
+                {
+                    "no_microphone"
+                } else {
+                    failure
+                }
+            })?;
             let device_id = device_id(&device);
             let flags = if source == Source::Loopback {
                 AUDCLNT_STREAMFLAGS_LOOPBACK
@@ -218,6 +235,8 @@ impl Stream {
                 enumerator,
                 flow,
                 device_id,
+                wanted: chosen_id.map(str::to_string),
+                fallback,
                 converter,
                 frame_bytes,
                 rate,
@@ -282,10 +301,18 @@ impl Stream {
         timeline::position(time)
     }
 
-    fn default_device_changed(&self) -> bool {
-        // SAFETY: plain query.
-        let current = unsafe { self.enumerator.GetDefaultAudioEndpoint(self.flow, eConsole) };
-        current.ok().and_then(|device| device_id(&device)) != self.device_id
+    /// The chosen device came back, or (following the default) the default device changed.
+    fn should_reopen(&self) -> bool {
+        match (&self.wanted, self.fallback) {
+            (Some(id), true) => active_device(&self.enumerator, id).is_some(),
+            (Some(_), false) => false,
+            (None, _) => {
+                // SAFETY: plain query.
+                let current =
+                    unsafe { self.enumerator.GetDefaultAudioEndpoint(self.flow, eConsole) };
+                current.ok().and_then(|device| device_id(&device)) != self.device_id
+            }
+        }
     }
 }
 
@@ -293,6 +320,72 @@ impl Drop for Stream {
     fn drop(&mut self) {
         // SAFETY: stopping a started client.
         let _ = unsafe { self.client.Stop() };
+    }
+}
+
+/// The endpoint `id` if it exists and is active (plugged in, enabled).
+fn active_device(enumerator: &IMMDeviceEnumerator, id: &str) -> Option<IMMDevice> {
+    // SAFETY: plain queries.
+    unsafe {
+        let device = enumerator.GetDevice(&HSTRING::from(id)).ok()?;
+        (device.GetState().ok()? == DEVICE_STATE_ACTIVE).then_some(device)
+    }
+}
+
+/// An active capture endpoint (`list_microphones`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Microphone {
+    /// WASAPI endpoint id (what `microphoneDevice` stores).
+    pub id: String,
+    /// Friendly name, e.g. "Microphone (USB Audio Device)".
+    pub name: String,
+    pub is_default: bool,
+}
+
+/// Active capture endpoints, the default one first. The caller initializes COM.
+pub fn microphones() -> Result<Vec<Microphone>, &'static str> {
+    const FAILED: &str = "mic_failed";
+    // SAFETY: COM enumeration; property values and id strings are freed after use.
+    unsafe {
+        let enumerator: IMMDeviceEnumerator =
+            CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL).map_err(|_| FAILED)?;
+        let default = enumerator
+            .GetDefaultAudioEndpoint(eCapture, eConsole)
+            .ok()
+            .and_then(|d| device_id(&d));
+        let devices = enumerator
+            .EnumAudioEndpoints(eCapture, DEVICE_STATE_ACTIVE)
+            .map_err(|_| FAILED)?;
+        let mut out = Vec::new();
+        for i in 0..devices.GetCount().map_err(|_| FAILED)? {
+            let Ok(device) = devices.Item(i) else {
+                continue;
+            };
+            let Some(id) = device_id(&device) else {
+                continue;
+            };
+            let name = device
+                .OpenPropertyStore(STGM_READ)
+                .ok()
+                .and_then(|store| {
+                    let mut value = store.GetValue(&PKEY_Device_FriendlyName).ok()?;
+                    let text = PropVariantToStringAlloc(&value).ok();
+                    let _ = PropVariantClear(&mut value);
+                    let text = text?;
+                    let name = text.to_string().ok();
+                    CoTaskMemFree(Some(text.0.cast_const().cast()));
+                    name
+                })
+                .unwrap_or_else(|| id.clone());
+            out.push(Microphone {
+                is_default: default.as_deref() == Some(id.as_str()),
+                id,
+                name,
+            });
+        }
+        out.sort_by_key(|m| !m.is_default);
+        Ok(out)
     }
 }
 
@@ -352,6 +445,43 @@ unsafe fn parse_format(format: *const WAVEFORMATEX) -> Option<SourceFormat> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn serializes_microphones() {
+        let mic = Microphone {
+            id: "{0.0.1.00000000}.{guid}".into(),
+            name: "Microphone (USB)".into(),
+            is_default: true,
+        };
+        assert_eq!(
+            serde_json::to_value(mic).unwrap(),
+            serde_json::json!({ "id": "{0.0.1.00000000}.{guid}", "name": "Microphone (USB)", "isDefault": true })
+        );
+    }
+
+    /// Lists the capture endpoints (read-only: opens nothing).
+    #[test]
+    #[ignore = "needs audio devices; run with --ignored --nocapture"]
+    fn lists_microphones() {
+        let _com = ComGuard::new();
+        let list = microphones().expect("microphones");
+        for mic in &list {
+            println!(
+                "{} {} ({})",
+                if mic.is_default { "*" } else { " " },
+                mic.name,
+                mic.id
+            );
+        }
+        assert!(list.iter().filter(|m| m.is_default).count() <= 1);
+        // A chosen id that does not exist falls back to the default device.
+        let enumerator: IMMDeviceEnumerator =
+            unsafe { CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL) }.expect("enumerator");
+        assert!(active_device(&enumerator, "{0.0.1.00000000}.{nope}").is_none());
+        if let Some(first) = list.first() {
+            assert!(active_device(&enumerator, &first.id).is_some());
+        }
+    }
+
     /// Prints, for each source, how far behind "now" packets are stamped and their sizes, to
     /// check the QPC alignment and latency on a real machine.
     #[test]
@@ -359,7 +489,7 @@ mod tests {
     fn reports_packet_timing() {
         let _com = ComGuard::new();
         for source in [Source::Loopback, Source::Microphone] {
-            let mut stream = match Stream::open(source) {
+            let mut stream = match Stream::open(source, None) {
                 Ok(stream) => stream,
                 Err(code) => {
                     println!("{source:?}: {code}");

@@ -2,21 +2,22 @@
 //!
 //! Threads:
 //! - video: Desktop Duplication of the primary display at a constant frame rate, BGRA → NV12
-//!   on the GPU, H.264 (hardware encoder of the display's adapter, else software) into a ring
-//!   of whole GOPs;
-//! - audio: WASAPI loopback of the default output (and the default microphone when enabled)
-//!   into continuous PCM timelines on the same clock;
+//!   (or P010 for 10-bit) on the GPU, then NVENC (H.264/HEVC/AV1, see `quality`) or the
+//!   adapter's Media Foundation H.264 encoder, else the software one, into a ring of whole GOPs;
+//! - audio: WASAPI loopback of the default output (and the chosen or default microphone when
+//!   enabled) into continuous PCM timelines on the same clock;
 //! - one short-lived thread per save, which mixes and encodes the audio and writes the MP4.
 //!
 //! An audio failure never stops video: it is only reported in the status.
 
-mod audio;
+pub mod audio;
 mod clock;
 mod duplication;
+pub mod encoders;
 pub mod game;
 pub mod naming;
 mod pcm;
-mod quality;
+pub mod quality;
 mod ring;
 mod save;
 pub mod sound;
@@ -26,7 +27,7 @@ mod timeline;
 mod video;
 
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -34,9 +35,11 @@ use std::time::Duration;
 use serde::Serialize;
 
 use crate::media::TICKS_PER_SECOND;
+use crate::media::codec::VideoCodec;
 use crate::media::h264::Vendor;
-use crate::settings::Quality;
 use crate::state::lock;
+
+pub use quality::{Backend, VideoSettings};
 
 pub use naming::Stamp;
 pub use save::SaveRequest;
@@ -52,13 +55,15 @@ pub const ENCODE_FAILED: &str = "encode_failed";
 /// Audio kept beyond the replay window: a clip may start up to one GOP before it.
 const AUDIO_MARGIN_SECONDS: u32 = 3;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EngineConfig {
-    /// 30 or 60 (software encoding is capped at 30).
-    pub fps: u32,
-    pub quality: Quality,
+    pub video: VideoSettings,
+    /// AAC bit/s of the stereo tracks.
+    pub audio_bitrate: u32,
     pub buffer_seconds: u32,
     pub microphone: bool,
+    /// WASAPI endpoint id; `None` = the default capture device.
+    pub microphone_device: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
@@ -92,6 +97,22 @@ pub struct CaptureStatus {
     pub error: Option<&'static str>,
     /// Audio problem while video still works: "loopback_failed" | "mic_failed" | "no_microphone".
     pub audio_error: Option<&'static str>,
+    pub codec: Option<VideoCodec>,
+    pub ten_bit: bool,
+    /// Average bit/s configured, 0 when unknown.
+    pub bitrate: u32,
+    pub backend: Option<Backend>,
+    /// A continuous recording in progress (the replay keeps running meanwhile).
+    pub recording: Option<RecordingStatus>,
+}
+
+/// `CaptureStatus::recording`.
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecordingStatus {
+    /// Length written so far.
+    pub seconds: f64,
+    pub bytes: u64,
 }
 
 impl CaptureStatus {
@@ -120,6 +141,10 @@ struct Status {
     width: u32,
     height: u32,
     fps: u32,
+    codec: Option<VideoCodec>,
+    ten_bit: bool,
+    bitrate: u32,
+    backend: Option<Backend>,
     error: Option<&'static str>,
     loopback_error: Option<&'static str>,
     mic_error: Option<&'static str>,
@@ -129,6 +154,8 @@ struct Status {
 struct Shared {
     config: EngineConfig,
     buffer_seconds: AtomicU32,
+    /// NVENC tool tier (`quality::Tier` as u8): raised when the encoder falls behind.
+    tier: AtomicU8,
     max_video_bytes: usize,
     stop: AtomicBool,
     video: Mutex<VideoRing>,
@@ -205,6 +232,12 @@ impl Shared {
             microphone: status.mic_active,
             error: status.error,
             audio_error: status.loopback_error.or(status.mic_error),
+            codec: status.codec,
+            ten_bit: status.ten_bit,
+            bitrate: status.bitrate,
+            backend: status.backend,
+            // TODO(recording): filled once continuous recording exists.
+            recording: None,
         }
     }
 }
@@ -222,16 +255,17 @@ impl Engine {
         let now = timeline::position(clock::now());
         let keep = i64::from(config.buffer_seconds + AUDIO_MARGIN_SECONDS)
             * i64::from(timeline::SAMPLE_RATE);
+        let microphone = config.microphone;
+        let buffer_seconds = config.buffer_seconds;
         let shared = Arc::new(Shared {
             config,
-            buffer_seconds: AtomicU32::new(config.buffer_seconds),
+            buffer_seconds: AtomicU32::new(buffer_seconds),
+            tier: AtomicU8::new(0),
             max_video_bytes: video_memory_cap(),
             stop: AtomicBool::new(false),
             video: Mutex::default(),
             game_audio: Mutex::new(AudioTimeline::new(now, keep)),
-            mic_audio: config
-                .microphone
-                .then(|| Mutex::new(AudioTimeline::new(now, keep))),
+            mic_audio: microphone.then(|| Mutex::new(AudioTimeline::new(now, keep))),
             status: Mutex::default(),
             events,
         });
@@ -244,7 +278,7 @@ impl Engine {
                 .spawn(run)
             {
                 Ok(handle) => threads.push(handle),
-                Err(err) => eprintln!("kryo-shard: cannot start {name}: {err}"),
+                Err(err) => eprintln!("krak: cannot start {name}: {err}"),
             };
         let video = shared.clone();
         spawn("kryo-video", Box::new(move || video::run(&video)));
@@ -253,7 +287,7 @@ impl Engine {
             "kryo-loopback",
             Box::new(move || audio::run(audio::Source::Loopback, &loopback)),
         );
-        if config.microphone {
+        if microphone {
             let mic = shared.clone();
             spawn(
                 "kryo-mic",
@@ -294,6 +328,7 @@ impl Engine {
             video,
             game: lock(&shared.game_audio).snapshot(),
             mic: shared.mic_audio.as_ref().map(|m| lock(m).snapshot()),
+            audio_bitrate: shared.config.audio_bitrate,
         };
         let events = shared.events.clone();
         std::thread::Builder::new()
@@ -383,6 +418,14 @@ mod contract_tests {
             microphone: true,
             error: None,
             audio_error: Some("mic_failed"),
+            codec: Some(VideoCodec::Hevc),
+            ten_bit: true,
+            bitrate: 50_000_000,
+            backend: Some(Backend::Nvenc),
+            recording: Some(RecordingStatus {
+                seconds: 12.5,
+                bytes: 4096,
+            }),
         };
         assert_eq!(
             serde_json::to_value(&status).unwrap(),
@@ -396,12 +439,22 @@ mod contract_tests {
                 "memoryBytes": 1234,
                 "microphone": true,
                 "error": null,
-                "audioError": "mic_failed"
+                "audioError": "mic_failed",
+                "codec": "hevc",
+                "tenBit": true,
+                "bitrate": 50_000_000,
+                "backend": "nvenc",
+                "recording": {"seconds": 12.5, "bytes": 4096}
             })
         );
         let paused = serde_json::to_value(CaptureStatus::with_state(CaptureState::Paused)).unwrap();
         assert_eq!(paused["state"], "paused");
-        assert!(paused["encoder"].is_null());
+        assert!(paused["encoder"].is_null() && paused["recording"].is_null());
+        assert!(paused["codec"].is_null() && paused["backend"].is_null());
+        assert_eq!(
+            (paused["tenBit"].as_bool(), paused["bitrate"].as_u64()),
+            (Some(false), Some(0))
+        );
         assert_eq!(
             serde_json::to_value(CaptureState::Error).unwrap(),
             serde_json::json!("error")
