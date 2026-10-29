@@ -16,6 +16,8 @@ pub struct AppState {
     pub meta_path: PathBuf,
     pub durations: Mutex<DurationCache>,
     pub watcher: Mutex<Option<ClipsWatcher>>,
+    /// Files exports wrote this session, and where "Save as" opens.
+    pub exports: Mutex<crate::editor::ExportSession>,
     /// Serializes settings updates. Held across their side effects (which may wait on the main
     /// thread), so it must never be taken from the main thread; `settings` itself is only
     /// locked briefly.
@@ -39,6 +41,7 @@ impl AppState {
             meta_path,
             durations: Mutex::default(),
             watcher: Mutex::default(),
+            exports: Mutex::default(),
             update_lock: Default::default(),
         })
     }

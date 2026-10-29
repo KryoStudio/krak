@@ -15,6 +15,9 @@
 //! Timestamps: Media Foundation's MP4 source ignores edit lists (measured: an edit-listed
 //! file still starts at 0 with every sample), so for our MP4s the caller passes the timeline
 //! time of media time 0, and the first compressed sample calibrates the reader's origin.
+//!
+//! With the "by krak" badge ([`watermark`](super::watermark)), every frame goes through our own
+//! target texture (never the decoder's), where the badge is drawn before encoding.
 
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -39,6 +42,7 @@ use windows::Win32::System::Com::StructuredStorage::PROPVARIANT;
 use windows::core::{GUID, HSTRING, Interface};
 
 use super::plan::{TOLERANCE, VideoTarget};
+use super::watermark::Stamp;
 use super::{CANCELLED, EXPORT_FAILED, Span, UNSUPPORTED, UNSUPPORTED_CODEC, media_failure};
 use crate::capture::encoders;
 use crate::media::codec::{CodecConfig, VideoCodec, VideoPacket};
@@ -64,6 +68,8 @@ pub struct Options {
     pub gpu_scaling: bool,
     /// No D3D manager for the reader: system-memory frames.
     pub software_decoding: bool,
+    /// Blend the badge on the CPU (staging copy of its rectangle) instead of drawing it.
+    pub cpu_watermark: bool,
 }
 
 /// How the reader's timestamps map to the clip timeline.
@@ -88,6 +94,8 @@ pub struct Encoded {
     pub vendor: Vendor,
     /// How frames reached the encoder, for logs and tests.
     pub path: &'static str,
+    /// How the badge was drawn ("gpu", "staging", "memory"), `None` without one.
+    pub badge: Option<&'static str>,
 }
 
 /// What to re-encode.
@@ -99,6 +107,8 @@ pub struct Job<'a> {
     pub start: i64,
     pub end: i64,
     pub target: VideoTarget,
+    /// Burn the "by krak" badge in.
+    pub watermark: bool,
     pub options: Options,
 }
 
@@ -110,6 +120,7 @@ pub fn transcode(job: Job, gpu: &Gpu, progress: &Span) -> Result<Encoded, &'stat
         start,
         end,
         target,
+        watermark,
         options,
     } = job;
     let fail = |what: &'static str| move |err: MediaError| media_failure(what, err);
@@ -146,7 +157,13 @@ pub fn transcode(job: Job, gpu: &Gpu, progress: &Span) -> Result<Encoded, &'stat
     } else {
         reader.frame.max(1)
     };
-    let mut frames = FramePipeline::new(gpu, (target.width, target.height));
+    let size = (target.width, target.height);
+    let stamp = if watermark {
+        Stamp::new(gpu, size, options.cpu_watermark).map_err(fail("badge"))?
+    } else {
+        None
+    };
+    let mut frames = FramePipeline::new(gpu, size, stamp);
     let mut packets = Vec::new();
     let mut slots = Slots {
         start,
@@ -222,6 +239,7 @@ pub fn transcode(job: Job, gpu: &Gpu, progress: &Span) -> Result<Encoded, &'stat
         encoder: encoder.name(),
         vendor: encoder.vendor(),
         path: frames.path,
+        badge: frames.badge,
     })
 }
 
@@ -632,10 +650,13 @@ struct FramePipeline<'g> {
     readback: Option<Nv12Readback>,
     memory: Vec<u8>,
     path: &'static str,
+    stamp: Option<Stamp<'g>>,
+    /// How the badge was drawn on the last frame.
+    badge: Option<&'static str>,
 }
 
 impl<'g> FramePipeline<'g> {
-    fn new(gpu: &'g Gpu, size: (u32, u32)) -> Self {
+    fn new(gpu: &'g Gpu, size: (u32, u32), stamp: Option<Stamp<'g>>) -> Self {
         Self {
             gpu,
             size,
@@ -646,6 +667,8 @@ impl<'g> FramePipeline<'g> {
             readback: None,
             memory: Vec::new(),
             path: "",
+            stamp,
+            badge: None,
         }
     }
 
@@ -675,7 +698,8 @@ impl<'g> FramePipeline<'g> {
                 let exact = (desc.Width, desc.Height) == self.size
                     && desc.ArraySize == 1
                     && subresource == 0;
-                if textures && exact {
+                // The badge is drawn into our own texture, never into the decoder's.
+                if textures && exact && self.stamp.is_none() {
                     self.path = "gpu";
                     return Ok(Prepared::Direct(texture));
                 }
@@ -694,6 +718,11 @@ impl<'g> FramePipeline<'g> {
                 if !textures {
                     self.path = "memory";
                     self.memory = pixels;
+                    if let Some(stamp) = &self.stamp {
+                        let (w, h) = (self.size.0 as usize, self.size.1 as usize);
+                        stamp.badge.blend_frame(&mut self.memory, w, h);
+                        self.badge = Some("memory");
+                    }
                     return Ok(Prepared::Memory);
                 }
                 self.path = "memory-upload";
@@ -704,6 +733,13 @@ impl<'g> FramePipeline<'g> {
                 let native = self.native(visible)?;
                 self.upload(&native, &pixels, visible)?;
                 self.scale(&native, visible)?;
+            }
+        }
+        if self.stamp.is_some() {
+            let target = self.target()?;
+            if let Some(stamp) = self.stamp.as_mut() {
+                stamp.texture(&target)?;
+                self.badge = Some(stamp.method());
             }
         }
         if textures {

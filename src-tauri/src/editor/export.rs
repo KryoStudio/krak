@@ -1,15 +1,20 @@
 //! One export, start to finish (runs on the export thread, COM and Media Foundation ready).
 //!
-//! Copy: H.264, HEVC and AV1 MP4 sources keep their compressed video (from the keyframe at or
-//! before `start` in decode order, B-frames included; an edit list hides the extra pictures);
-//! other sources are re-encoded to H.264 at their own size. Every audio track is decoded,
-//! gained, re-mixed and re-encoded (AAC).
+//! Copy and file: H.264, HEVC and AV1 MP4 sources keep their compressed video (from the
+//! keyframe at or before `start` in decode order, B-frames included; an edit list hides the
+//! extra pictures); other sources are re-encoded to H.264 at their own size. Every audio track
+//! is decoded, gained, re-mixed and re-encoded (AAC). A copy goes next to the original under a
+//! free name; a file goes exactly where the user chose (through `<path>.part`, renamed once the
+//! source is closed, so even the clip itself can be replaced).
 //!
 //! Discord: always H.264 (every Discord client plays it), one mixed AAC track at 128 kbit/s.
 //! An H.264 passthrough is kept if it fits under 95 % of the limit; otherwise (and for HEVC/AV1
 //! sources) the video is re-encoded for the budget (see [`plan::discord_target`]), and once more
 //! at 85 % (or less, by the measured overshoot: [`plan::retry_factor`]) if that still does not
 //! fit.
+//!
+//! The "by krak" badge ([`super::watermark`]) needs new pictures: with it, every target
+//! re-encodes (copies and files at the source's size and bitrate).
 //!
 //! Timing: media time zero of an output is its first video decode time, which comes before the
 //! first picture when there are B-frames; audio is taken from that instant too, and the
@@ -45,10 +50,15 @@ const STEREO_BITRATE: u32 = 160_000;
 const MONO_BITRATE: u32 = 96_000;
 /// Discord export names tried when the previous file is still in use.
 const DISCORD_ATTEMPTS: u32 = 20;
+/// H.264 needs about this much more bitrate than HEVC/AV1 for the same picture: a copy of
+/// such a clip that has to be re-encoded (badge) gets it.
+const H264_PER_HEVC: f64 = 1.4;
 
 pub enum Destination {
     /// Next to the source: "<stem> (<label>).mp4".
     Copy { label: String },
+    /// Exactly `path` (replaced if it exists: the save dialog asked), all tracks.
+    File { path: PathBuf },
     /// `<dir>/<title>.mp4`, at most `max_bytes`.
     Discord { dir: PathBuf, max_bytes: u64 },
 }
@@ -59,8 +69,27 @@ pub struct Request {
     pub end: f64,
     pub gains: Gains,
     pub destination: Destination,
+    /// Burn the "by krak" badge in.
+    pub watermark: bool,
     /// Fallback paths (tests).
     pub options: transcode::Options,
+}
+
+/// Where a copy or file export writes.
+#[derive(Clone, Copy)]
+enum Output<'a> {
+    /// A free "<stem> (<label>).mp4" next to the source.
+    Next(&'a str),
+    /// `<path>.part`, left for the caller to rename.
+    Part(&'a Path),
+}
+
+/// How the video of an export may be produced.
+#[derive(Clone, Copy)]
+struct VideoJob {
+    /// The badge: no passthrough.
+    watermark: bool,
+    options: transcode::Options,
 }
 
 #[derive(Debug)]
@@ -266,20 +295,50 @@ pub fn export(
     progress.check()?;
     let (start, end) = range(request.start, request.end, source.duration)?;
     let gains = clamp_gains(request.gains);
+    let job = VideoJob {
+        watermark: request.watermark,
+        options: request.options,
+    };
     match &request.destination {
-        Destination::Copy { label } => {
-            copy(&source, start, end, gains, label, request.options, progress)
-        }
-        Destination::Discord { dir, max_bytes } => discord(
+        Destination::Copy { label } => copy(
             &source,
             start,
             end,
             gains,
-            dir,
-            *max_bytes,
-            request.options,
+            Output::Next(label),
+            job,
             progress,
         ),
+        Destination::File { path } => {
+            let written = copy(
+                &source,
+                start,
+                end,
+                gains,
+                Output::Part(path),
+                job,
+                progress,
+            )?;
+            // The source is unmapped first: the file chosen may be the clip itself.
+            drop(source);
+            let part = written.path;
+            if progress.check().is_err() {
+                let _ = fs::remove_file(&part);
+                return Err(CANCELLED);
+            }
+            if let Err(err) = fs::rename(&part, path) {
+                eprintln!("krak: export: cannot write {}: {err}", path.display());
+                let _ = fs::remove_file(&part);
+                return Err(WRITE_FAILED);
+            }
+            Ok(Exported {
+                path: path.clone(),
+                ..written
+            })
+        }
+        Destination::Discord { dir, max_bytes } => {
+            discord(&source, start, end, gains, dir, *max_bytes, job, progress)
+        }
     }
 }
 
@@ -427,17 +486,19 @@ fn passthrough_video<'a>(
     })
 }
 
+/// A copy or file export: every track, the source's quality.
 fn copy(
     source: &Source,
     start: i64,
     end: i64,
     gains: (f32, f32),
-    label: &str,
-    options: transcode::Options,
+    output: Output,
+    job: VideoJob,
     progress: &Progress,
 ) -> Result<Exported, &'static str> {
     let plan = plan::audio_plan(&source_tracks(source), false);
-    if let Some((video, config, file)) = source.passthrough() {
+    let passthrough = source.passthrough().filter(|_| !job.watermark);
+    if let Some((video, config, file)) = passthrough {
         let video = passthrough_video(video, config, file, start, end)?;
         // Audio covers the kept pictures from the first decode time; the edit list hides the
         // same lead-in on every track.
@@ -450,9 +511,9 @@ fn copy(
             false,
             progress.span(0.0, 0.6),
         )?;
-        let (path, size) = write_copy(
+        let (path, size) = write_output(
             &source.path,
-            label,
+            output,
             &video.track(),
             &tracks,
             &video.options(),
@@ -469,15 +530,15 @@ fn copy(
             ),
         });
     }
-    let target = plan::copy_target(source.size, source.fps, source.bitrate);
-    let encoded = reencode(
-        source,
-        start,
-        end,
-        target,
-        options,
-        progress.span(0.0, 0.75),
-    )?;
+    // HEVC/AV1 that only the badge forces to re-encode: H.264 needs more for the same picture.
+    let efficient = source
+        .passthrough()
+        .is_some_and(|(_, config, _)| config.codec() != VideoCodec::H264);
+    let bitrate = source
+        .bitrate
+        .map(|b| if efficient { b * H264_PER_HEVC } else { b });
+    let target = plan::copy_target(source.size, source.fps, bitrate);
+    let encoded = reencode(source, start, end, target, job, progress.span(0.0, 0.75))?;
     let tracks = audio(
         source,
         &plan,
@@ -488,9 +549,9 @@ fn copy(
         progress.span(0.75, 0.9),
     )?;
     let track = encoded_track(&encoded);
-    let (path, size) = write_copy(
+    let (path, size) = write_output(
         &source.path,
-        label,
+        output,
         &track,
         &tracks,
         &Options::default(),
@@ -512,7 +573,7 @@ fn discord(
     gains: (f32, f32),
     dir: &Path,
     max_bytes: u64,
-    options: transcode::Options,
+    job: VideoJob,
     progress: &Progress,
 ) -> Result<Exported, &'static str> {
     fs::create_dir_all(dir).map_err(|_| WRITE_FAILED)?;
@@ -527,10 +588,10 @@ fn discord(
     let fits = |size: u64| size as f64 <= max_bytes as f64 * plan::DISCORD_PASSTHROUGH;
     let plan = plan::audio_plan(&source_tracks(source), true);
 
-    // Discord always gets H.264: other codecs are re-encoded.
+    // Discord always gets H.264: other codecs are re-encoded (and everything with the badge).
     let h264 = source
         .passthrough()
-        .filter(|(_, config, _)| config.codec() == VideoCodec::H264);
+        .filter(|(_, config, _)| config.codec() == VideoCodec::H264 && !job.watermark);
     if let Some((video, config, file)) = h264 {
         let video = passthrough_video(video, config, file, start, end)?;
         let video_bytes: u64 = video.samples.iter().map(|s| s.data.len() as u64).sum();
@@ -576,14 +637,7 @@ fn discord(
     for attempt in 0..2 {
         let target = plan::discord_target(source.size, source.fps, seconds, max_bytes, factor)?;
         progress.rewind(0.0);
-        let encoded = reencode(
-            source,
-            start,
-            end,
-            target,
-            options,
-            progress.span(0.0, 0.85),
-        )?;
+        let encoded = reencode(source, start, end, target, job, progress.span(0.0, 0.85))?;
         let lead_in = encoded.lead_in();
         if tracks.as_ref().is_none_or(|(at, _)| *at != lead_in) {
             let decoded = audio(
@@ -628,8 +682,11 @@ fn discord(
 }
 
 fn describe(encoded: &Encoded, target: VideoTarget) -> String {
+    let badge = encoded
+        .badge
+        .map_or_else(String::new, |how| format!(", badge ({how})"));
     format!(
-        "{} ({:?}, {}), {}x{} @ {} fps, {} kbit/s, {} frames",
+        "{} ({:?}, {}), {}x{} @ {} fps, {} kbit/s, {} frames{badge}",
         encoded.encoder,
         encoded.vendor,
         encoded.path,
@@ -651,7 +708,7 @@ fn reencode(
     start: i64,
     end: i64,
     target: VideoTarget,
-    options: transcode::Options,
+    video: VideoJob,
     progress: Span,
 ) -> Result<Encoded, &'static str> {
     let display = d3d::primary_display().map_err(|err| media_failure("display", err))?;
@@ -662,7 +719,8 @@ fn reencode(
         start,
         end,
         target,
-        options,
+        watermark: video.watermark,
+        options: video.options,
     };
     transcode::transcode(job, &gpu, &progress)
 }
@@ -846,19 +904,29 @@ fn measure(
     })
 }
 
-fn write_copy(
+/// Writes a copy or file export: returns the copy, or the part file of the file export.
+fn write_output(
     source: &Path,
-    label: &str,
+    output: Output,
     video: &VideoTrack,
     audio: &[EncodedAudio],
     options: &Options,
     progress: Span,
 ) -> Result<(PathBuf, u64), &'static str> {
     let tracks = muxer_tracks(audio);
+    let label = match output {
+        Output::Next(label) => label,
+        Output::Part(path) => {
+            return match write_file(path, video, &tracks, options, Finish::KeepPart, &progress) {
+                Ok(size) => finish(mp4_writer::part_path(path), size, &progress),
+                Err(err) => Err(write_error(path, &err, &progress)),
+            };
+        }
+    };
     let mut number = 1;
     for _ in 0..naming::MAX_ATTEMPTS {
         let (path, n) = naming::free_copy_path(source, label, number).ok_or(WRITE_FAILED)?;
-        match write_file(&path, video, &tracks, options, false, &progress) {
+        match write_file(&path, video, &tracks, options, Finish::New, &progress) {
             Ok(size) => return finish(path, size, &progress),
             // Taken in the meantime: next number.
             Err(err) if err.kind() == ErrorKind::AlreadyExists => number = n + 1,
@@ -881,7 +949,7 @@ fn write_discord(
     for n in 1..=DISCORD_ATTEMPTS {
         let path = naming::export_path(dir, stem, n);
         // A previous export with this name may still be open (being uploaded): next name.
-        match write_file(&path, video, &tracks, options, true, &progress) {
+        match write_file(&path, video, &tracks, options, Finish::Replace, &progress) {
             Ok(size) => return finish(path, size, &progress),
             Err(err) => {
                 last = write_error(&path, &err, &progress);
@@ -912,14 +980,25 @@ fn write_error(path: &Path, err: &io::Error, progress: &Span) -> &'static str {
     WRITE_FAILED
 }
 
-/// Writes through `<path>.part` (progress reported, cancellable, synced, then renamed); the
-/// part file is removed on any failure.
+/// What happens to the part file once written.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Finish {
+    /// Renamed to the path, which must not exist.
+    New,
+    /// Renamed over the path.
+    Replace,
+    /// Left as `<path>.part`.
+    KeepPart,
+}
+
+/// Writes through `<path>.part` (progress reported, cancellable, synced, then renamed as
+/// `finish` says); the part file is removed on any failure.
 fn write_file(
     path: &Path,
     video: &VideoTrack,
     audio: &[AudioTrack],
     options: &Options,
-    replace: bool,
+    finish: Finish,
     progress: &Span,
 ) -> io::Result<u64> {
     let total = mp4_writer::write(&mut io::sink(), video, audio, options)?;
@@ -939,10 +1018,10 @@ fn write_file(
         let watched = out.into_inner().map_err(io::IntoInnerError::into_error)?;
         watched.inner.sync_all()?;
         drop(watched);
-        if replace {
-            fs::rename(&part, path)?;
-        } else {
-            mp4_writer::rename_no_replace(&part, path)?;
+        match finish {
+            Finish::New => mp4_writer::rename_no_replace(&part, path)?,
+            Finish::Replace => fs::rename(&part, path)?,
+            Finish::KeepPart => {}
         }
         Ok(size)
     })();
@@ -1023,7 +1102,7 @@ mod tests {
             &track,
             &[],
             &Options::default(),
-            false,
+            Finish::New,
             &progress.span(0.0, 1.0),
         )
         .expect("write");
@@ -1040,16 +1119,48 @@ mod tests {
             &track,
             &[],
             &Options::default(),
-            false,
+            Finish::New,
             &progress.span(0.0, 1.0),
         );
         assert_eq!(again.unwrap_err().kind(), ErrorKind::AlreadyExists);
+        // A file export leaves its part file for the caller to rename.
+        let chosen = dir.join("chosen.mp4");
+        let part = write_file(
+            &chosen,
+            &track,
+            &[],
+            &Options::default(),
+            Finish::KeepPart,
+            &progress.span(0.0, 1.0),
+        )
+        .expect("part");
+        assert_eq!(part, size);
+        assert!(!chosen.exists() && mp4_writer::part_path(&chosen).exists());
+        // Replacing an existing file (the save dialog asked).
+        let replaced = write_file(
+            &path,
+            &track,
+            &[],
+            &Options::default(),
+            Finish::Replace,
+            &progress.span(0.0, 1.0),
+        );
+        assert_eq!(replaced.expect("replace"), size);
+        assert!(!mp4_writer::part_path(&path).exists());
 
         // Cancelled: the write stops and leaves nothing behind.
         cancel.store(true, Ordering::SeqCst);
         let other = dir.join("cancelled.mp4");
         let span = progress.span(0.0, 1.0);
-        let err = write_file(&other, &track, &[], &Options::default(), true, &span).unwrap_err();
+        let err = write_file(
+            &other,
+            &track,
+            &[],
+            &Options::default(),
+            Finish::Replace,
+            &span,
+        )
+        .unwrap_err();
         assert_eq!(write_error(&other, &err, &span), CANCELLED);
         assert!(!other.exists() && !mp4_writer::part_path(&other).exists());
         // A cancel that comes after the last byte still removes the file.

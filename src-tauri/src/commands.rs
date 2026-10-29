@@ -16,14 +16,14 @@ use crate::editor::export::{self, Destination};
 use crate::editor::waveform::{self, Waveform};
 use crate::editor::{
     EXPORT_PROGRESS, ExportProgress, ExportRequest, ExportResult, ExportSlot, INVALID_REQUEST,
-    Progress, ShardInfo, Target, WRITE_FAILED,
+    Progress, ShardInfo, Target, WRITE_FAILED, naming,
 };
 use crate::library::{self, NOT_FOUND, Shard};
 use crate::media::{ComGuard, MfGuard};
 use crate::settings::{Settings, SettingsPatch};
 use crate::state::{AppState, lock};
 use crate::storage::{self, StorageInfo};
-use crate::{clipboard, editor, i18n, names, replay, shell, update, window};
+use crate::{clipboard, editor, i18n, names, presence, replay, shell, update, window};
 
 type CmdResult<T> = Result<T, String>;
 
@@ -281,8 +281,10 @@ pub async fn probe_shard(app: AppHandle, id: String) -> CmdResult<ShardInfo> {
     media_thread("kryo-probe", move || editor::probe::probe(&path)).await
 }
 
-/// Exports a trimmed, re-mixed clip: a copy next to the original (`copy`), or a file under
-/// `maxBytes` put on the clipboard (`discord`). Progress comes as `export-progress` events.
+/// Exports a trimmed, re-mixed clip: a copy next to the original (`copy`), a file where the
+/// user chose (`file`, from `choose_export_path`), or a file under `maxBytes` put on the
+/// clipboard (`discord`); with `watermark`, the "by krak" badge burnt in. Progress comes as
+/// `export-progress` events.
 #[tauri::command]
 pub async fn export_shard(app: AppHandle, request: ExportRequest) -> CmdResult<ExportResult> {
     // Held until the result is ready (clipboard included).
@@ -295,6 +297,9 @@ pub async fn export_shard(app: AppHandle, request: ExportRequest) -> CmdResult<E
             label: i18n::labels(state.settings().language.as_deref())
                 .edited
                 .to_string(),
+        },
+        Target::File => Destination::File {
+            path: naming::export_file(request.path.as_deref().ok_or(INVALID_REQUEST)?)?,
         },
         Target::Discord => {
             let max_bytes = request
@@ -317,6 +322,7 @@ pub async fn export_shard(app: AppHandle, request: ExportRequest) -> CmdResult<E
         end: request.end,
         gains: request.gains,
         destination,
+        watermark: request.watermark,
         options: editor::transcode::Options::default(),
     };
     let cancel = slot.cancel_flag();
@@ -365,6 +371,19 @@ pub async fn export_shard(app: AppHandle, request: ExportRequest) -> CmdResult<E
             })
             .await?
         }
+        Target::File => {
+            let (app, path) = (app.clone(), exported.path.clone());
+            // In the clips folder (or one of its game folders), the file is a shard too.
+            blocking(move || {
+                let state = app.state::<AppState>();
+                let Some(id) = shard_id_of(&clips_dir, &path) else {
+                    return Ok(None);
+                };
+                let favorites = lock(&state.meta).favorites.clone();
+                Ok(library::shard(&clips_dir, &id, &favorites, &mut lock(&state.durations)).ok())
+            })
+            .await?
+        }
         Target::Discord => {
             let path = exported.path.clone();
             shell::isolated(move || clipboard::copy_file(&path))
@@ -374,6 +393,7 @@ pub async fn export_shard(app: AppHandle, request: ExportRequest) -> CmdResult<E
             None
         }
     };
+    lock(&state.exports).files.insert(exported.path.clone());
     drop(slot);
     Ok(ExportResult {
         path: exported.path.to_string_lossy().into_owned(),
@@ -448,6 +468,130 @@ pub async fn cancel_export() -> CmdResult<()> {
     Ok(())
 }
 
+/// Native "Save as" for a file export (MP4), opening where the last one was saved this
+/// session, else in Videos. The dialog asks before overwriting. `None` when cancelled.
+#[tauri::command]
+pub async fn choose_export_path(
+    app: AppHandle,
+    suggested_name: String,
+) -> CmdResult<Option<String>> {
+    let state = app.state::<AppState>();
+    let last_dir = lock(&state.exports).last_dir.clone();
+    let dir = last_dir
+        .filter(|dir| dir.is_dir())
+        .or_else(|| app.path().video_dir().ok().filter(|dir| dir.is_dir()));
+    let name = naming::suggested_file_name(&suggested_name, dir.as_deref());
+    let (tx, mut rx) = tauri::async_runtime::channel(1);
+    let mut dialog = app
+        .dialog()
+        .file()
+        .add_filter("MP4", &["mp4"])
+        .set_file_name(name);
+    if let Some(dir) = &dir {
+        dialog = dialog.set_directory(dir);
+    }
+    if let Some(main) = app.get_webview_window(window::MAIN) {
+        dialog = dialog.set_parent(&main);
+    }
+    dialog.save_file(move |picked| {
+        let _ = tx.try_send(picked);
+    });
+    let Some(Some(picked)) = rx.recv().await else {
+        return Ok(None);
+    };
+    let picked = picked
+        .into_path()
+        .map_err(|_| editor::INVALID_DIR.to_string())?;
+    let path = naming::with_mp4_extension(picked.clone());
+    // ".mp4" added to the name typed: that file was not the one the dialog asked about.
+    if path != picked && path.exists() {
+        return Err("exists".into());
+    }
+    lock(&state.exports).last_dir = path.parent().map(Path::to_path_buf);
+    Ok(Some(path.to_string_lossy().into_owned()))
+}
+
+/// Opens Explorer with a file an export wrote this session selected (nothing else).
+#[tauri::command]
+pub async fn reveal_export(app: AppHandle, path: String) -> CmdResult<()> {
+    let path = PathBuf::from(path);
+    let known = lock(&app.state::<AppState>().exports).files.contains(&path);
+    if !known || !path.is_file() {
+        return Err(NOT_FOUND.into());
+    }
+    let opener = app.clone();
+    shell::isolated(move || opener.opener().reveal_item_in_dir(path))
+        .await
+        .ok_or(INTERNAL)?
+        .map_err(|_| "reveal_failed".to_string())
+}
+
+/// Whether the Discord status is on, and whether Discord is there to show it.
+#[tauri::command]
+pub async fn get_presence(app: AppHandle) -> CmdResult<presence::PresenceInfo> {
+    blocking(move || Ok(presence::info(&app))).await
+}
+
+/// The shard id of `path` when it is a clip the library lists: a file of the clips folder or
+/// of one of its game folders (compared through their real paths, links resolved).
+fn shard_id_of(clips_dir: &Path, path: &Path) -> Option<String> {
+    let dir = fs::canonicalize(clips_dir).ok()?;
+    let file = fs::canonicalize(path).ok()?;
+    let parts = file
+        .strip_prefix(&dir)
+        .ok()?
+        .iter()
+        .map(|part| part.to_str())
+        .collect::<Option<Vec<&str>>>()?;
+    match parts.as_slice() {
+        [_] => {}
+        [folder, _] if !folder.starts_with(['.', '$']) => {}
+        _ => return None,
+    }
+    library::is_video(path).then(|| parts.join("/"))
+}
+
 fn same_file(a: &Path, b: &Path) -> bool {
     matches!((fs::canonicalize(a), fs::canonicalize(b)), (Ok(a), Ok(b)) if a == b)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn finds_exported_files_in_the_library() {
+        let dir = std::env::temp_dir().join(format!("kryo-commands-ids-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let clips = dir.join("Clips");
+        fs::create_dir_all(clips.join("Valorant")).unwrap();
+        fs::create_dir_all(clips.join(".hidden")).unwrap();
+        fs::create_dir_all(clips.join("Valorant").join("deeper")).unwrap();
+        let file = |rel: &str| {
+            let path = clips.join(rel);
+            fs::write(&path, b"x").unwrap();
+            path
+        };
+        assert_eq!(
+            shard_id_of(&clips, &file("Ace.mp4")).as_deref(),
+            Some("Ace.mp4")
+        );
+        assert_eq!(
+            shard_id_of(&clips, &file(r"Valorant\Clutch.mp4")).as_deref(),
+            Some("Valorant/Clutch.mp4")
+        );
+        // Spelled differently, same file.
+        let other_case = dir.join("CLIPS").join("valorant").join("Clutch.mp4");
+        assert_eq!(
+            shard_id_of(&clips, &other_case).as_deref(),
+            Some("Valorant/Clutch.mp4")
+        );
+        assert_eq!(shard_id_of(&clips, &file(r".hidden\a.mp4")), None);
+        assert_eq!(shard_id_of(&clips, &file(r"Valorant\deeper\a.mp4")), None);
+        assert_eq!(shard_id_of(&clips, &file("notes.txt")), None);
+        let outside = dir.join("Elsewhere.mp4");
+        fs::write(&outside, b"x").unwrap();
+        assert_eq!(shard_id_of(&clips, &outside), None);
+        let _ = fs::remove_dir_all(&dir);
+    }
 }

@@ -23,6 +23,7 @@ use super::export::{self, Destination, Exported, Request};
 use super::mapped::MappedFile;
 use super::pcm::Pcm;
 use super::transcode::Options;
+use super::watermark::{Badge, Rect};
 use super::{CANCELLED, Gains, INVALID_RANGE, Progress, TrackKind, decode, probe};
 use crate::capture::VideoSettings;
 use crate::capture::{
@@ -253,6 +254,7 @@ fn run(
         end,
         gains,
         destination,
+        watermark: false,
         options,
     };
     let started = Instant::now();
@@ -758,6 +760,7 @@ fn editor_end_to_end() {
                 software_encoder: true,
                 gpu_scaling: false,
                 no_nvenc: false,
+                cpu_watermark: false,
             },
         ),
     ] {
@@ -1495,8 +1498,9 @@ fn write_clip(
     mp4_writer::write_file(path, &video, &[audio], &MuxOptions::default(), true).expect("mux");
 }
 
-/// The synthetic pattern (frame index in binary) encoded by NVENC HEVC with B-frames.
-fn synthetic_hevc_clip(path: &Path) {
+/// The synthetic pattern (frame index in binary) encoded by NVENC HEVC with B-frames (Main10
+/// with `ten_bit`, from the same 8-bit frames).
+fn synthetic_hevc_clip(path: &Path, ten_bit: bool) {
     use crate::media::d3d::{self, Gpu};
     use crate::media::nvenc::{self, NvencEncoder, RateControl};
     use windows::Win32::Graphics::Direct3D11::{
@@ -1508,6 +1512,7 @@ fn synthetic_hevc_clip(path: &Path) {
     let mut settings = nvenc::bench::settings(crate::media::codec::VideoCodec::Hevc, false, 5);
     (settings.width, settings.height, settings.fps, settings.gop) = (SYN_W, SYN_H, SYN_FPS, 60);
     settings.b_frames = 3;
+    settings.ten_bit = ten_bit;
     settings.b_ref = nvenc::BRef::Middle;
     settings.lookahead = 8;
     settings.rate = RateControl::Vbr {
@@ -1633,7 +1638,7 @@ fn editor_hevc_and_av1_sources() {
 
     // HEVC with B-frames: every frame decodes in order.
     let hevc = dir.join("Synthetic HEVC.mp4");
-    synthetic_hevc_clip(&hevc);
+    synthetic_hevc_clip(&hevc, false);
     let indices = decoded_indices(&hevc);
     assert_eq!(indices.len(), SYN_FRAMES as usize);
     assert!(indices.iter().enumerate().all(|(k, &(_, i))| i == k as u32));
@@ -1755,4 +1760,378 @@ fn editor_hevc_and_av1_sources() {
     assert_eq!(codec_of(&d.path), "h264");
     let (decoded, _) = decode_all_frames(&d.path);
     assert!((44..=46).contains(&decoded), "{decoded}");
+}
+
+// ---- The "by krak" badge, and file exports ----
+
+/// One export without cancellation.
+fn export_once(
+    source: &Path,
+    (start, end): (f64, f64),
+    destination: Destination,
+    watermark: bool,
+    options: Options,
+) -> (Result<Exported, &'static str>, f64) {
+    let cancel = AtomicBool::new(false);
+    let report = |_| {};
+    let progress = Progress::new(&cancel, &report);
+    let request = Request {
+        start,
+        end,
+        gains: Gains {
+            game: 1.0,
+            mic: 1.0,
+        },
+        destination,
+        watermark,
+        options,
+    };
+    let started = Instant::now();
+    let exported = export::export(source, &request, &progress);
+    (exported, started.elapsed().as_secs_f64())
+}
+
+/// Luma of the `nth` frame Media Foundation decodes from `path` (rows of the returned width).
+fn luma_frame(path: &Path, nth: usize) -> (usize, Vec<u8>) {
+    use windows::Win32::Media::MediaFoundation::{IMF2DBuffer, MF_MT_FRAME_SIZE};
+    use windows::core::Interface;
+    // SAFETY: Source Reader on our own file; NV12 frames read with their pitch.
+    unsafe {
+        let reader =
+            MFCreateSourceReaderFromURL(&HSTRING::from(path.as_os_str()), None).expect("reader");
+        let video = MF_SOURCE_READER_FIRST_VIDEO_STREAM.0.cast_unsigned();
+        reader
+            .SetStreamSelection(MF_SOURCE_READER_ALL_STREAMS.0.cast_unsigned(), false)
+            .expect("deselect");
+        reader.SetStreamSelection(video, true).expect("select");
+        let ty = media_type(&MFMediaType_Video, &MFVideoFormat_NV12).expect("type");
+        reader.SetCurrentMediaType(video, None, &ty).expect("nv12");
+        let size = reader
+            .GetCurrentMediaType(video)
+            .expect("current")
+            .GetUINT64(&MF_MT_FRAME_SIZE)
+            .expect("size");
+        let (w, h) = ((size >> 32) as usize, (size as u32) as usize);
+        let mut seen = 0;
+        loop {
+            let (mut flags, mut time) = (0u32, 0i64);
+            let mut sample = None;
+            reader
+                .ReadSample(
+                    video,
+                    0,
+                    None,
+                    Some(&mut flags),
+                    Some(&mut time),
+                    Some(&mut sample),
+                )
+                .expect("read");
+            if let Some(sample) = sample {
+                if seen == nth {
+                    let buffer = sample.GetBufferByIndex(0).expect("buffer");
+                    let planar = buffer.cast::<IMF2DBuffer>().expect("2d buffer");
+                    let (mut scan0, mut pitch) = (std::ptr::null_mut(), 0i32);
+                    planar.Lock2D(&mut scan0, &mut pitch).expect("lock");
+                    let mut luma = vec![0u8; w * h];
+                    for row in 0..h {
+                        let line = std::slice::from_raw_parts(scan0.add(row * pitch as usize), w);
+                        luma[row * w..(row + 1) * w].copy_from_slice(line);
+                    }
+                    planar.Unlock2D().expect("unlock");
+                    return (w, luma);
+                }
+                seen += 1;
+            }
+            assert!(
+                flags & MF_SOURCE_READERF_ENDOFSTREAM.0.cast_unsigned() == 0,
+                "only {seen} frames"
+            );
+        }
+    }
+}
+
+/// The badge's rectangle in a `size` frame and the luma it should have over a flat `y`.
+fn expected_badge(size: (u32, u32), y: u8) -> (Rect, Vec<u8>) {
+    let badge = Badge::new(size).expect("badge").expect("fits");
+    let (w, h) = (size.0 as usize, size.1 as usize);
+    let mut frame = vec![y; w * h];
+    frame.extend(std::iter::repeat_n(128u8, w * h / 2));
+    badge.blend_frame(&mut frame, w, h);
+    let r = badge.rect;
+    let (x, top, rw, rh) = (
+        r.x as usize,
+        r.y as usize,
+        r.width as usize,
+        r.height as usize,
+    );
+    let region = (0..rh)
+        .flat_map(|row| frame[(top + row) * w + x..(top + row) * w + x + rw].to_vec())
+        .collect();
+    (r, region)
+}
+
+/// Mean absolute difference between `luma` (rows of `width`) in `rect` and `expected`.
+fn region_error(luma: &[u8], width: usize, rect: Rect, expected: &[u8]) -> f64 {
+    let (x, top, rw, rh) = (
+        rect.x as usize,
+        rect.y as usize,
+        rect.width as usize,
+        rect.height as usize,
+    );
+    let mut total = 0.0;
+    for row in 0..rh {
+        for col in 0..rw {
+            let got = f64::from(luma[(top + row) * width + x + col]);
+            total += (got - f64::from(expected[row * rw + col])).abs();
+        }
+    }
+    total / (rw * rh) as f64
+}
+
+/// `frames` flat frames of `size` (luma `y`, neutral chroma) at 30 fps, H.264, no audio.
+fn flat_clip(path: &Path, size: (u32, u32), y: u8, frames: u32) {
+    use crate::media::h264::{Frame, H264Config, H264Encoder};
+    use crate::media::mp4_writer::{self, Options as MuxOptions, VideoSample, VideoTrack};
+    let config = H264Config::new(size.0, size.1, 30, 4_000_000);
+    let mut encoder = H264Encoder::software(config).expect("encoder");
+    let (w, h) = (size.0 as usize, size.1 as usize);
+    let mut pixels = vec![y; w * h];
+    pixels.extend(std::iter::repeat_n(128u8, w * h / 2));
+    let mut packets = Vec::new();
+    for k in 0..frames {
+        let pts = i64::from(k) * TICKS_PER_SECOND / 30;
+        assert!(
+            encoder
+                .encode(Frame::Nv12(&pixels), pts, &mut packets)
+                .expect("encode")
+        );
+    }
+    encoder.drain(&mut packets).expect("drain");
+    let video_config = encoder.codec_config().expect("parameter sets");
+    let video = VideoTrack {
+        config: &video_config,
+        colour: Some(Colour::BT709),
+        samples: packets
+            .iter()
+            .map(|p| VideoSample {
+                data: &p.data,
+                pts: p.pts,
+                dts: p.dts,
+                keyframe: p.keyframe,
+            })
+            .collect(),
+        last_duration: TICKS_PER_SECOND / 30,
+    };
+    mp4_writer::write_file(path, &video, &[], &MuxOptions::default(), true).expect("mux");
+}
+
+#[test]
+#[ignore = "needs Media Foundation, the GPU and NVENC (HEVC source); run with --ignored"]
+fn editor_badge_and_file_exports() {
+    use crate::media::mp4_writer;
+    let _com = ComGuard::new();
+    let _mf = MfGuard::new().expect("media foundation");
+    let dir = std::env::var_os("KRYO_EDITOR_OUT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| std::env::temp_dir().join("kryo-editor-e2e"))
+        .join("badge");
+    let keep = std::env::var_os("KRYO_EDITOR_KEEP").is_some();
+    let _ = std::fs::remove_dir_all(&dir);
+    let out = dir.join("out");
+    std::fs::create_dir_all(&out).expect("dir");
+    let source = dir.join("Synthetic.mp4");
+    synthetic_clip(&source);
+    let size = (SYN_W, SYN_H);
+    let w = SYN_W as usize;
+
+    // The top right block of the pattern is black before frame 256, white from it: the badge
+    // over both, drawn each way, against the CPU reference.
+    for (start, y) in [(1.0, 16u8), (4.4, 235)] {
+        let (rect, expected) = expected_badge(size, y);
+        for (name, options) in [
+            ("gpu", Options::default()),
+            (
+                "staging",
+                Options {
+                    cpu_watermark: true,
+                    ..Options::default()
+                },
+            ),
+            (
+                "memory",
+                Options {
+                    software_decoding: true,
+                    software_encoder: true,
+                    ..Options::default()
+                },
+            ),
+        ] {
+            let path = out.join(format!("Badge {name} {start}.mp4"));
+            let destination = Destination::File { path: path.clone() };
+            let (e, seconds) =
+                export_once(&source, (start, start + 0.5), destination, true, options);
+            let e = e.unwrap_or_else(|c| panic!("{name} {start}: {c}"));
+            let (width, luma) = luma_frame(&path, 3);
+            let error = region_error(&luma, width, rect, &expected);
+            println!(
+                "badge {name} over {y}: mean error {error:.2} in {seconds:.2} s ({})",
+                e.detail
+            );
+            assert_eq!(e.path, path);
+            assert!(e.reencoded && e.detail.contains(&format!("badge ({name})")));
+            assert!(!mp4_writer::part_path(&path).exists());
+            assert_eq!(width, w);
+            assert!(error < 6.0, "{name} over {y}: mean error {error}");
+            // Next to it, the picture is untouched.
+            let beside = luma[(rect.y + rect.height / 2) as usize * w + rect.x as usize - 8];
+            assert!(beside.abs_diff(y) < 12, "{beside}");
+        }
+        // Without the badge the same place is the plain background (the check means something).
+        let (width, luma) = luma_frame(&source, (start * 60.0) as usize + 3);
+        let flat = vec![y; expected.len()];
+        let (plain, badged) = (
+            region_error(&luma, width, rect, &flat),
+            region_error(&luma, width, rect, &expected),
+        );
+        println!("source over {y}: {plain:.2} from flat, {badged:.2} from the badge");
+        assert!(plain < 8.0 && badged > 15.0);
+    }
+
+    // Discord with the badge: still under the limit.
+    let (d, seconds) = export_once(
+        &source,
+        (1.0, 3.0),
+        Destination::Discord {
+            dir: out.clone(),
+            max_bytes: 400_000,
+        },
+        true,
+        Options::default(),
+    );
+    let d = d.expect("discord with badge");
+    println!(
+        "discord with badge: {} bytes in {seconds:.2} s ({})",
+        d.size, d.detail
+    );
+    assert!(d.reencoded && d.size <= 400_000 * 95 / 100 && d.detail.contains("badge (gpu)"));
+    let (width, luma) = luma_frame(&d.path, 3);
+    let (rect, expected) = expected_badge((width as u32, width as u32 * 9 / 16), 16);
+    assert!(region_error(&luma, width, rect, &expected) < 8.0);
+
+    // Speed: the same re-encode with and without the badge.
+    for watermark in [false, true] {
+        let (e, seconds) = export_once(
+            &source,
+            (0.0, 5.0),
+            Destination::Discord {
+                dir: out.clone(),
+                max_bytes: 4_000_000,
+            },
+            watermark,
+            Options::default(),
+        );
+        let e = e.expect("timing");
+        println!(
+            "5 s re-encode, badge {watermark}: {seconds:.2} s ({})",
+            e.detail
+        );
+    }
+
+    // HEVC Main10 source: decoded to 8 bits by the reader, H.264 out, same badge.
+    let hevc = dir.join("Synthetic HEVC 10.mp4");
+    synthetic_hevc_clip(&hevc, true);
+    let (e, seconds) = export_once(
+        &hevc,
+        (1.0, 1.5),
+        Destination::Copy {
+            label: "edit".into(),
+        },
+        true,
+        Options::default(),
+    );
+    let e = e.expect("hevc 10-bit with badge");
+    println!("hevc 10-bit with badge: {seconds:.2} s ({})", e.detail);
+    assert!(e.reencoded && codec_of(&e.path) == "h264");
+    let (width, luma) = luma_frame(&e.path, 3);
+    let (rect, expected) = expected_badge(size, 16);
+    let error = region_error(&luma, width, rect, &expected);
+    assert!(error < 6.0, "hevc: mean error {error}");
+
+    // Portrait and other sizes.
+    for frame in [(720u32, 1280u32), (854, 480), (1366, 768)] {
+        let clip = dir.join(format!("Flat {}x{}.mp4", frame.0, frame.1));
+        flat_clip(&clip, frame, 180, 30);
+        let path = out.join(format!("Flat {}x{} badge.mp4", frame.0, frame.1));
+        let (e, _) = export_once(
+            &clip,
+            (0.0, 0.9),
+            Destination::File { path: path.clone() },
+            true,
+            Options::default(),
+        );
+        e.unwrap_or_else(|c| panic!("{frame:?}: {c}"));
+        let (width, luma) = luma_frame(&path, 3);
+        assert_eq!(width, frame.0 as usize);
+        let (rect, expected) = expected_badge(frame, 180);
+        let error = region_error(&luma, width, rect, &expected);
+        println!(
+            "{}x{}: badge {rect:?}, mean error {error:.2}",
+            frame.0, frame.1
+        );
+        assert!(error < 6.0, "{frame:?}: mean error {error}");
+    }
+
+    // File exports: a passthrough lands exactly there, an existing file is replaced, and the
+    // clip itself can be overwritten with its trimmed version.
+    let chosen = out.join("Chosen.mp4");
+    for round in 0..2 {
+        let (e, _) = export_once(
+            &source,
+            (1.0, 2.0),
+            Destination::File {
+                path: chosen.clone(),
+            },
+            false,
+            Options::default(),
+        );
+        let e = e.unwrap_or_else(|c| panic!("file round {round}: {c}"));
+        assert_eq!(e.path, chosen);
+        assert!(!e.reencoded);
+        assert_eq!(std::fs::metadata(&chosen).unwrap().len(), e.size);
+    }
+    let itself = dir.join("Itself.mp4");
+    std::fs::copy(&source, &itself).unwrap();
+    let (e, _) = export_once(
+        &itself,
+        (2.0, 3.0),
+        Destination::File {
+            path: itself.clone(),
+        },
+        false,
+        Options::default(),
+    );
+    e.expect("over the clip itself");
+    let info = probe::probe(&itself).expect("probe");
+    assert!((info.duration - 1.0).abs() < 0.05, "{}", info.duration);
+    // Cancelled: nothing left behind.
+    let cancelled = out.join("Cancelled.mp4");
+    let r = run(
+        &source,
+        0.0,
+        5.0,
+        Gains {
+            game: 1.0,
+            mic: 1.0,
+        },
+        Destination::File {
+            path: cancelled.clone(),
+        },
+        Options::default(),
+        Some(0.3),
+    );
+    assert_eq!(r.exported.err(), Some(CANCELLED));
+    assert!(!cancelled.exists() && !mp4_writer::part_path(&cancelled).exists());
+    if !keep {
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

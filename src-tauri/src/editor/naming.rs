@@ -1,10 +1,12 @@
 //! Output paths: "<original stem> (<label>).mp4" next to the original for copies (" (2)"... on
-//! collisions), `<cache>/exports/<title>.mp4` for Discord, and cleanup of old Discord exports.
+//! collisions), `<cache>/exports/<title>.mp4` for Discord, cleanup of old Discord exports, and
+//! the "Save as" file of a file export (suggested name, validation).
 
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
+use super::{INVALID_DIR, INVALID_NAME};
 use crate::media::mp4_writer;
 use crate::{i18n, names};
 
@@ -69,6 +71,69 @@ pub fn export_path(dir: &Path, stem: &str, n: u32) -> PathBuf {
     } else {
         dir.join(format!("{stem}.mp4"))
     }
+}
+
+/// The name "Save as" suggests for `suggested` ("Ace.mp4", "Valorant: clutch"...): a valid
+/// Windows file name (separators become dashes), ".mp4", and not one already in `dir`.
+pub fn suggested_file_name(suggested: &str, dir: Option<&Path>) -> String {
+    let trimmed = suggested.trim();
+    let stem = match trimmed.get(trimmed.len().saturating_sub(4)..) {
+        Some(ext) if ext.eq_ignore_ascii_case(".mp4") => &trimmed[..trimmed.len() - 4],
+        _ => trimmed,
+    };
+    let stem = stem.replace([':', '/', '\\'], "-");
+    let stem = export_stem(&stem);
+    let free = |n: u32| export_path(dir.unwrap_or(Path::new("")), &stem, n);
+    let path = dir
+        .and_then(|_| (1..=MAX_ATTEMPTS).map(free).find(|p| !p.exists()))
+        .unwrap_or_else(|| free(1));
+    path.file_name().map_or_else(
+        || format!("{stem}.mp4"),
+        |n| n.to_string_lossy().into_owned(),
+    )
+}
+
+/// `path` as the dialog returned it, with ".mp4" added when the name typed has another
+/// extension (or none): the export always writes MP4.
+pub fn with_mp4_extension(path: PathBuf) -> PathBuf {
+    if is_mp4(&path) {
+        return path;
+    }
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(".mp4");
+    path.with_file_name(name)
+}
+
+/// Checks the destination of a file export: an absolute `.mp4` path in an existing folder,
+/// not a folder itself. An existing file is fine: the dialog asked before overwriting it.
+pub fn export_file(raw: &str) -> Result<PathBuf, &'static str> {
+    let path = PathBuf::from(raw.trim());
+    if !path.is_absolute() {
+        return Err(INVALID_DIR);
+    }
+    // Windows-valid (the dialog's names are), not a device name, not just spaces.
+    let named = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .is_some_and(|stem| {
+            names::sanitize_title(stem).is_some()
+                && !stem.chars().any(|c| {
+                    c.is_control()
+                        || matches!(c, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*')
+                })
+        });
+    if !named || !is_mp4(&path) || path.is_dir() {
+        return Err(INVALID_NAME);
+    }
+    match path.parent() {
+        Some(dir) if dir.is_dir() => Ok(path),
+        _ => Err(INVALID_DIR),
+    }
+}
+
+fn is_mp4(path: &Path) -> bool {
+    path.extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case("mp4"))
 }
 
 /// Deletes files in `dir` last modified more than `max_age` ago (best effort).
@@ -148,6 +213,64 @@ mod tests {
         let dir = Path::new(r"C:\cache\exports");
         assert_eq!(export_path(dir, "Ace", 1), dir.join("Ace.mp4"));
         assert_eq!(export_path(dir, "Ace", 2), dir.join("Ace (2).mp4"));
+    }
+
+    #[test]
+    fn suggests_save_as_names() {
+        assert_eq!(suggested_file_name("Ace.mp4", None), "Ace.mp4");
+        assert_eq!(suggested_file_name(" Ace.MP4 ", None), "Ace.mp4");
+        assert_eq!(suggested_file_name("Valorant", None), "Valorant.mp4");
+        assert_eq!(
+            suggested_file_name("Clutch 20:15 a/b", None),
+            "Clutch 20-15 a-b.mp4"
+        );
+        assert_eq!(suggested_file_name("CON.mp4", None), "Krak.mp4");
+        assert_eq!(suggested_file_name("???", None), "Krak.mp4");
+        // Not over a file of the folder it opens in.
+        let dir = std::env::temp_dir().join(format!("kryo-editor-saveas-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        assert_eq!(suggested_file_name("Ace.mp4", Some(&dir)), "Ace.mp4");
+        fs::write(dir.join("Ace.mp4"), b"x").unwrap();
+        fs::write(dir.join("Ace (2).mp4"), b"x").unwrap();
+        assert_eq!(suggested_file_name("Ace.mp4", Some(&dir)), "Ace (3).mp4");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn validates_export_files() {
+        let dir = std::env::temp_dir().join(format!("kryo-editor-file-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("sub.mp4")).unwrap();
+        let ok = dir.join("Ace.mp4");
+        assert_eq!(export_file(ok.to_str().unwrap()), Ok(ok.clone()));
+        // Overwriting an existing file is allowed (the dialog asked).
+        fs::write(&ok, b"x").unwrap();
+        assert_eq!(export_file(ok.to_str().unwrap()), Ok(ok.clone()));
+        let upper = dir.join("Ace.MP4");
+        assert_eq!(export_file(upper.to_str().unwrap()), Ok(upper));
+        for (path, code) in [
+            (dir.join("Ace.mkv"), INVALID_NAME),
+            (dir.join("Ace"), INVALID_NAME),
+            (dir.join("sub.mp4"), INVALID_NAME),
+            (dir.join("CON.mp4"), INVALID_NAME),
+            (dir.join(" .mp4"), INVALID_NAME),
+            (dir.join("missing").join("Ace.mp4"), INVALID_DIR),
+            (PathBuf::from("Ace.mp4"), INVALID_DIR),
+            (PathBuf::from(r"\Ace.mp4"), INVALID_DIR),
+            (PathBuf::from(r"C:Ace.mp4"), INVALID_DIR),
+        ] {
+            assert_eq!(export_file(path.to_str().unwrap()), Err(code), "{path:?}");
+        }
+        assert_eq!(export_file(""), Err(INVALID_DIR));
+        assert_eq!(
+            with_mp4_extension(dir.join("Ace")),
+            dir.join("Ace.mp4"),
+            "typed without extension"
+        );
+        assert_eq!(with_mp4_extension(dir.join("v1.2")), dir.join("v1.2.mp4"));
+        assert_eq!(with_mp4_extension(dir.join("a.Mp4")), dir.join("a.Mp4"));
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

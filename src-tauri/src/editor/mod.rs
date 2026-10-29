@@ -1,5 +1,6 @@
 //! Clip editor backend: probing a clip (`probe_shard`) and exporting a trimmed, re-mixed copy
-//! (`export_shard`), either next to the original or as a small file for Discord.
+//! (`export_shard`): next to the original, to a file the user picked, or as a small file for
+//! Discord, optionally with the "by krak" badge.
 //!
 //! - [`demux`] reads MP4/MOV sample tables, [`mapped`] maps the source file in memory;
 //! - [`plan`] holds the pure decisions (start keyframe and edit-list offset, Discord ladder,
@@ -7,7 +8,7 @@
 //! - [`decode`] decodes audio (AAC with the Media Foundation decoder, anything else with the
 //!   Source Reader), [`transcode`] re-encodes video (hardware decode → GPU scaling → H.264);
 //! - [`export`] puts it together, [`naming`] picks output paths, [`probe`] answers the UI,
-//!   [`waveform`] draws the timeline's audio lanes.
+//!   [`waveform`] draws the timeline's audio lanes, [`watermark`] draws the badge.
 //!
 //! Exports run on a dedicated thread (COM/MF initialised there), one at a time; every loop
 //! checks the cancel flag and partial outputs are deleted on cancel or failure.
@@ -29,8 +30,12 @@ mod tests;
 #[cfg(windows)]
 pub mod transcode;
 #[cfg(windows)]
+pub mod watermark;
+#[cfg(windows)]
 pub mod waveform;
 
+use std::collections::HashSet;
+use std::path::PathBuf;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -44,8 +49,12 @@ use crate::state::lock;
 pub const BUSY: &str = "busy";
 pub const CANCELLED: &str = "cancelled";
 pub const INVALID_RANGE: &str = "invalid_range";
-/// Malformed request (Discord export without a usable `maxBytes`).
+/// Malformed request (Discord export without a usable `maxBytes`, file export without `path`).
 pub const INVALID_REQUEST: &str = "invalid_request";
+/// A file export's folder does not exist or the path is not absolute.
+pub const INVALID_DIR: &str = "invalid_dir";
+/// A file export's name is not an `.mp4` file name.
+pub const INVALID_NAME: &str = "invalid_name";
 pub const UNSUPPORTED: &str = "unsupported";
 /// The clip's video codec cannot be decoded on this PC (HEVC/AV1 without Windows' extensions).
 pub const UNSUPPORTED_CODEC: &str = "unsupported_codec";
@@ -112,6 +121,7 @@ pub struct Gains {
 pub enum Target {
     Copy,
     Discord,
+    File,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -125,6 +135,11 @@ pub struct ExportRequest {
     pub target: Target,
     /// Discord only: the upload limit in bytes.
     pub max_bytes: Option<f64>,
+    /// File only: where to write (from `choose_export_path`, which asked before overwriting).
+    pub path: Option<String>,
+    /// Burn the "by krak" badge in (forces a re-encode).
+    #[serde(default)]
+    pub watermark: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -134,6 +149,14 @@ pub struct ExportResult {
     pub size: u64,
     pub shard: Option<Shard>,
     pub reencoded: bool,
+}
+
+/// What exports did this session: the files they wrote (`reveal_export` shows only these)
+/// and the folder of the last "Save as" (where the next one opens).
+#[derive(Debug, Default)]
+pub struct ExportSession {
+    pub files: HashSet<PathBuf>,
+    pub last_dir: Option<PathBuf>,
 }
 
 /// `export-progress` payload.
@@ -342,6 +365,15 @@ mod contract_tests {
         }))
         .unwrap();
         assert_eq!((copy.target, copy.max_bytes), (Target::Copy, None));
+        assert!(!copy.watermark && copy.path.is_none(), "optional fields");
+        let file: ExportRequest = serde_json::from_value(serde_json::json!({
+            "id": "a.mp4", "start": 0, "end": 1, "gains": { "game": 1, "mic": 1 },
+            "target": "file", "maxBytes": null, "path": "D:\\Exports\\Ace.mp4", "watermark": true
+        }))
+        .unwrap();
+        assert_eq!(file.target, Target::File);
+        assert_eq!(file.path.as_deref(), Some("D:\\Exports\\Ace.mp4"));
+        assert!(file.watermark);
         let result = ExportResult {
             path: "C:\\x.mp4".into(),
             size: 3,
