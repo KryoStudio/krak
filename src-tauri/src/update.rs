@@ -18,7 +18,6 @@ pub async fn apply(app: &AppHandle, patch: SettingsPatch) -> Result<Settings, &'
     let state = app.state::<AppState>();
     let _serialized = state.update_lock.lock().await;
     let old = state.settings();
-    let hotkey_requested = patch.hotkey.is_some();
     let mut new = old.merge(patch);
 
     let dir_changed = Path::new(&new.clips_dir) != Path::new(&old.clips_dir);
@@ -26,22 +25,10 @@ pub async fn apply(app: &AppHandle, patch: SettingsPatch) -> Result<Settings, &'
         new.clips_dir = prepare_clips_dir(&new.clips_dir)?;
     }
 
-    // Register the new hotkey before releasing the old one, so a failure changes nothing.
-    let old_shortcut = hotkey::parse(&old.hotkey).ok();
-    let new_shortcut = if hotkey_requested {
-        Some(hotkey::parse(&new.hotkey)?)
-    } else {
-        None
-    };
-    let added = match new_shortcut {
-        Some(shortcut) => hotkey::ensure_registered(app, shortcut)?.then_some(shortcut),
-        None => None,
-    };
-    let rollback_hotkey = || {
-        if let Some(shortcut) = added {
-            hotkey::unregister(app, shortcut);
-        }
-    };
+    // Register the new hotkeys (replay, recording, screenshot) before releasing the old ones,
+    // so a failure changes nothing.
+    let added = hotkey::register_changes(app, &old, &new)?;
+    let rollback_hotkey = || hotkey::unregister_all(app, &added);
 
     let autostart_changed = new.launch_at_startup != old.launch_at_startup;
     if autostart_changed && let Err(err) = set_autostart(app, new.launch_at_startup) {
@@ -58,19 +45,16 @@ pub async fn apply(app: &AppHandle, patch: SettingsPatch) -> Result<Settings, &'
     }
     *lock(&state.settings) = new.clone();
 
-    if let (Some(old_shortcut), Some(new_shortcut)) = (old_shortcut, new_shortcut)
-        && old_shortcut != new_shortcut
-    {
-        hotkey::unregister(app, old_shortcut);
-    }
+    hotkey::release_unused(app, &old, &new);
     if dir_changed {
         activate_clips_dir(app, Path::new(&new.clips_dir));
         let _ = app.emit(LIBRARY_CHANGED, ());
     }
-    if new.language != old.language || new.hotkey != old.hotkey {
+    if new.language != old.language || hotkey::changed(&old, &new) {
         let _ = tray::refresh(app);
     }
     replay::settings_changed(app, &old, &new);
+    crate::presence::settings_changed(app, &old, &new);
     if new.storage_limit_gb.is_some()
         && (new.storage_limit_gb != old.storage_limit_gb || dir_changed)
     {

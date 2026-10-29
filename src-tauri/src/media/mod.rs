@@ -1,6 +1,7 @@
 //! Media building blocks: Direct3D 11 capture/convert helpers, H.264 and AAC encoders over
-//! Media Foundation, and a pure-Rust MP4 muxer. Nothing here knows about Tauri or the replay
-//! buffer, so a clip editor or exporter can reuse them as they are.
+//! Media Foundation, a pure-Rust MP4 muxer (whole clips, and growing files for recordings that
+//! survive a crash), PNG through WIC. Nothing here knows about Tauri or the replay buffer, so a
+//! clip editor or exporter can reuse them as they are.
 //!
 //! Times are in 100 ns units ([`TICKS_PER_SECOND`]) everywhere, the unit of both Media
 //! Foundation and the QPC clock (`capture::clock`).
@@ -17,9 +18,11 @@ pub mod h264;
 pub mod hevc;
 #[cfg(windows)]
 pub(crate) mod mf;
+pub mod mp4_stream;
 pub mod mp4_writer;
 #[cfg(windows)]
 pub mod nvenc;
+pub mod png;
 #[cfg(all(test, windows))]
 pub mod testing;
 

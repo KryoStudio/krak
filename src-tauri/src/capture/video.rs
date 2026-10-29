@@ -43,6 +43,7 @@ use super::duplication::{Acquire, Duplication};
 use super::encoders;
 use super::quality::{self, Backend, Capabilities, EncoderPlan, Plan, Tier};
 use super::ring::StreamParams;
+use super::screenshot::Source;
 use super::{CaptureState, Shared, clock};
 use crate::media::codec::{CodecConfig, VideoPacket};
 use crate::media::d3d::{self, Display, Gpu, Nv12Converter, Nv12Readback};
@@ -341,6 +342,7 @@ impl Pipeline {
     fn run(&mut self, shared: &Shared) -> MediaResult<Exit> {
         let mut stats = Stats::default();
         let result = self.run_ticks(shared, &mut stats);
+        shared.set_screen(None);
         let Stats {
             ticks,
             late,
@@ -382,6 +384,15 @@ impl Pipeline {
 
             if let Some(exit) = self.poll_desktop(now) {
                 return Ok(exit);
+            }
+            if stats.ticks == 1 {
+                // Our desktop copy holds an image now: screenshots can read it.
+                shared.set_screen(Some(Source::new(
+                    &self.gpu,
+                    &self.desktop,
+                    self.input,
+                    self.display.rotation,
+                )));
             }
             match &mut self.encoder {
                 VideoEncoder::Nvenc(encoder) => {
@@ -652,7 +663,10 @@ impl Pipeline {
                     self.params_sent = true;
                 }
                 ready |= packet.keyframe;
-                ring.push(Arc::new(packet), shared.window(), shared.max_video_bytes);
+                let packet = Arc::new(packet);
+                // A continuous recording gets the same packets (`record`).
+                shared.tee(ring.params().as_ref(), &packet);
+                ring.push(packet, shared.window(), shared.max_video_bytes);
             }
             ready &= ring.len() > 0;
         }

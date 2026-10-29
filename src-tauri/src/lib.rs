@@ -13,7 +13,10 @@ mod mp4;
 mod names;
 mod overlay;
 mod persist;
+mod presence;
+mod recording;
 mod replay;
+mod screenshots;
 mod settings;
 mod shell;
 mod state;
@@ -81,14 +84,30 @@ pub fn run() {
             commands::probe_shard,
             commands::export_shard,
             commands::cancel_export,
+            commands::choose_export_path,
+            commands::reveal_export,
+            commands::get_presence,
             commands::get_encoder_info,
             commands::resolve_video,
             commands::list_microphones,
             commands::get_storage_info,
             commands::get_waveforms,
+            recording::start_recording,
+            recording::stop_recording,
+            screenshots::take_screenshot,
+            screenshots::list_screenshots,
+            screenshots::delete_screenshots,
+            screenshots::copy_screenshot,
+            screenshots::reveal_screenshot,
         ])
-        .run(context)
-        .expect("error while running Krak");
+        .build(context)
+        .expect("error while running Krak")
+        .run(|app, event| {
+            if let tauri::RunEvent::Exit = event {
+                // A recording going on is finished before the process ends.
+                recording::shutdown(app);
+            }
+        });
 }
 
 fn setup(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {
@@ -99,10 +118,15 @@ fn setup(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {
 
     update::activate_clips_dir(&handle, Path::new(&settings.clips_dir));
     update::sync_autostart(&handle, settings.launch_at_startup);
+    // Recordings a crash left behind are finished in the background.
+    recording::recover(&handle, Path::new(&settings.clips_dir));
+    recording::init(&handle);
     // Before the hotkey (which saves through it) and the tray (which shows the pause state).
     // Capture starts in the background.
     replay::init(&handle, &settings);
-    hotkey::register_initial(&handle, &settings.hotkey);
+    // After the replay (it shows its state); connects in the background.
+    presence::init(&handle);
+    hotkey::register_initial(&handle, &settings);
 
     // Windows are created only now (`create: false` in the config): their pages call commands
     // as soon as they load, and in release builds that is faster than this setup.

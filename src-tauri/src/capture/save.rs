@@ -19,9 +19,9 @@ use crate::media::codec::VideoPacket;
 use crate::media::mp4_writer::{self, AudioTrack, Colour, Options, VideoSample, VideoTrack};
 use crate::media::{ComGuard, MfGuard, TICKS_PER_SECOND};
 
-const MIC_BITRATE: u32 = 96_000;
+pub(super) const MIC_BITRATE: u32 = 96_000;
 /// Name collisions (another clip in the same second) retried before giving up.
-const MAX_ATTEMPTS: u32 = 20;
+pub(super) const MAX_ATTEMPTS: u32 = 20;
 
 /// Where and under which name to save.
 #[derive(Debug, Clone)]

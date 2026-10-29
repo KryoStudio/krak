@@ -34,8 +34,16 @@ pub fn watch(app: &AppHandle, dir: &Path) -> Option<ClipsWatcher> {
 }
 
 /// Ignores bursts on files still being written (a final `Any` follows once they settle) and
-/// changes to files that are not videos. Vanished paths count: they may be clips or folders.
+/// changes to files that are neither videos nor screenshots (PNGs: the frontend reloads both
+/// lists on `library-changed`), such as a recording's growing `.part`. Vanished paths count:
+/// they may be clips, screenshots or folders.
 fn is_relevant(event: &DebouncedEvent) -> bool {
     event.kind == DebouncedEventKind::Any
-        && !(event.path.is_file() && !library::is_video(&event.path))
+        && !(event.path.is_file() && !library::is_video(&event.path) && !is_png(&event.path))
+}
+
+fn is_png(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("png"))
 }

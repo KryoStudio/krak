@@ -1,6 +1,7 @@
 //! Clip file names: `<clipsDir>/<Game>/<Game> YYYY-MM-DD HH-MM-SS.mp4`, or
 //! `<clipsDir>/<Desktop> YYYY-MM-DD HH-MM-SS.mp4` without a game, with " (2)", " (3)"... on
-//! collision. `names::display_title` treats all of these as automatic names.
+//! collision. `names::display_title` treats all of these as automatic names. Screenshots follow
+//! the same scheme as PNGs under `<clipsDir>/Screenshots/`.
 
 use std::path::{Path, PathBuf};
 
@@ -44,8 +45,8 @@ impl std::fmt::Display for Stamp {
     }
 }
 
-/// Candidate path number `n` (1 = no suffix). `game` must already be a valid folder name
-/// (`names::sanitize_title`); an unusable desktop label falls back to "Desktop".
+/// Candidate clip path number `n` (see [`named_path`]).
+#[cfg(test)]
 pub fn clip_path(
     clips_dir: &Path,
     game: Option<&str>,
@@ -53,18 +54,31 @@ pub fn clip_path(
     stamp: Stamp,
     n: u32,
 ) -> PathBuf {
+    named_path(clips_dir, game, desktop_label, stamp, n, "mp4")
+}
+
+/// Candidate path number `n` (1 = no suffix). `game` must already be a valid folder name
+/// (`names::sanitize_title`); an unusable desktop label falls back to "Desktop".
+fn named_path(
+    dir: &Path,
+    game: Option<&str>,
+    desktop_label: &str,
+    stamp: Stamp,
+    n: u32,
+    extension: &str,
+) -> PathBuf {
     let suffix = if n > 1 {
         format!(" ({n})")
     } else {
         String::new()
     };
     match game {
-        Some(game) => clips_dir
+        Some(game) => dir
             .join(game)
-            .join(format!("{game} {stamp}{suffix}.mp4")),
+            .join(format!("{game} {stamp}{suffix}.{extension}")),
         None => {
             let label = names::sanitize_title(desktop_label).unwrap_or_else(|| "Desktop".into());
-            clips_dir.join(format!("{label} {stamp}{suffix}.mp4"))
+            dir.join(format!("{label} {stamp}{suffix}.{extension}"))
         }
     }
 }
@@ -78,9 +92,32 @@ pub fn free_clip_path(
     stamp: Stamp,
     first: u32,
 ) -> (PathBuf, u32) {
+    free_path(clips_dir, game, desktop_label, stamp, first, "mp4")
+}
+
+/// [`free_clip_path`] for a screenshot: `<screenshots_dir>/<Game>/<Game> <stamp>.png`, or
+/// `<screenshots_dir>/<Desktop> <stamp>.png`.
+pub fn free_screenshot_path(
+    screenshots_dir: &Path,
+    game: Option<&str>,
+    desktop_label: &str,
+    stamp: Stamp,
+    first: u32,
+) -> (PathBuf, u32) {
+    free_path(screenshots_dir, game, desktop_label, stamp, first, "png")
+}
+
+fn free_path(
+    dir: &Path,
+    game: Option<&str>,
+    desktop_label: &str,
+    stamp: Stamp,
+    first: u32,
+    extension: &str,
+) -> (PathBuf, u32) {
     let mut n = first.max(1);
     loop {
-        let path = clip_path(clips_dir, game, desktop_label, stamp, n);
+        let path = named_path(dir, game, desktop_label, stamp, n, extension);
         if n >= 999 || !(path.exists() || part_path(&path).exists()) {
             return (path, n);
         }
@@ -155,6 +192,16 @@ mod tests {
         );
         // Starting further (after a lost race) skips lower numbers.
         assert_eq!(free_clip_path(&dir, Some("Game"), "Desktop", STAMP, 5).1, 5);
+        // Screenshots: same names as PNGs; a clip of the same second does not collide.
+        let shots = dir.join("Screenshots");
+        assert_eq!(
+            free_screenshot_path(&shots, Some("Game"), "Desktop", STAMP, 1),
+            (shots.join("Game").join("Game 2026-10-08 09-05-03.png"), 1)
+        );
+        assert_eq!(
+            free_screenshot_path(&shots, None, "Bureau", STAMP, 2).0,
+            shots.join("Bureau 2026-10-08 09-05-03 (2).png")
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

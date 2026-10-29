@@ -9,7 +9,8 @@ use tauri_plugin_global_shortcut::Shortcut;
 use crate::persist;
 
 pub const DEFAULT_HOTKEY: &str = "F9";
-pub const DEFAULT_RECORD_HOTKEY: &str = "Alt+F9";
+/// Not Alt+F9: that is NVIDIA's own recording shortcut, often already taken.
+pub const DEFAULT_RECORD_HOTKEY: &str = "Shift+F9";
 pub const DEFAULT_SCREENSHOT_HOTKEY: &str = "Ctrl+F9";
 const DEFAULT_BUFFER_SECONDS: u32 = 30;
 const MIN_BUFFER_SECONDS: u32 = 10;
@@ -410,7 +411,7 @@ mod tests {
         assert_eq!(s.hotkey, "F9");
         assert_eq!(
             (s.record_hotkey.as_str(), s.screenshot_hotkey.as_str()),
-            ("Alt+F9", "Ctrl+F9")
+            ("Shift+F9", "Ctrl+F9")
         );
         assert_eq!(s.buffer_seconds, 30);
         assert_eq!(s.fps, 60);
@@ -449,7 +450,7 @@ mod tests {
         assert!(json["microphoneDevice"].is_null());
         assert!(json["storageLimitGb"].is_null());
         assert_eq!(json["onboarded"], false);
-        assert_eq!(json["recordHotkey"], "Alt+F9");
+        assert_eq!(json["recordHotkey"], "Shift+F9");
         assert_eq!(json["screenshotHotkey"], "Ctrl+F9");
         assert_eq!(json["discordPresence"], true);
         assert_eq!(json["watermark"], false);
@@ -640,7 +641,7 @@ mod tests {
         assert_eq!(s.hotkey, "F9");
         assert_eq!(
             (s.record_hotkey.as_str(), s.screenshot_hotkey.as_str()),
-            ("Alt+F9", "Ctrl+F9")
+            ("Shift+F9", "Ctrl+F9")
         );
         assert_eq!(s.clips_dir, defaults().clips_dir);
     }

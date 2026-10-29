@@ -106,6 +106,17 @@ impl AudioTimeline {
         }
     }
 
+    /// `frames` interleaved stereo frames from `from`, silence wherever nothing is held (the
+    /// same as `snapshot().read(..)`, without copying the track).
+    pub fn read(&self, from: i64, frames: usize) -> Vec<i16> {
+        let pieces = self
+            .chunks
+            .iter()
+            .map(|c| &c[..])
+            .chain([&self.current[..]]);
+        read_pieces(self.start, pieces, from, frames)
+    }
+
     pub fn snapshot(&self) -> AudioSnapshot {
         AudioSnapshot {
             start: self.start,
@@ -158,25 +169,36 @@ pub struct AudioSnapshot {
 impl AudioSnapshot {
     /// `frames` interleaved stereo frames from `from`, silence wherever nothing was recorded.
     pub fn read(&self, from: i64, frames: usize) -> Vec<i16> {
-        let mut out = vec![0i16; frames * CHANNELS];
-        let mut chunk_start = self.start;
         let pieces = self.chunks.iter().map(|c| &c[..]).chain([&self.tail[..]]);
-        for piece in pieces {
-            let len = i64::try_from(piece.len() / CHANNELS).unwrap_or(0);
-            let (lo, hi) = (
-                chunk_start.max(from),
-                (chunk_start + len).min(from + frames as i64),
-            );
-            if lo < hi {
-                let src = usize::try_from(lo - chunk_start).unwrap_or(0) * CHANNELS;
-                let dst = usize::try_from(lo - from).unwrap_or(0) * CHANNELS;
-                let n = usize::try_from(hi - lo).unwrap_or(0) * CHANNELS;
-                out[dst..dst + n].copy_from_slice(&piece[src..src + n]);
-            }
-            chunk_start += len;
-        }
-        out
+        read_pieces(self.start, pieces, from, frames)
     }
+}
+
+/// Reads `frames` frames from `from` out of consecutive pieces starting at `start`, silence
+/// wherever they hold nothing.
+fn read_pieces<'a>(
+    start: i64,
+    pieces: impl Iterator<Item = &'a [i16]>,
+    from: i64,
+    frames: usize,
+) -> Vec<i16> {
+    let mut out = vec![0i16; frames * CHANNELS];
+    let mut chunk_start = start;
+    for piece in pieces {
+        let len = i64::try_from(piece.len() / CHANNELS).unwrap_or(0);
+        let (lo, hi) = (
+            chunk_start.max(from),
+            (chunk_start + len).min(from + frames as i64),
+        );
+        if lo < hi {
+            let src = usize::try_from(lo - chunk_start).unwrap_or(0) * CHANNELS;
+            let dst = usize::try_from(lo - from).unwrap_or(0) * CHANNELS;
+            let n = usize::try_from(hi - lo).unwrap_or(0) * CHANNELS;
+            out[dst..dst + n].copy_from_slice(&piece[src..src + n]);
+        }
+        chunk_start += len;
+    }
+    out
 }
 
 #[cfg(test)]
@@ -279,6 +301,8 @@ mod tests {
         assert!(out[..6000].iter().all(|&s| s == 0));
         assert_eq!(out[6000], 5);
         let tail = left(&snap.read(239_990, 200));
+        assert_eq!(left(&t.read(239_990, 200)), tail, "same as a snapshot");
+        assert_eq!(left(&t.read(90_000, 20_000)), out);
         assert_eq!(tail[9], 10);
         assert_eq!(tail[10], 42);
         assert_eq!(tail[109], 42);

@@ -162,13 +162,17 @@ pub fn shard(
 pub type ClipFile = (PathBuf, String, Option<String>, Metadata);
 
 /// Every clip file in the clips folder and its first-level game folders (what the library
-/// shows: video extensions, no symlinks or junctions), unsorted.
+/// shows: video extensions, no symlinks or junctions), unsorted. The screenshots folder is
+/// not a game (`screenshots::FOLDER`).
 pub fn clip_files(clips_dir: &Path) -> Vec<ClipFile> {
     let mut found: Vec<ClipFile> = Vec::new();
     for (path, name, meta) in entries(clips_dir) {
         if meta.is_file() && is_video(&path) {
             found.push((path, name, None, meta));
-        } else if meta.is_dir() && !name.starts_with(['.', '$']) {
+        } else if meta.is_dir()
+            && !name.starts_with(['.', '$'])
+            && !name.eq_ignore_ascii_case(crate::screenshots::FOLDER)
+        {
             for (file, file_name, file_meta) in entries(&path) {
                 if file_meta.is_file() && is_video(&file) {
                     found.push((
@@ -344,6 +348,9 @@ mod tests {
         fs::write(root.join("Apex").join("Clutch.mkv"), b"x").expect("file");
         fs::write(root.join("Apex").join("notes.txt"), b"x").expect("file");
         fs::write(root.join("Apex").join("nested").join("deep.mp4"), b"x").expect("file");
+        // Never a game, even with a video in it.
+        fs::create_dir_all(root.join("Screenshots")).expect("dirs");
+        fs::write(root.join("Screenshots").join("stray.mp4"), b"x").expect("file");
 
         let favorites = BTreeSet::from(["Apex/Clutch.mkv".to_string()]);
         let mut cache = DurationCache::default();

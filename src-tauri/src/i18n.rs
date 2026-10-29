@@ -42,8 +42,6 @@ impl Rule {
     }
 }
 
-// TEMPORARY: until recording, screenshots and Discord presence use their labels.
-#[allow(dead_code)]
 pub struct Labels {
     rule: Rule,
     pub open_app: &'static str,
@@ -73,7 +71,6 @@ pub struct Labels {
     presence_today: Plural,
 }
 
-#[allow(dead_code)] // TEMPORARY, see above.
 impl Labels {
     /// "3 shards captured today", in the right form for `count`.
     pub fn shards_today(&self, count: u64) -> String {

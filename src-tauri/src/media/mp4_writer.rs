@@ -29,8 +29,8 @@ use super::{TICKS_PER_SECOND, rescale};
 /// Samples per AAC-LC frame.
 pub const AAC_FRAME_SAMPLES: u32 = 1024;
 
-const MOVIE_TIMESCALE: u32 = 1000;
-const VIDEO_TIMESCALE: u32 = 90_000;
+pub(super) const MOVIE_TIMESCALE: u32 = 1000;
+pub(super) const VIDEO_TIMESCALE: u32 = 90_000;
 /// Target chunk length used to interleave tracks.
 const CHUNK_TICKS: i64 = TICKS_PER_SECOND / 2;
 /// Seconds between 1904-01-01 (MP4 epoch) and 1970-01-01.
@@ -500,7 +500,7 @@ fn write_with<W: Write>(
 
 // --- Box writing ---
 
-fn boxed(out: &mut Vec<u8>, kind: &[u8; 4], body: impl FnOnce(&mut Vec<u8>)) {
+pub(super) fn boxed(out: &mut Vec<u8>, kind: &[u8; 4], body: impl FnOnce(&mut Vec<u8>)) {
     let start = out.len();
     out.extend_from_slice(&[0; 4]);
     out.extend_from_slice(kind);
@@ -509,7 +509,7 @@ fn boxed(out: &mut Vec<u8>, kind: &[u8; 4], body: impl FnOnce(&mut Vec<u8>)) {
     out[start..start + 4].copy_from_slice(&size.to_be_bytes());
 }
 
-fn full(
+pub(super) fn full(
     out: &mut Vec<u8>,
     kind: &[u8; 4],
     version: u8,
@@ -523,7 +523,7 @@ fn full(
     });
 }
 
-trait Put {
+pub(super) trait Put {
     fn u16(&mut self, v: u16);
     fn u32(&mut self, v: u32);
     fn u64(&mut self, v: u64);
@@ -546,7 +546,7 @@ impl Put for Vec<u8> {
 }
 
 /// Unity transformation matrix (16.16 / 2.30 fixed point).
-const MATRIX: [u32; 9] = [0x0001_0000, 0, 0, 0, 0x0001_0000, 0, 0, 0, 0x4000_0000];
+pub(super) const MATRIX: [u32; 9] = [0x0001_0000, 0, 0, 0, 0x0001_0000, 0, 0, 0, 0x4000_0000];
 
 fn ftyp(codec: VideoCodec, signed_offsets: bool) -> Vec<u8> {
     let mut out = Vec::new();
@@ -569,7 +569,7 @@ fn ftyp(codec: VideoCodec, signed_offsets: bool) -> Vec<u8> {
     out
 }
 
-fn mp4_now() -> u64 {
+pub(super) fn mp4_now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_secs())
@@ -577,7 +577,7 @@ fn mp4_now() -> u64 {
 }
 
 /// Writes a (creation, modification, timescale, duration) header in v0 or v1 form.
-fn times(b: &mut Vec<u8>, v1: bool, now: u64, timescale: u32, duration: u64) {
+pub(super) fn times(b: &mut Vec<u8>, v1: bool, now: u64, timescale: u32, duration: u64) {
     if v1 {
         b.u64(now);
         b.u64(now);
@@ -806,7 +806,7 @@ fn offset_runs(offsets: &[i32]) -> Vec<(u32, i32)> {
     runs
 }
 
-fn render_visual(
+pub(super) fn render_visual(
     b: &mut Vec<u8>,
     codec: VideoCodec,
     record: &[u8],
@@ -849,7 +849,7 @@ fn render_visual(
     });
 }
 
-fn render_mp4a(b: &mut Vec<u8>, audio: &AudioTrack) {
+pub(super) fn render_mp4a(b: &mut Vec<u8>, audio: &AudioTrack) {
     boxed(b, b"mp4a", |b| {
         b.zeros(6);
         b.u16(1); // data_reference_index

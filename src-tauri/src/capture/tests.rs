@@ -31,6 +31,8 @@ struct Seen {
     statuses: Vec<CaptureStatus>,
     saved: Option<PathBuf>,
     failed: Option<&'static str>,
+    recordings: Vec<PathBuf>,
+    recording_failed: Option<&'static str>,
 }
 
 impl EngineEvents for Recorder {
@@ -47,6 +49,18 @@ impl EngineEvents for Recorder {
 
     fn save_failed(&self, code: &'static str) {
         lock(&self.events).failed = Some(code);
+        self.changed.notify_all();
+    }
+
+    fn recording_saved(&self, path: &Path) {
+        lock(&self.events).recordings.push(path.to_path_buf());
+        self.changed.notify_all();
+    }
+
+    fn recording_failed(&self, code: &'static str, kept: Option<&Path>) {
+        let mut seen = lock(&self.events);
+        seen.recording_failed = Some(code);
+        seen.recordings.extend(kept.map(Path::to_path_buf));
         self.changed.notify_all();
     }
 }
@@ -333,6 +347,168 @@ fn engine_end_to_end_with_microphone() {
 #[ignore = "records the screen with the software encoder (silently); run with --ignored"]
 fn engine_end_to_end_software() {
     run("Software", video(Quality::High, 60), false, true);
+}
+
+/// Checks a recording like `run` checks clips, with Media Foundation: one video stream and
+/// `audio` AAC streams, every frame decoding one tick apart, the audio covering the video.
+/// Returns the duration.
+fn check_recording(path: &Path, audio: usize, fps: u32) -> f64 {
+    let info = testing::probe(path);
+    let video: Vec<_> = info
+        .streams
+        .iter()
+        .filter(|s| s.major == MFMediaType_Video)
+        .collect();
+    assert_eq!(video.len(), 1, "one video stream");
+    let sound = info
+        .streams
+        .iter()
+        .filter(|s| s.major == MFMediaType_Audio && s.subtype == MFAudioFormat_AAC)
+        .count();
+    assert_eq!(sound, audio, "audio streams");
+    let movie = crate::editor::demux::open(path).expect("demux");
+    let samples = movie.video().expect("video").samples.len();
+    let frames = testing::decode_video_timestamps(path, false);
+    let frame = TICKS_PER_SECOND / i64::from(fps);
+    let gaps: Vec<i64> = frames.windows(2).map(|w| w[1] - w[0]).collect();
+    let regular = gaps.iter().filter(|&&g| (g - frame).abs() <= 2_000).count();
+    println!(
+        "{}: {:.2} s, MF decoded {}/{samples} frames, {regular}/{} gaps regular, max {:.1} ms",
+        path.display(),
+        info.duration,
+        frames.len(),
+        gaps.len(),
+        gaps.iter().max().copied().unwrap_or(0) as f64 / 1e4
+    );
+    assert_eq!(frames.len(), samples, "every frame decodes");
+    assert!(gaps.iter().all(|&g| g > 0), "presentation order");
+    assert!(regular * 100 >= gaps.len() * 97, "frames one tick apart");
+    let (pcm, channels) = testing::decode_audio(path, 0);
+    let audio_seconds = pcm.len() as f64 / f64::from(channels) / 48_000.0;
+    assert!(
+        (audio_seconds - info.duration).abs() < 0.15,
+        "audio {audio_seconds} s vs {} s",
+        info.duration
+    );
+    info.duration
+}
+
+/// Continuous recording on the real engine: ~7 s recorded while the replay keeps working (a
+/// clip saved in the middle) and a screenshot is read from the running pipeline; the status
+/// counts; the file is checked like clips. A copy of the file taken mid-recording (what a
+/// crash leaves, possibly with a torn fragment) is recovered and checked too.
+#[test]
+#[ignore = "records the screen (silently); needs a display, GPU and audio (run with --ignored)"]
+fn engine_records_continuously() {
+    let _com = ComGuard::new();
+    let _mf = MfGuard::new().expect("media foundation");
+    let dir = out_dir().join(format!("recording-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("dir");
+    let recorder = Arc::new(Recorder::default());
+    let config = EngineConfig {
+        video: video(Quality::High, 60),
+        audio_bitrate: 192_000,
+        buffer_seconds: 10,
+        microphone: false,
+        microphone_device: None,
+    };
+    let engine = Engine::start(config, recorder.clone());
+    recorder
+        .wait(Duration::from_secs(10), |seen| {
+            seen.statuses
+                .iter()
+                .any(|s| s.state == CaptureState::Ready)
+                .then_some(())
+        })
+        .expect("engine never became ready");
+    std::thread::sleep(Duration::from_secs(1));
+    let request = |label: &str| SaveRequest {
+        clips_dir: dir.clone(),
+        game: None,
+        desktop_label: label.into(),
+        stamp: Stamp::now(),
+    };
+    let started = Instant::now();
+    engine
+        .start_recording(request("Recording"), RecordingStatus::default())
+        .expect("recording starts");
+    engine
+        .start_recording(request("Twice"), RecordingStatus::default())
+        .expect("already recording: nothing changes");
+    std::thread::sleep(Duration::from_secs(2));
+
+    // A screenshot from the pipeline while it encodes.
+    let display = crate::media::d3d::primary_display().expect("display");
+    let read_at = Instant::now();
+    let image = engine
+        .screen()
+        .expect("pipeline image")
+        .read()
+        .expect("read");
+    println!(
+        "screenshot {}x{} read in {:.1} ms",
+        image.width,
+        image.height,
+        read_at.elapsed().as_secs_f64() * 1000.0
+    );
+    assert_eq!((image.width, image.height), (display.width, display.height));
+    drop(image);
+
+    // The replay keeps saving clips meanwhile.
+    engine.save(request("Clip")).expect("save accepted");
+    let clip = recorder
+        .wait(Duration::from_secs(30), |seen| seen.saved.clone())
+        .expect("clip saved");
+    println!("clip during the recording: {}", clip.display());
+
+    // What a crash would leave now.
+    std::thread::sleep(Duration::from_secs(3));
+    let part = std::fs::read_dir(&dir)
+        .expect("dir")
+        .flatten()
+        .map(|e| e.path())
+        .find(|p| p.to_string_lossy().ends_with(".mp4.part"))
+        .expect("the recording being written");
+    let crashed = dir.join("Crashed.mp4.part");
+    std::fs::copy(&part, &crashed).expect("copy");
+
+    std::thread::sleep(Duration::from_secs(1));
+    let status = engine.status();
+    println!("while recording: {:?}", status.recording);
+    let live = status.recording.expect("recording in the status");
+    assert!(live.seconds > 6.0 && live.bytes > 0, "{live:?}");
+    engine.stop_recording();
+    assert!(engine.status().recording.is_none());
+    let recorded = started.elapsed().as_secs_f64();
+    let path = recorder
+        .wait(Duration::from_secs(10), |seen| {
+            seen.recordings.first().cloned()
+        })
+        .expect("recording saved");
+    assert_eq!(lock(&recorder.events).recording_failed, None);
+    assert!(!part.exists(), "renamed once finished");
+    drop(engine);
+
+    let duration = check_recording(&path, 1, 60);
+    // From the newest keyframe before the start (up to a second) to the stop.
+    assert!(
+        duration > recorded - 0.5 && duration < recorded + 1.2,
+        "{duration} s for {recorded:.2} s"
+    );
+    assert_eq!(
+        crate::media::mp4_stream::recover(&path).ok(),
+        Some(crate::media::mp4_stream::Recovered::AlreadyFinished),
+        "a plain MP4 already"
+    );
+
+    let recovered = crate::media::mp4_stream::recover(&crashed).expect("recover");
+    println!("crash copy: {recovered:?}");
+    let duration = check_recording(&crashed, 1, 60);
+    assert!(duration > 4.0, "{duration} s kept");
+
+    if std::env::var_os("KRYO_E2E_OUT").is_none() {
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 /// A/V sync through the real save path with B-frames: NVENC encodes black frames with one

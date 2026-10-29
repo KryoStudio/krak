@@ -1,6 +1,7 @@
 //! Connects the capture engine to the app: starts it at launch (in the background), restarts
 //! it when capture settings change, pause/resume, saves on the hotkey, and the events:
 //! `capture-status` (CaptureStatus), `shard-saved` (Shard) and `capture-failed` (code).
+//! A continuous recording goes on across restarts (`crate::recording`).
 //!
 //! Starting and stopping happen on one control thread: stopping joins the engine's threads,
 //! which must never happen on the main thread (engine callbacks may need it).
@@ -19,7 +20,7 @@ use crate::capture::{
 };
 use crate::settings::Settings;
 use crate::state::{AppState, lock};
-use crate::{i18n, library, storage, tray};
+use crate::{i18n, library, recording, storage, tray};
 
 pub const CAPTURE_STATUS: &str = "capture-status";
 pub const SHARD_SAVED: &str = "shard-saved";
@@ -99,11 +100,14 @@ fn control_loop(app: &AppHandle, rx: &Receiver<Control>) {
         }
         let replay = app.state::<Replay>();
         let previous = lock(&replay.engine).take();
+        // What a recording going on has recorded so far (its file is finished on its own).
+        let recorded = previous.as_ref().and_then(|e| e.status().recording);
         drop(previous); // joins the old engine's threads, outside the lock
         match message {
             Control::Start(config) if !replay.is_paused() => {
                 let events = Arc::new(AppEvents { app: app.clone() });
                 let engine = Engine::start(config, events);
+                recording::engine_started(app, &engine, recorded.unwrap_or_default());
                 *lock(&replay.engine) = Some(engine);
             }
             _ => {
@@ -124,9 +128,20 @@ pub fn status(app: &AppHandle) -> CaptureStatus {
     )
 }
 
+/// Runs `f` with the engine (`None` while paused or restarting), engine locked: keep it short.
+pub fn with_engine<R>(app: &AppHandle, f: impl FnOnce(Option<&Engine>) -> R) -> R {
+    let replay = app.state::<Replay>();
+    let engine = lock(&replay.engine);
+    f(engine.as_ref().filter(|_| !replay.is_paused()))
+}
+
 /// Pause stops capture and frees the buffers; resume starts again (also a retry after an error).
+/// Pausing ends a continuous recording (its file is saved).
 pub fn set_paused(app: &AppHandle, paused: bool) -> CaptureStatus {
     let replay = app.state::<Replay>();
+    if paused && !replay.is_paused() {
+        recording::end(app);
+    }
     if replay.paused.swap(paused, Ordering::SeqCst) != paused {
         if paused {
             replay.send(Control::Stop);
@@ -221,10 +236,18 @@ impl EngineEvents for AppEvents {
     fn save_failed(&self, code: &'static str) {
         let _ = self.app.emit(CAPTURE_FAILED, code);
     }
+
+    fn recording_saved(&self, path: &Path) {
+        recording::saved(&self.app, path);
+    }
+
+    fn recording_failed(&self, code: &'static str, kept: Option<&Path>) {
+        recording::failed(&self.app, code, kept);
+    }
 }
 
 /// `<clipsDir>/Game/clip.mp4` -> `Game/clip.mp4`.
-fn shard_id(clips_dir: &Path, path: &Path) -> Option<String> {
+pub fn shard_id(clips_dir: &Path, path: &Path) -> Option<String> {
     let rel = path.strip_prefix(clips_dir).ok()?;
     let parts: Option<Vec<&str>> = rel
         .components()

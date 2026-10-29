@@ -71,6 +71,9 @@ pub fn encode_with(
 }
 
 #[cfg(windows)]
+pub use imp::StreamEncoder;
+
+#[cfg(windows)]
 mod imp {
     use windows::Win32::Media::MediaFoundation::{
         AACMFTEncoder, IMFTransform, MF_E_NOTACCEPTING, MF_MT_AAC_AUDIO_PROFILE_LEVEL_INDICATION,
@@ -200,6 +203,166 @@ mod imp {
             asc: asc.to_vec(),
             frames,
         })
+    }
+
+    /// [`super::encode`] for audio that arrives as it is captured (continuous recording): PCM
+    /// in as it comes, whole AAC frames out as the encoder makes them, aligned the same way
+    /// (frame `n` covers input samples `n * 1024 .. (n + 1) * 1024`, see the module docs).
+    pub struct StreamEncoder {
+        transform: IMFTransform,
+        alloc: OutputAlloc,
+        config: AacConfig,
+        /// Input frames (samples per channel) still to skip: the encoder delay.
+        skip: usize,
+        /// Input frames pushed so far, skipped ones included.
+        total: usize,
+        /// Frames fed to the encoder so far.
+        fed: usize,
+        /// AAC frames handed out so far.
+        produced: usize,
+        /// Frames the encoder made while it would not take input yet.
+        held: Vec<Vec<u8>>,
+    }
+
+    impl StreamEncoder {
+        /// The caller has initialized COM and Media Foundation on this thread, and keeps using
+        /// the encoder there.
+        pub fn new(config: AacConfig) -> MediaResult<Self> {
+            if config.channels == 0 || config.channels > 2 {
+                return Err(MediaError::new(FAILED));
+            }
+            audio_specific_config(config.sample_rate, config.channels)
+                .ok_or(MediaError::new(FAILED))?;
+            // SAFETY: COM calls on a freshly created MFT owned by the encoder.
+            let transform: IMFTransform =
+                unsafe { CoCreateInstance(&AACMFTEncoder, None, CLSCTX_INPROC_SERVER) }
+                    .code("no_aac_encoder")?;
+            configure(&transform, config).code(FAILED)?;
+            let alloc = OutputAlloc::query(&transform).code(FAILED)?;
+            // SAFETY: see above.
+            unsafe {
+                transform
+                    .ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0)
+                    .code(FAILED)?;
+                transform
+                    .ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0)
+                    .code(FAILED)?;
+            }
+            Ok(Self {
+                transform,
+                alloc,
+                config,
+                skip: super::ENCODER_DELAY,
+                total: 0,
+                fed: 0,
+                produced: 0,
+                held: Vec::new(),
+            })
+        }
+
+        /// AudioSpecificConfig of the stream.
+        pub fn asc(&self) -> Vec<u8> {
+            audio_specific_config(self.config.sample_rate, self.config.channels)
+                .map_or_else(Vec::new, |asc| asc.to_vec())
+        }
+
+        /// Encodes interleaved PCM (whole frames); appends the AAC frames now ready to `out`.
+        pub fn push(&mut self, pcm: &[i16], out: &mut Vec<Vec<u8>>) -> MediaResult<()> {
+            let channels = usize::from(self.config.channels);
+            if !pcm.len().is_multiple_of(channels) {
+                return Err(MediaError::new(FAILED));
+            }
+            self.total += pcm.len() / channels;
+            let skip = (self.skip * channels).min(pcm.len());
+            self.skip -= skip / channels;
+            self.feed(&pcm[skip..])?;
+            self.take(out)
+        }
+
+        /// Flushes the encoder: `out` gets the last frames, exactly `ceil(pushed / 1024)` in
+        /// all (the padding that flushes them is cut).
+        pub fn finish(mut self, out: &mut Vec<Vec<u8>>) -> MediaResult<()> {
+            let channels = usize::from(self.config.channels);
+            // The delay, plus one frame of silence so the last real samples come out whole.
+            let padding = (super::ENCODER_DELAY + FRAME_SAMPLES) * channels;
+            self.feed(&vec![0; padding])?;
+            // SAFETY: see `new`.
+            unsafe {
+                self.transform
+                    .ProcessMessage(MFT_MESSAGE_COMMAND_DRAIN, 0)
+                    .code(FAILED)?;
+            }
+            self.take(out)?;
+            // SAFETY: see `new`.
+            unsafe {
+                let _ = self
+                    .transform
+                    .ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0);
+                let _ = self
+                    .transform
+                    .ProcessMessage(MFT_MESSAGE_NOTIFY_END_STREAMING, 0);
+            }
+            // Fewer would mean the encoder lost data.
+            if self.produced < self.total.div_ceil(FRAME_SAMPLES) {
+                return Err(MediaError::new(FAILED));
+            }
+            Ok(())
+        }
+
+        fn feed(&mut self, pcm: &[i16]) -> MediaResult<()> {
+            let channels = usize::from(self.config.channels);
+            if pcm.is_empty() {
+                return Ok(());
+            }
+            let rate = i64::from(self.config.sample_rate);
+            let bytes: Vec<u8> = pcm.iter().flat_map(|s| s.to_le_bytes()).collect();
+            let sample = memory_sample(&bytes).code(FAILED)?;
+            let frames = pcm.len() / channels;
+            let at =
+                |n: usize| rescale(i64::try_from(n).unwrap_or(i64::MAX), rate, TICKS_PER_SECOND);
+            // SAFETY: valid sample, owned by us.
+            unsafe {
+                sample.SetSampleTime(at(self.fed)).code(FAILED)?;
+                sample.SetSampleDuration(at(frames)).code(FAILED)?;
+            }
+            let mut pending = Vec::new();
+            loop {
+                // SAFETY: stream 0, valid sample.
+                match unsafe { self.transform.ProcessInput(0, &sample, 0) } {
+                    Ok(()) => break,
+                    Err(err) if err.code() == MF_E_NOTACCEPTING => {
+                        if !pull(&self.transform, &self.alloc, &mut pending)? {
+                            return Err(MediaError {
+                                code: FAILED,
+                                hresult: err.code().0,
+                            });
+                        }
+                    }
+                    Err(err) => {
+                        return Err(MediaError {
+                            code: FAILED,
+                            hresult: err.code().0,
+                        });
+                    }
+                }
+            }
+            self.fed += frames;
+            self.held.extend(pending);
+            Ok(())
+        }
+
+        /// Hands out what the encoder made, never more than the input covers.
+        fn take(&mut self, out: &mut Vec<Vec<u8>>) -> MediaResult<()> {
+            pull(&self.transform, &self.alloc, &mut self.held)?;
+            let wanted = self.total.div_ceil(FRAME_SAMPLES);
+            for frame in self.held.drain(..) {
+                if self.produced < wanted {
+                    out.push(frame);
+                    self.produced += 1;
+                }
+            }
+            Ok(())
+        }
     }
 
     /// Collects every available output frame. Returns whether at least one was produced.
@@ -383,6 +546,55 @@ mod tests {
             assert_eq!(left, right);
             assert_eq!(usize::try_from(left).ok(), Some(ENCODER_DELAY));
             assert_eq!(decoded, frames * FRAME_SAMPLES);
+        }
+
+        /// The streaming encoder (fed in uneven pieces, like a recording) makes the same frames
+        /// as the one-shot encoder, as many, so the two are interchangeable.
+        #[test]
+        #[ignore = "needs the Media Foundation AAC encoder; run with --ignored"]
+        fn streaming_matches_one_shot_encoding() {
+            let _com = ComGuard::new();
+            let _mf = MfGuard::new().expect("mf");
+            let pcm = burst();
+            for channels in [2u16, 1] {
+                let pcm: Vec<i16> = if channels == 2 {
+                    pcm.clone()
+                } else {
+                    pcm.iter().step_by(2).copied().collect()
+                };
+                let config = AacConfig {
+                    sample_rate: 48_000,
+                    channels,
+                    bitrate: if channels == 2 { 192_000 } else { 96_000 },
+                };
+                let whole = encode(&pcm, config).expect("encode");
+                let mut stream = StreamEncoder::new(config).expect("stream");
+                assert_eq!(stream.asc(), whole.asc);
+                let mut frames = Vec::new();
+                let step = usize::from(channels);
+                let mut at = 0;
+                for (i, size) in [4800usize, 333, 12_000, 1, 1024, 7777]
+                    .iter()
+                    .cycle()
+                    .enumerate()
+                {
+                    if at >= pcm.len() || i > 1000 {
+                        break;
+                    }
+                    let end = (at + size * step).min(pcm.len());
+                    stream.push(&pcm[at..end], &mut frames).expect("push");
+                    at = end;
+                }
+                stream.finish(&mut frames).expect("finish");
+                assert_eq!(frames.len(), whole.frames.len(), "{channels} channels");
+                let same = frames
+                    .iter()
+                    .zip(&whole.frames)
+                    .filter(|(a, b)| a == b)
+                    .count();
+                println!("{channels} ch: {} frames, {same} identical", frames.len());
+                assert_eq!(same, frames.len(), "{channels} channels");
+            }
         }
 
         #[test]

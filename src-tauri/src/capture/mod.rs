@@ -6,8 +6,11 @@
 //!   adapter's Media Foundation H.264 encoder, else the software one, into a ring of whole GOPs;
 //! - audio: WASAPI loopback of the default output (and the chosen or default microphone when
 //!   enabled) into continuous PCM timelines on the same clock;
-//! - one short-lived thread per save, which mixes and encodes the audio and writes the MP4.
+//! - one short-lived thread per save, which mixes and encodes the audio and writes the MP4;
+//! - during a continuous recording, one more thread that gets every video packet the ring gets
+//!   and encodes the audio as it comes into a growing MP4 (`record`).
 //!
+//! Screenshots read the video thread's copy of the desktop (`screenshot`).
 //! An audio failure never stops video: it is only reported in the status.
 
 pub mod audio;
@@ -18,8 +21,10 @@ pub mod game;
 pub mod naming;
 mod pcm;
 pub mod quality;
+mod record;
 mod ring;
 mod save;
+pub mod screenshot;
 pub mod sound;
 #[cfg(test)]
 mod tests;
@@ -42,6 +47,7 @@ use crate::state::lock;
 pub use quality::{Backend, VideoSettings};
 
 pub use naming::Stamp;
+pub use record::wait_idle as wait_for_recordings;
 pub use save::SaveRequest;
 
 use ring::VideoRing;
@@ -131,6 +137,16 @@ pub trait EngineEvents: Send + Sync + 'static {
     fn saved(&self, path: &Path);
     /// "write_failed" | "encode_failed".
     fn save_failed(&self, code: &'static str);
+    /// A part of the continuous recording is finished (the recording may go on in a new one).
+    /// Listeners that never record can ignore it.
+    fn recording_saved(&self, path: &Path) {
+        let _ = path;
+    }
+    /// The recording stopped: "write_failed" | "encode_failed". `kept` is the file finished
+    /// with what was written, if any.
+    fn recording_failed(&self, code: &'static str, kept: Option<&Path>) {
+        let _ = (code, kept);
+    }
 }
 
 /// The status fields threads change; buffer figures are computed on demand.
@@ -163,9 +179,39 @@ struct Shared {
     mic_audio: Option<Mutex<AudioTimeline>>,
     status: Mutex<Status>,
     events: Arc<dyn EngineEvents>,
+    /// The running continuous recording's end of the tee (`record`).
+    recorder: Mutex<Option<record::Tee>>,
+    /// A recording is running (checked by the video thread without taking a lock).
+    recording: AtomicBool,
+    /// The video pipeline's desktop copy while it runs (`screenshot`).
+    screen: Mutex<Option<screenshot::Source>>,
 }
 
 impl Shared {
+    /// Empty buffers whose audio timelines start now.
+    fn new(config: EngineConfig, events: Arc<dyn EngineEvents>) -> Self {
+        let now = timeline::position(clock::now());
+        let keep = i64::from(config.buffer_seconds + AUDIO_MARGIN_SECONDS)
+            * i64::from(timeline::SAMPLE_RATE);
+        let microphone = config.microphone;
+        let buffer_seconds = config.buffer_seconds;
+        Self {
+            config,
+            buffer_seconds: AtomicU32::new(buffer_seconds),
+            tier: AtomicU8::new(0),
+            max_video_bytes: video_memory_cap(),
+            stop: AtomicBool::new(false),
+            video: Mutex::default(),
+            game_audio: Mutex::new(AudioTimeline::new(now, keep)),
+            mic_audio: microphone.then(|| Mutex::new(AudioTimeline::new(now, keep))),
+            status: Mutex::default(),
+            events,
+            recorder: Mutex::default(),
+            recording: AtomicBool::new(false),
+            screen: Mutex::default(),
+        }
+    }
+
     fn stopping(&self) -> bool {
         self.stop.load(Ordering::Relaxed)
     }
@@ -236,8 +282,7 @@ impl Shared {
             ten_bit: status.ten_bit,
             bitrate: status.bitrate,
             backend: status.backend,
-            // TODO(recording): filled once continuous recording exists.
-            recording: None,
+            recording: lock(&self.recorder).as_ref().map(record::Tee::status),
         }
     }
 }
@@ -252,23 +297,8 @@ pub struct Engine {
 impl Engine {
     /// Starts capturing in the background; returns at once (state "starting").
     pub fn start(config: EngineConfig, events: Arc<dyn EngineEvents>) -> Self {
-        let now = timeline::position(clock::now());
-        let keep = i64::from(config.buffer_seconds + AUDIO_MARGIN_SECONDS)
-            * i64::from(timeline::SAMPLE_RATE);
         let microphone = config.microphone;
-        let buffer_seconds = config.buffer_seconds;
-        let shared = Arc::new(Shared {
-            config,
-            buffer_seconds: AtomicU32::new(buffer_seconds),
-            tier: AtomicU8::new(0),
-            max_video_bytes: video_memory_cap(),
-            stop: AtomicBool::new(false),
-            video: Mutex::default(),
-            game_audio: Mutex::new(AudioTimeline::new(now, keep)),
-            mic_audio: microphone.then(|| Mutex::new(AudioTimeline::new(now, keep))),
-            status: Mutex::default(),
-            events,
-        });
+        let shared = Arc::new(Shared::new(config, events));
         shared.events.status_changed(&shared.status());
 
         let mut threads = Vec::new();

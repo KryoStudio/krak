@@ -112,6 +112,13 @@ impl VideoRing {
         self.packets.range(start..end).cloned().collect()
     }
 
+    /// Every packet from the newest keyframe on: where a continuous recording starts (the
+    /// packets that follow are pushed after these).
+    pub fn since_last_keyframe(&self) -> Vec<Arc<VideoPacket>> {
+        let start = self.packets.iter().rposition(|p| p.keyframe).unwrap_or(0);
+        self.packets.range(start..).cloned().collect()
+    }
+
     /// Length (100 ns) of the clip `snapshot` would give, counting `frame` for the last picture.
     pub fn span(&self, now: i64, window: i64, frame: i64) -> i64 {
         let Some((start, end)) = self.range(now, window) else {
@@ -196,6 +203,11 @@ mod tests {
         // Packets after `now` are left out.
         assert_eq!(short.snapshot(S, 5 * S).len(), 11);
         assert!(VideoRing::default().snapshot(S, S).is_empty());
+        // A recording starts at the newest keyframe (19 s), with everything after it.
+        let tail = ring.since_last_keyframe();
+        assert_eq!((tail.len(), tail[0].pts), (10, 19 * S));
+        assert!(tail[0].keyframe);
+        assert!(VideoRing::default().since_last_keyframe().is_empty());
         assert_eq!(VideoRing::default().span(S, S, 1), 0);
     }
 
