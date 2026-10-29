@@ -357,7 +357,7 @@
       filter var(--fast);
   }
   .button:hover {
-    background: #2a2b31;
+    background: var(--surface-4);
   }
   .button.primary {
     color: var(--accent-fg);

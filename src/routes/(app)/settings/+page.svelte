@@ -778,7 +778,7 @@
     transition: background var(--fast);
   }
   .button:hover:not(:disabled) {
-    background: #2a2b31;
+    background: var(--surface-4);
   }
   .button:disabled {
     opacity: 0.45;

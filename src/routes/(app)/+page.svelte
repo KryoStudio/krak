@@ -38,6 +38,9 @@
     const key = `capture.error.${status.error}`;
     return t(hasKey(key) ? key : 'capture.error.capture_failed');
   });
+  // "Press F9 to keep what just happened": the sentence in the language's own order, split where
+  // the shortcut goes.
+  const keepLine = $derived(t('home.keepLine', { key: '\u0000' }).split('\u0000'));
   const fill = $derived(status.state === 'ready' ? Math.min(1, status.bufferedSeconds / settings.value.bufferSeconds) : 0);
   // The format being recorded. Paused or restarting, the last one stays (dimmed), so the card
   // keeps its height and nothing below it jumps.
@@ -106,9 +109,9 @@
         <p class="press error">{errorLine}</p>
       {:else}
         <p class="press">
-          {t('home.press')}
-          {#each formatHotkey(settings.value.hotkey) as key, i (i)}{#if i > 0}<span class="plus">+</span>{/if}<kbd>{key}</kbd>{/each}
-          {t('home.toCapture')}
+          {#if keepLine[0]}<span>{keepLine[0]}</span>{/if}
+          <span class="keys">{#each formatHotkey(settings.value.hotkey) as key, i (i)}{#if i > 0}<span class="plus">+</span>{/if}<kbd>{key}</kbd>{/each}</span>
+          {#if keepLine[1]}<span>{keepLine[1]}</span>{/if}
         </p>
       {/if}
       <button
@@ -156,6 +159,7 @@
           </button>
         {/if}
       </div>
+      <p class="side-note">{t('home.recordCaption')}</p>
     </div>
     {#if fill > 0 && fill < 1}<span class="fill" style:transform="scaleX({fill})"></span>{/if}
   </section>
@@ -332,7 +336,19 @@
     font-size: 13px;
     color: var(--text);
   }
+  .keys {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+  }
   .plus {
+    color: var(--text-3);
+  }
+  /* Under the record button: what it does, next to "Capture" that keeps the past. */
+  .side-note {
+    font-size: 11.5px;
+    line-height: 1.35;
+    text-align: center;
     color: var(--text-3);
   }
   /* Same height as the shortcut line it replaces. */
@@ -596,7 +612,7 @@
     transition: background var(--fast);
   }
   .button:hover {
-    background: #2a2b31;
+    background: var(--surface-4);
   }
 
   .stats {

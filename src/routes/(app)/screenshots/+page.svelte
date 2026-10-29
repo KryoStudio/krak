@@ -265,12 +265,13 @@
         <span>{formatAge(viewing.createdAt)} · {viewing.width}×{viewing.height} · {formatSize(viewing.size)}</span>
       </div>
       {#if !isCropping}
-      <button class="icon-btn" onclick={() => viewing && startCrop(viewing)} aria-label={t('screens.crop')} use:tooltip={{ text: `${t('screens.crop')} · R`, side: 'bottom' }}>
-        <Icon name="crop" size={16} />
+      <button class="text-btn solid" onclick={() => viewing && startCrop(viewing)} use:tooltip={{ text: 'R', side: 'bottom' }}>
+        <Icon name="crop" size={14} />{t('screens.crop')}
       </button>
-      <button class="icon-btn" onclick={() => viewing && screens.copy(viewing)} aria-label={t('screens.copy')} use:tooltip={{ text: `${t('screens.copy')} · Ctrl+C`, side: 'bottom' }}>
-        <Icon name="copy" size={16} />
+      <button class="text-btn solid" onclick={() => viewing && screens.copy(viewing)} use:tooltip={{ text: `${t('toast.copiedBody')} · Ctrl+C`, side: 'bottom' }}>
+        <Icon name="copy" size={14} />{t('screens.copy')}
       </button>
+      <span class="divider"></span>
       <button class="icon-btn" onclick={() => viewing && screens.reveal(viewing)} aria-label={t('shard.reveal')} use:tooltip={{ text: t('shard.reveal'), side: 'bottom' }}>
         <Icon name="folder" size={16} />
       </button>
@@ -574,6 +575,12 @@
   .back:active,
   .text-btn:active:not(:disabled) {
     transform: scale(0.97);
+  }
+  .divider {
+    width: 1px;
+    height: 18px;
+    margin: 0 4px;
+    background: var(--border-strong);
   }
   .crop-bar {
     display: flex;

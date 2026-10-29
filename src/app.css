@@ -2,15 +2,17 @@
   /* Krak — Nuit / Givre / Glacier. Surfaces from the page up to popovers. */
   --bg: #06090d;
   --bg-raised: #0a0e14;
-  --surface: #0a0e14;
-  --surface-2: #10161f;
-  --surface-3: #1b2430;
-  --border: #141b25;
-  --border-strong: #1b2430;
+  /* Each step a notch lighter than the page, so cards and panels stand out from it. */
+  --surface: #0d1219;
+  --surface-2: #131a24;
+  --surface-3: #1d2734;
+  --surface-4: #273242;
+  --border: #19212c;
+  --border-strong: #243042;
 
   --text: #e8f1f2;
-  --text-2: #b3bec7;
-  --text-3: #7c8794;
+  --text-2: #bdc7cf;
+  --text-3: #8b96a3;
 
   /* One accent, used sparingly. Overridden by [data-accent]. */
   --accent: #7fc6db;

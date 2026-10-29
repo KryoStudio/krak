@@ -71,9 +71,13 @@
         <p>{actions.gameName(shard)} · {formatAge(shard.createdAt)} · {formatSize(shard.size)}</p>
       </div>
       <div class="tools">
-        <button class="edit" class:on={ui.editing} onclick={() => (ui.editing = !ui.editing)} aria-pressed={ui.editing}>
+        <button class="pill" class:on={ui.editing} onclick={() => (ui.editing = !ui.editing)} aria-pressed={ui.editing}>
           <Icon name={ui.editing ? 'check' : 'scissors'} size={15} />
           {t(ui.editing ? 'editor.done' : 'editor.edit')}
+        </button>
+        <!-- The main actions say what they do; the rest are icons with tooltips. -->
+        <button class="pill" onclick={() => actions.copy(shard)} use:tooltip={{ text: t('toast.copiedBody'), side: 'bottom' }}>
+          <Icon name="copy" size={15} />{t('shard.copy')}
         </button>
         <span class="divider"></span>
         <button
@@ -88,9 +92,6 @@
         </button>
         <button class="icon-btn" onclick={() => actions.rename(shard)} aria-label={t('shard.rename')} use:tooltip={{ text: t('shard.rename'), side: 'bottom' }}>
           <Icon name="pencil" size={16} />
-        </button>
-        <button class="icon-btn" onclick={() => actions.copy(shard)} aria-label={t('shard.copy')} use:tooltip={{ text: t('shard.copy'), side: 'bottom' }}>
-          <Icon name="copy" size={16} />
         </button>
         <button class="icon-btn" onclick={() => actions.reveal(shard)} aria-label={t('shard.reveal')} use:tooltip={{ text: t('shard.reveal'), side: 'bottom' }}>
           <Icon name="folder" size={16} />
@@ -282,13 +283,13 @@
     transform: scale(0.97);
   }
 
-  .edit {
+  .pill {
     display: inline-flex;
     align-items: center;
     gap: 7px;
     height: 32px;
     padding: 0 12px;
-    margin-right: 2px;
+    margin-right: 4px;
     border-radius: 8px;
     font-size: 13px;
     font-weight: 600;
@@ -298,10 +299,10 @@
       background var(--fast),
       color var(--fast);
   }
-  .edit:hover {
+  .pill:hover {
     background: var(--surface-3);
   }
-  .edit.on {
+  .pill.on {
     color: var(--accent-fg);
     background: var(--accent);
     box-shadow: none;
