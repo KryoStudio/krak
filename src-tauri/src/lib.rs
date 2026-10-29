@@ -1,4 +1,4 @@
-//! Kryo Shard: free, open-source game clipping for Windows.
+//! Krak: free, open-source game clipping for Windows.
 
 mod capture;
 mod clipboard;
@@ -8,6 +8,7 @@ mod hotkey;
 mod i18n;
 mod library;
 mod media;
+mod migrate;
 mod mp4;
 mod names;
 mod overlay;
@@ -16,6 +17,7 @@ mod replay;
 mod settings;
 mod shell;
 mod state;
+mod storage;
 mod tray;
 mod update;
 mod watcher;
@@ -33,6 +35,10 @@ const MINIMIZED_ARG: &str = "--minimized";
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    let context = tauri::generate_context!();
+    // Before any plugin reads its files.
+    migrate::from_kryo_shard(&context.config().identifier);
+
     tauri::Builder::default()
         // Must be registered first: a second launch just brings the running window back.
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
@@ -75,9 +81,14 @@ pub fn run() {
             commands::probe_shard,
             commands::export_shard,
             commands::cancel_export,
+            commands::get_encoder_info,
+            commands::resolve_video,
+            commands::list_microphones,
+            commands::get_storage_info,
+            commands::get_waveforms,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running Kryo Shard");
+        .run(context)
+        .expect("error while running Krak");
 }
 
 fn setup(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {

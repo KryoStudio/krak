@@ -9,7 +9,11 @@ use tauri_plugin_dialog::DialogExt;
 use tauri_plugin_opener::OpenerExt;
 
 use crate::capture::CaptureStatus;
+use crate::capture::audio::{self, Microphone};
+use crate::capture::encoders::{self, EncoderInfo};
+use crate::capture::quality::{self, ResolvedVideo, Tier};
 use crate::editor::export::{self, Destination};
+use crate::editor::waveform::{self, Waveform};
 use crate::editor::{
     EXPORT_PROGRESS, ExportProgress, ExportRequest, ExportResult, ExportSlot, INVALID_REQUEST,
     Progress, ShardInfo, Target, WRITE_FAILED,
@@ -18,6 +22,7 @@ use crate::library::{self, NOT_FOUND, Shard};
 use crate::media::{ComGuard, MfGuard};
 use crate::settings::{Settings, SettingsPatch};
 use crate::state::{AppState, lock};
+use crate::storage::{self, StorageInfo};
 use crate::{clipboard, editor, i18n, names, replay, shell, update, window};
 
 type CmdResult<T> = Result<T, String>;
@@ -78,7 +83,7 @@ pub async fn choose_clips_dir(app: AppHandle) -> CmdResult<Option<Settings>> {
     let mut dialog = app
         .dialog()
         .file()
-        .set_title(i18n::labels(current.language).choose_clips_dir)
+        .set_title(i18n::labels(current.language.as_deref()).choose_clips_dir)
         .set_directory(&current.clips_dir);
     if let Some(main) = app.get_webview_window(window::MAIN) {
         dialog = dialog.set_parent(&main);
@@ -287,7 +292,9 @@ pub async fn export_shard(app: AppHandle, request: ExportRequest) -> CmdResult<E
     let source = library::resolve_id(&clips_dir, &request.id)?;
     let destination = match request.target {
         Target::Copy => Destination::Copy {
-            label: i18n::labels(state.settings().language).edited.to_string(),
+            label: i18n::labels(state.settings().language.as_deref())
+                .edited
+                .to_string(),
         },
         Target::Discord => {
             let max_bytes = request
@@ -327,7 +334,7 @@ pub async fn export_shard(app: AppHandle, request: ExportRequest) -> CmdResult<E
         let started = std::time::Instant::now();
         let exported = export::export(&source, &job, &progress)?;
         eprintln!(
-            "kryo-shard: exported {} ({} bytes, {}) in {:.1} s",
+            "krak: exported {} ({} bytes, {}) in {:.1} s",
             exported.path.display(),
             exported.size,
             exported.detail,
@@ -374,6 +381,64 @@ pub async fn export_shard(app: AppHandle, request: ExportRequest) -> CmdResult<E
         shard,
         reencoded: exported.reencoded,
     })
+}
+
+/// The capture display and what this PC can encode and decode (cached after the first call).
+#[tauri::command]
+pub async fn get_encoder_info() -> CmdResult<EncoderInfo> {
+    media_thread("kryo-encoders", || {
+        encoders::info().map_err(|err| {
+            eprintln!("krak: encoder info: {err}");
+            err.code
+        })
+    })
+    .await
+}
+
+/// What the engine would record with the current settings and `patch` (nothing is applied).
+#[tauri::command]
+pub async fn resolve_video(app: AppHandle, patch: SettingsPatch) -> CmdResult<ResolvedVideo> {
+    let settings = app.state::<AppState>().settings().merge(patch);
+    let video = replay::video_settings(&settings);
+    media_thread("kryo-encoders", move || {
+        let (display, refresh, caps) = encoders::detect().map_err(|err| err.code)?;
+        let plan = quality::plan(
+            &video,
+            (display.width, display.height),
+            refresh,
+            &caps,
+            Tier::Best,
+        );
+        Ok(plan.resolved)
+    })
+    .await
+}
+
+/// Active microphones (WASAPI capture endpoints), the default one first.
+#[tauri::command]
+pub async fn list_microphones() -> CmdResult<Vec<Microphone>> {
+    media_thread("kryo-microphones", audio::microphones).await
+}
+
+/// Size and count of the library's clips, and the free space of their drive.
+#[tauri::command]
+pub async fn get_storage_info(app: AppHandle) -> CmdResult<StorageInfo> {
+    blocking(move || Ok(storage::info(&app.state::<AppState>().clips_dir()))).await
+}
+
+/// One row of audio peaks per track of a clip (same order and names as `probe_shard`).
+#[tauri::command]
+pub async fn get_waveforms(app: AppHandle, id: String, buckets: f64) -> CmdResult<Vec<Waveform>> {
+    let path = library::resolve_id(&app.state::<AppState>().clips_dir(), &id)?;
+    let buckets = if buckets.is_finite() {
+        buckets.round().clamp(0.0, 1e6) as usize
+    } else {
+        0
+    };
+    media_thread("kryo-waveform", move || {
+        waveform::waveforms(&path, buckets).map(|w| w.as_ref().clone())
+    })
+    .await
 }
 
 /// Stops the running export (it then fails with `cancelled` and leaves no file behind).

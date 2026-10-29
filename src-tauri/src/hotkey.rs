@@ -32,7 +32,7 @@ pub fn register_initial(app: &AppHandle, accelerator: &str) {
     if let Ok(shortcut) = parse(accelerator)
         && app.global_shortcut().register(shortcut).is_err()
     {
-        eprintln!("kryo-shard: hotkey {accelerator} is already in use");
+        eprintln!("krak: hotkey {accelerator} is already in use");
     }
 }
 

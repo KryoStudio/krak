@@ -10,7 +10,7 @@ use tauri_plugin_autostart::ManagerExt as _;
 use crate::settings::{self, Settings, SettingsPatch};
 use crate::state::{AppState, lock};
 use crate::watcher::{self, LIBRARY_CHANGED};
-use crate::{hotkey, replay, tray};
+use crate::{hotkey, replay, storage, tray};
 
 pub const INVALID_DIR: &str = "invalid_dir";
 
@@ -71,6 +71,11 @@ pub async fn apply(app: &AppHandle, patch: SettingsPatch) -> Result<Settings, &'
         let _ = tray::refresh(app);
     }
     replay::settings_changed(app, &old, &new);
+    if new.storage_limit_gb.is_some()
+        && (new.storage_limit_gb != old.storage_limit_gb || dir_changed)
+    {
+        storage::enforce(app, None);
+    }
     Ok(new)
 }
 
@@ -91,7 +96,7 @@ pub fn activate_clips_dir(app: &AppHandle, dir: &Path) {
     // folder makes Tauri register both the verbatim and the plain form.
     let scope_dir = fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
     if let Err(err) = app.asset_protocol_scope().allow_directory(&scope_dir, true) {
-        eprintln!("kryo-shard: cannot expose {}: {err}", dir.display());
+        eprintln!("krak: cannot expose {}: {err}", dir.display());
     }
     let state = app.state::<AppState>();
     let mut watcher = lock(&state.watcher);
@@ -120,6 +125,6 @@ pub fn sync_autostart(app: &AppHandle, enabled: bool) {
         Ok(())
     };
     if let Err(err) = result {
-        eprintln!("kryo-shard: cannot update autostart: {err}");
+        eprintln!("krak: cannot update autostart: {err}");
     }
 }

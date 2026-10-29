@@ -19,7 +19,7 @@ const QUIT: &str = "quit";
 
 pub fn create(app: &AppHandle) -> tauri::Result<()> {
     let mut builder = TrayIconBuilder::with_id(TRAY_ID)
-        .tooltip("Kryo Shard")
+        .tooltip("Krak")
         .menu(&menu(app)?)
         .show_menu_on_left_click(false)
         .on_menu_event(on_menu_event)
@@ -45,7 +45,7 @@ fn is_paused(app: &AppHandle) -> bool {
 
 fn menu(app: &AppHandle) -> tauri::Result<Menu<Wry>> {
     let settings = app.state::<AppState>().settings();
-    let labels = i18n::labels(settings.language);
+    let labels = i18n::labels(settings.language.as_deref());
     let capture_now = format!("{} ({})", labels.capture_now, settings.hotkey);
     let toggle = if is_paused(app) {
         labels.resume_replay

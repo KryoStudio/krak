@@ -2098,9 +2098,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "kryo-shard"
+name = "krak"
 version = "0.1.0"
 dependencies = [
+ "cc",
  "clipboard-win",
  "notify-debouncer-mini",
  "serde",

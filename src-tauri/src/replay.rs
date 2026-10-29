@@ -15,10 +15,11 @@ use tauri::{AppHandle, Emitter, Manager};
 
 use crate::capture::{
     self, CaptureState, CaptureStatus, Engine, EngineConfig, EngineEvents, SaveRequest, Stamp,
+    VideoSettings,
 };
 use crate::settings::Settings;
 use crate::state::{AppState, lock};
-use crate::{i18n, library, tray};
+use crate::{i18n, library, storage, tray};
 
 pub const CAPTURE_STATUS: &str = "capture-status";
 pub const SHARD_SAVED: &str = "shard-saved";
@@ -48,12 +49,24 @@ impl Replay {
     }
 }
 
+pub fn video_settings(settings: &Settings) -> VideoSettings {
+    VideoSettings {
+        quality: settings.quality,
+        codec: settings.codec,
+        resolution: settings.resolution,
+        fps: settings.fps,
+        bitrate: settings.bitrate,
+        ten_bit: settings.ten_bit,
+    }
+}
+
 fn engine_config(settings: &Settings) -> EngineConfig {
     EngineConfig {
-        fps: settings.fps,
-        quality: settings.quality,
+        video: video_settings(settings),
+        audio_bitrate: settings.audio_bitrate * 1000,
         buffer_seconds: settings.buffer_seconds,
         microphone: settings.microphone,
+        microphone_device: settings.microphone_device.clone(),
     }
 }
 
@@ -71,7 +84,7 @@ pub fn init(app: &AppHandle, settings: &Settings) {
         .name("kryo-replay".into())
         .spawn(move || control_loop(&handle, &rx))
     {
-        eprintln!("kryo-shard: cannot start the capture control thread: {err}");
+        eprintln!("krak: cannot start the capture control thread: {err}");
         return;
     }
     app.state::<Replay>()
@@ -127,8 +140,9 @@ pub fn set_paused(app: &AppHandle, paused: bool) -> CaptureStatus {
 }
 
 /// Applies settings that affect capture (after a successful update): the replay length
-/// changes live; frame rate, quality and microphone restart the engine; any change retries an
-/// engine that is in error.
+/// changes live; any video or audio field (quality, codec, resolution, frame rate, bitrates,
+/// 10-bit, microphone and its device) restarts the engine; any change retries an engine that
+/// is in error.
 pub fn settings_changed(app: &AppHandle, old: &Settings, new: &Settings) {
     let replay = app.state::<Replay>();
     let state = {
@@ -162,7 +176,7 @@ pub fn request_save(app: &AppHandle) {
     let request = SaveRequest {
         clips_dir: settings.clips_dir.clone().into(),
         game: capture::game::foreground_game(),
-        desktop_label: i18n::labels(settings.language).desktop.into(),
+        desktop_label: i18n::labels(settings.language.as_deref()).desktop.into(),
         stamp: Stamp::now(),
     };
     let result = match lock(&replay.engine).as_ref() {
@@ -198,11 +212,10 @@ impl EngineEvents for AppEvents {
             Ok(shard) => {
                 let _ = self.app.emit(SHARD_SAVED, shard);
             }
-            Err(err) => eprintln!(
-                "kryo-shard: saved clip not listed ({err}): {}",
-                path.display()
-            ),
+            Err(err) => eprintln!("krak: saved clip not listed ({err}): {}", path.display()),
         }
+        // Over the storage limit: the oldest clips go, never this one.
+        storage::enforce(&self.app, Some(id));
     }
 
     fn save_failed(&self, code: &'static str) {
@@ -229,7 +242,7 @@ mod tests {
 
     #[test]
     fn builds_shard_ids_relative_to_the_clips_folder() {
-        let dir = Path::new(r"C:\Videos\Kryo Shard");
+        let dir = Path::new(r"C:\Videos\Krak");
         assert_eq!(
             shard_id(
                 dir,

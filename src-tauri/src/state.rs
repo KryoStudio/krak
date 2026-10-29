@@ -52,7 +52,7 @@ impl AppState {
     }
 }
 
-/// `<Videos>/Kryo Shard`, falling back to `<Home>/Videos/Kryo Shard`.
+/// `<Videos>/Krak`, falling back to `<Home>/Videos/Krak`.
 fn default_clips_dir(app: &AppHandle) -> String {
     let paths = app.path();
     let videos = paths
@@ -60,5 +60,5 @@ fn default_clips_dir(app: &AppHandle) -> String {
         .or_else(|_| paths.home_dir().map(|home| home.join("Videos")))
         .or_else(|_| paths.app_data_dir())
         .unwrap_or_default();
-    videos.join("Kryo Shard").to_string_lossy().into_owned()
+    videos.join("Krak").to_string_lossy().into_owned()
 }

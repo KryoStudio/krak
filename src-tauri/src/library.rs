@@ -158,13 +158,13 @@ pub fn shard(
     Ok(build(path, id.to_string(), game, &meta, favorites, cache))
 }
 
-/// Lists every clip in the clips folder and its first-level game folders, newest first.
-pub fn scan(
-    clips_dir: &Path,
-    favorites: &BTreeSet<String>,
-    cache: &mut DurationCache,
-) -> Vec<Shard> {
-    let mut found: Vec<(PathBuf, String, Option<String>, Metadata)> = Vec::new();
+/// A clip file of the library: path, id, game folder, metadata.
+pub type ClipFile = (PathBuf, String, Option<String>, Metadata);
+
+/// Every clip file in the clips folder and its first-level game folders (what the library
+/// shows: video extensions, no symlinks or junctions), unsorted.
+pub fn clip_files(clips_dir: &Path) -> Vec<ClipFile> {
+    let mut found: Vec<ClipFile> = Vec::new();
     for (path, name, meta) in entries(clips_dir) {
         if meta.is_file() && is_video(&path) {
             found.push((path, name, None, meta));
@@ -181,6 +181,21 @@ pub fn scan(
             }
         }
     }
+    found
+}
+
+/// Creation time in ms since the epoch (modification time where creation is unknown).
+pub fn created_ms(meta: &Metadata) -> u64 {
+    unix_ms(meta.created().or_else(|_| meta.modified()))
+}
+
+/// Lists every clip in the clips folder and its first-level game folders, newest first.
+pub fn scan(
+    clips_dir: &Path,
+    favorites: &BTreeSet<String>,
+    cache: &mut DurationCache,
+) -> Vec<Shard> {
+    let found = clip_files(clips_dir);
 
     cache.retain(&found.iter().map(|(path, ..)| path.clone()).collect());
     let mut shards: Vec<Shard> = found
