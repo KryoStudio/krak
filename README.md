@@ -34,18 +34,21 @@ A clip is called a **shard**. Your library is the **Glacier**.
 
 ## Roadmap to the first beta
 
-- [x] Brand, app shell and Glacier preview (FR / EN)
-- [x] App foundation: settings, global hotkey, tray icon, launch at Windows startup, single instance
-- [x] Glacier: shards sorted by game, favorites, search, rename, built-in player, copy a clip for Discord, Recycle Bin
-- [x] Always-on replay buffer (capture engine), capture sound and in-game notification
+- [x] Krak identity, in 12 languages that follow Windows
+- [x] App foundation: settings, global shortcuts, tray icon, launch at Windows startup, single instance
+- [x] Glacier: shards sorted by game, favorites, search, rename, multi-select, built-in player, Recycle Bin
+- [x] Always-on replay buffer, encoded natively with NVENC on NVIDIA (H.264, HEVC), with Standard, High and Premium presets
+- [x] Continuous recording while the replay keeps working, safe from crashes
+- [x] Screenshots, with their own page
 - [x] Separate audio tracks: game and microphone, plus a mix that every player picks by default
-- [x] Editor: trim bar, mute or lower each audio track
-- [x] Discord export: fit a clip under 10 MB, 50 MB or 500 MB, copy and paste it straight into Discord
+- [x] Editor: trim bar, waveforms, volume of each audio track, remembered per clip
+- [x] Export to a file, to the Glacier or to Discord under 10 MB, 50 MB or 500 MB, with an optional "by krak" badge
+- [x] Discord Rich Presence
 - [x] Installer and signed automatic updates
 - [ ] Windows code signing (no SmartScreen warning)
-- [ ] Separate Discord voice track, mouse cursor in clips, choice of the captured screen
+- [ ] Native AMD and Intel encoders, separate Discord voice track, mouse cursor in clips, choice of the captured screen
 
-**Later:** auto-clips (Rocket League first), vertical 9:16 format, slow motion, text and local subtitles, importing clips from ShadowPlay / OBS / Medal, Discord Rich Presence, community translations and detectors.
+**Later:** auto-clips (Rocket League first), vertical 9:16 format, slow motion, text and local subtitles, importing clips from ShadowPlay / OBS / Medal, community translations and detectors.
 
 ## Building from source
 
@@ -63,7 +66,7 @@ Releases are built by GitHub Actions: push a tag such as `v0.2.0` (matching the 
 
 ### How capture works
 
-The screen is read with DXGI Desktop Duplication, the same Windows API that OBS and Discord use, so nothing is injected into games. Frames are encoded on the graphics card and the last seconds are kept in memory: on NVIDIA through the driver's NVENC directly (H.264, HEVC and AV1 where the card has it, with B-frames, lookahead and adaptive quantization), on AMD and Intel through Media Foundation, with a software fallback. If the encoder cannot keep up (a heavy game, a high frame rate), it switches to lighter settings on the fly instead of dropping frames. Game sound comes from WASAPI loopback and the microphone from its own device, on separate tracks. Pressing the hotkey writes an MP4 straight from memory, without re-encoding.
+The screen is read with DXGI Desktop Duplication, the same Windows API that OBS and Discord use, so nothing is injected into games. Frames are encoded on the graphics card and the last seconds are kept in memory: on NVIDIA through the driver's NVENC directly (H.264, HEVC and AV1 where the card has it, with B-frames, lookahead and adaptive quantization), on AMD and Intel through Media Foundation, with a software fallback. If the encoder cannot keep up (a heavy game, a high frame rate), it switches to lighter settings on the fly instead of dropping frames. Game sound comes from WASAPI loopback and the microphone from its own device, on separate tracks. Pressing the hotkey writes an MP4 straight from memory, without re-encoding. Continuous recording reuses the same encoded video and writes a fragmented MP4 as it goes, so a crash loses at most a second; screenshots are full-resolution PNGs of the same capture.
 
 The quality presets and the measurements behind them (bitrates, tools, PSNR/SSIM, encoder speed) are documented in [`src-tauri/src/capture/quality.rs`](src-tauri/src/capture/quality.rs). The NVENC layer is a small C file compiled by `cargo` with the Visual Studio C++ tools, against NVIDIA's MIT-licensed `nvEncodeAPI.h` ([`src-tauri/native/nvenc`](src-tauri/native/nvenc)); the NVENC library itself ships with the NVIDIA driver and is loaded at run time, never redistributed.
 

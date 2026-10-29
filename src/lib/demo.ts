@@ -13,14 +13,14 @@ export function demoShards(): Shard[] {
   return [
     shard('Rocket League', 'Ceiling shot', 30, 48, 6, true),
     shard('GTA V', null, 45, 71, 42),
-    shard('Fortnite', 'Victoire royale', 30, 52, 95, true),
+    shard('Fortnite', 'Victory royale', 30, 52, 95, true),
     shard('Rocket League', null, 20, 31, 180),
-    shard('GTA V', 'Course-poursuite sur le pont', 60, 96, 300),
+    shard('GTA V', 'Bridge chase', 60, 96, 300),
     shard('Fortnite', null, 30, 49, 1500),
     shard(null, null, 15, 12, 2900),
     shard('Rocket League', 'Triple save', 30, 47, 4400, true),
     shard('GTA V', null, 30, 50, 7300),
-    shard('Valorant', 'Ace en défense', 40, 63, 9800),
+    shard('Valorant', 'Defense ace', 40, 63, 9800),
     shard('Valorant', null, 25, 38, 12000),
   ];
 }
