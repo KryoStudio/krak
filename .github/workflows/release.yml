@@ -37,8 +37,8 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
           tagName: ${{ github.ref_name }}
-          releaseName: Kryo Shard ${{ github.ref_name }}
-          releaseBody: Download `Kryo Shard_*_x64-setup.exe` below and run it. Already installed? The app updates itself.
+          releaseName: Krak ${{ github.ref_name }}
+          releaseBody: Download `Krak_*_x64-setup.exe` below and run it. Already installed (Krak or Kryo Shard)? The app updates itself.
           releaseDraft: true
           prerelease: false
           includeUpdaterJson: true
