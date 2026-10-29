@@ -1,46 +1,62 @@
-<!-- Editing tools under the player: trim, per-track volume, save a copy, export for Discord.
-     Keys: Space play/pause, I/O set the start/end at the playhead, ←/→ seek. -->
+<!-- Editing tools under the player: a multi-track timeline (video, game sound, microphone) with
+     trim handles and per-track volume, then save a copy or export for Discord.
+     Keys: Space play/pause, I/O set the start/end at the playhead, ←/→ seek (Shift: 5 s). -->
 <script lang="ts">
   import { onMount, untrack } from 'svelte';
   import Icon from './Icon.svelte';
-  import Timeline from './Timeline.svelte';
-  import { api, errorCode, mediaSrc, native, on, type Shard, type ShardInfo } from '$lib/api';
+  import Timeline, { type Lane } from './Timeline.svelte';
+  import ExportDialog from './ExportDialog.svelte';
+  import { api, mediaSrc, native, type Shard, type ShardInfo, type Waveform } from '$lib/api';
+  import { getEdit, saveEdit } from '$lib/edits';
   import { gameTint } from '$lib/games';
-  import { formatSize, hasKey, t } from '$lib/i18n.svelte';
+  import { t } from '$lib/i18n.svelte';
   import { library } from '$lib/library.svelte';
-  import { showError } from '$lib/shard-actions';
   import { tooltip } from '$lib/tooltip';
-  import { openMenu, toast } from '$lib/ui.svelte';
 
   let { shard, video }: { shard: Shard; video?: HTMLVideoElement } = $props();
 
+  const BUCKETS = 800;
+
   let info = $state<ShardInfo | null>(null);
+  let waveforms = $state<Waveform[] | null>(null);
   let start = $state(0);
   let end = $state(0);
   let current = $state(0);
   let playing = $state(false);
   let gains = $state({ game: 1, mic: 1 });
-  let progress = $state<number | null>(null);
+  let exporting = $state(false);
+  /** The clip whose saved edit is applied: edits are only saved once it is. */
+  let loadedId = $state<string | null>(null);
 
   const duration = $derived(info?.duration ?? 0);
   const hasMic = $derived(!!info?.audioTracks.some((track) => track.kind === 'mic'));
   const selection = $derived(Math.max(0, end - start));
   const real = $derived(native && !library.demo);
+  const trimmed = $derived(start > 0.05 || end < duration - 0.05);
 
-  // Discord upload limits (MB) and the one used last.
-  const limits = [10, 50, 500] as const;
-  let limit = $state<(typeof limits)[number]>(readLimit());
-  function readLimit(): (typeof limits)[number] {
-    try {
-      const saved = Number(localStorage.getItem('kryo-shard.discord-limit'));
-      return limits.find((l) => l === saved) ?? 10;
-    } catch {
-      return 10;
+  // One lane per thing the user can turn up or down: game + mic, or the only track.
+  const lanes = $derived.by((): Lane[] => {
+    if (!info?.audioTracks.length) return [];
+    const peaksOf = (kind: Waveform['kind']) => waveforms?.find((w) => w.kind === kind)?.peaks ?? null;
+    if (hasMic) {
+      return [
+        { key: 'game', label: t('editor.game'), icon: 'gamepad', peaks: peaksOf('game'), gain: gains.game },
+        { key: 'mic', label: t('editor.mic'), icon: 'mic', peaks: peaksOf('mic'), gain: gains.mic },
+      ];
     }
-  }
+    const only = info.audioTracks[0];
+    return [
+      {
+        key: 'game',
+        label: only.kind === 'game' ? t('editor.game') : t('editor.audio'),
+        icon: only.kind === 'game' ? 'gamepad' : 'volume',
+        peaks: waveforms?.[0]?.peaks ?? null,
+        gain: gains.game,
+      },
+    ];
+  });
 
-  // What the clip contains. Demo shards and older backends get a plausible stand-in.
-  // Only a change of clip re-runs this.
+  // What the clip contains and its waveforms. Only a change of clip re-runs this.
   $effect(() => {
     const id = shard.id;
     untrack(() => load(id));
@@ -52,22 +68,70 @@
       width: 1920,
       height: 1080,
       fps: 60,
-      audioTracks: real ? [{ name: 'Audio', kind: 'mix' }] : [
-        { name: 'Mix', kind: 'mix' },
-        { name: 'Game', kind: 'game' },
-        { name: 'Microphone', kind: 'mic' },
-      ],
+      audioTracks: real
+        ? [{ name: 'Audio', kind: 'mix' }]
+        : [
+            { name: 'Mix', kind: 'mix' },
+            { name: 'Game', kind: 'game' },
+            { name: 'Microphone', kind: 'mic' },
+          ],
     };
+    waveforms = null;
+    loadedId = null;
     const apply = (next: ShardInfo) => {
       if (shard.id !== id) return;
       info = { ...next, duration: next.duration || fallback.duration };
-      start = 0;
-      end = info.duration;
-      gains = { game: 1, mic: 1 };
+      // Start from the last edit of this clip, if any (clamped: the file may have changed).
+      const saved = getEdit(id);
+      const d = info.duration;
+      start = saved ? Math.min(Math.max(0, saved.start), Math.max(0, d - 0.5)) : 0;
+      end = saved ? Math.min(d, Math.max(start + 0.5, saved.end)) : d;
+      gains = saved ? { ...saved.gains } : { game: 1, mic: 1 };
+      if (saved) seek(start);
+      loadedId = id;
     };
-    if (real) api.probeShard(id).then(apply, () => apply(fallback));
-    else apply(fallback);
+    if (real) {
+      api.probeShard(id).then(apply, () => apply(fallback));
+      api.getWaveforms(id, BUCKETS).then(
+        (list) => shard.id === id && (waveforms = list),
+        () => {},
+      );
+    } else {
+      apply(fallback);
+      waveforms = demoWaveforms(id);
+    }
   }
+
+  /** Plausible waveforms for demo shards: game sound with bursts, a voice in short phrases. */
+  function demoWaveforms(seed: string): Waveform[] {
+    let h = 0;
+    for (const c of seed) h = (h * 31 + c.charCodeAt(0)) | 0;
+    const rand = () => ((h = (h * 1103515245 + 12345) | 0), ((h >>> 16) & 0x7fff) / 0x7fff);
+    const game = Array.from({ length: BUCKETS }, (_, i) => {
+      const base = 0.28 + 0.12 * Math.sin(i / 37) + 0.08 * Math.sin(i / 9);
+      return Math.min(1, base + (rand() < 0.04 ? 0.45 * rand() : 0.12 * rand()));
+    });
+    let talking = false;
+    const mic = Array.from({ length: BUCKETS }, () => {
+      if (rand() < 0.02) talking = !talking;
+      return talking ? 0.2 + 0.35 * rand() : 0.02 * rand();
+    });
+    return [
+      { name: 'Mix', kind: 'mix', peaks: game.map((g, i) => Math.min(1, g + mic[i] * 0.6)) },
+      { name: 'Game', kind: 'game', peaks: game },
+      { name: 'Microphone', kind: 'mic', peaks: mic },
+    ];
+  }
+
+  // Remember the trim and volumes of this clip (shortly after the last change).
+  $effect(() => {
+    const edit = { start, end, gains: { ...gains } };
+    const id = loadedId;
+    const d = duration;
+    if (!id || id !== shard.id || !d) return;
+    const timer = setTimeout(() => saveEdit(id, edit, d), 300);
+    return () => clearTimeout(timer);
+  });
 
   // Playhead follows the video smoothly; playback loops inside the kept range.
   onMount(() => {
@@ -83,7 +147,7 @@
     return () => cancelAnimationFrame(frame);
   });
 
-  // Single audio track: the volume can be previewed live (up to 100 %).
+  // A single audio track can be previewed live (up to 100 %); separate tracks apply on export.
   $effect(() => {
     if (video && !hasMic) video.volume = Math.min(1, gains.game);
   });
@@ -119,98 +183,19 @@
     const s = (time % 60).toFixed(1).padStart(4, '0');
     return `${m}:${s}`;
   };
-
-  async function run(target: 'copy' | 'discord') {
-    if (progress !== null || !info) return;
-    progress = 0;
-    if (!real) {
-      // Browser preview / demo data: show the flow.
-      for (let p = 0; p <= 1; p += 0.1) {
-        progress = p;
-        await new Promise((r) => setTimeout(r, 90));
-      }
-      progress = null;
-      toast({ kind: 'info', title: t('toast.demo') });
-      return;
-    }
-    const stop = on('export-progress', (p) => {
-      if (p.id === shard.id && progress !== null) progress = p.progress;
-    });
-    try {
-      const maxBytes = target === 'discord' ? limit * 1_000_000 : null;
-      const result = await api.exportShard({ id: shard.id, start, end, gains: $state.snapshot(gains), target, maxBytes });
-      if (target === 'copy') {
-        if (result.shard) library.upsert(result.shard);
-        toast({ kind: 'success', title: t('editor.saved') });
-      } else {
-        toast({ kind: 'success', title: t('editor.copied'), body: t('editor.copiedBody', { size: formatSize(result.size) }) });
-      }
-    } catch (e) {
-      const code = errorCode(e);
-      if (code === 'cancelled') toast({ kind: 'info', title: t('error.cancelled') });
-      else showError(hasKey(`error.${code}`) ? code : 'export_failed');
-    } finally {
-      stop.then((unlisten) => unlisten());
-      progress = null;
-    }
-  }
-
-  function pickLimit(e: MouseEvent) {
-    const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
-    openMenu(
-      r.right,
-      r.top - 8,
-      limits.map((l) => ({
-        label: `${formatSize(l * 1_000_000)} · ${t(`editor.limit.${l}`)}`,
-        icon: l === limit ? 'check' : undefined,
-        run: () => {
-          limit = l;
-          try {
-            localStorage.setItem('kryo-shard.discord-limit', String(l));
-          } catch {
-            // no storage
-          }
-          run('discord');
-        },
-      })),
-    );
-  }
 </script>
 
 <svelte:window {onkeydown} />
 
-{#snippet slider(label: string, icon: 'gamepad' | 'mic' | 'volume', key: 'game' | 'mic')}
-  <label class="slider">
-    <span class="slider-label" use:tooltip={{ text: label, side: 'top' }}>
-      <Icon name={gains[key] === 0 ? 'mute' : icon} size={15} />
-    </span>
-    <input type="range" min="0" max="2" step="0.05" bind:value={gains[key]} aria-label={label} style:--fill="{(gains[key] / 2) * 100}%" />
-    <span class="percent">{Math.round(gains[key] * 100)} %</span>
-  </label>
-{/snippet}
-
-<div class="editor" class:busy={progress !== null}>
-  <div class="top">
-    <button class="play" onclick={toggle} aria-label={t('shard.play')}>
+<div class="editor">
+  <div class="toolbar">
+    <button class="play" onclick={toggle} aria-label={t('shard.play')} use:tooltip={{ text: `${t('shard.play')} · Espace`, side: 'top' }}>
       <Icon name={playing ? 'pause' : 'play'} size={15} fill />
     </button>
     <span class="clock">{clock(current)} <span>/ {clock(duration)}</span></span>
-    <div class="grow">
-      {#if info}
-        <Timeline
-          {duration}
-          bind:start
-          bind:end
-          {current}
-          src={shard.path ? mediaSrc(shard.path) : null}
-          tint={gameTint(shard.game)}
-          onseek={seek}
-        />
-      {/if}
-    </div>
-  </div>
 
-  <div class="bottom">
+    <span class="divider"></span>
+
     <div class="trim">
       <button class="chip" onclick={() => (start = Math.min(current, end - 0.5))} aria-label={t('editor.setIn')} use:tooltip={{ text: `${t('editor.setIn')} · I`, side: 'top' }}>
         <span class="bracket">[</span>
@@ -218,62 +203,60 @@
       <button class="chip" onclick={() => (end = Math.max(current, start + 0.5))} aria-label={t('editor.setOut')} use:tooltip={{ text: `${t('editor.setOut')} · O`, side: 'top' }}>
         <span class="bracket">]</span>
       </button>
-      {#if start > 0 || end < duration}
+      {#if trimmed}
         <button class="chip" onclick={() => ((start = 0), (end = duration))} aria-label={t('editor.reset')} use:tooltip={{ text: t('editor.reset'), side: 'top' }}>
           <Icon name="undo" size={13} />
         </button>
       {/if}
-      <span class="selection">{t('editor.selection', { duration: `${selection.toFixed(1)} s` })}</span>
-    </div>
-
-    <div class="audio">
-      {#if hasMic}
-        {@render slider(t('editor.game'), 'gamepad', 'game')}
-        {@render slider(t('editor.mic'), 'mic', 'mic')}
-      {:else}
-        {@render slider(t('editor.volume'), 'volume', 'game')}
-      {/if}
+      <span class="selection" class:trimmed>{t('editor.selection', { duration: `${selection.toFixed(1)} s` })}</span>
     </div>
 
     <div class="actions">
-      {#if progress !== null}
-        <div class="progress">
-          <span class="bar" style:transform="scaleX({progress})"></span>
-          <span class="label">{t('editor.exporting', { percent: Math.round(progress * 100) })}</span>
-          {#if real}
-            <button class="cancel" onclick={() => api.cancelExport()} aria-label={t('common.cancel')}><Icon name="x" size={13} /></button>
-          {/if}
-        </div>
-      {:else}
-        <button class="button" onclick={() => run('copy')}>{t('editor.saveCopy')}</button>
-        <div class="split" use:tooltip={{ text: t('editor.discordHint'), side: 'top' }}>
-          <button class="button primary" onclick={() => run('discord')}>
-            <Icon name="share" size={14} />{t('editor.discord')} · {formatSize(limit * 1_000_000)}
-          </button>
-          <button class="button primary more" onclick={pickLimit} aria-label={t('shard.more')} aria-haspopup="menu">
-            <Icon name="chevronDown" size={14} />
-          </button>
-        </div>
-      {/if}
+      <button class="button primary" onclick={() => (exporting = true)} disabled={!info}>
+        <Icon name="share" size={14} />{t('export.title')}
+      </button>
     </div>
   </div>
+
+  {#if info}
+    <Timeline
+      {duration}
+      bind:start
+      bind:end
+      {current}
+      src={shard.path ? mediaSrc(shard.path) : null}
+      tint={gameTint(shard.game)}
+      {lanes}
+      onseek={seek}
+      ongain={(key, gain) => (gains[key] = gain)}
+    />
+  {/if}
+
+  {#if hasMic && (gains.game !== 1 || gains.mic !== 1)}
+    <p class="note"><Icon name="info" size={13} />{t('editor.volumesOnExport')}</p>
+  {/if}
 </div>
+
+{#if exporting}
+  <ExportDialog {shard} {start} {end} gains={{ ...gains }} onclose={() => (exporting = false)} />
+{/if}
 
 <style>
   .editor {
     display: flex;
     flex-direction: column;
     gap: 14px;
-    padding: 14px 16px 16px;
+    padding: 12px 16px 16px;
     border-radius: var(--radius-lg);
     background: var(--surface);
     border: 1px solid var(--border);
   }
 
-  .top {
+  .toolbar {
     display: flex;
     align-items: center;
     gap: 12px;
+    min-height: 36px;
   }
   .play {
     display: grid;
@@ -290,49 +273,32 @@
     transform: scale(0.92);
   }
   .clock {
-    width: 92px;
+    width: 96px;
     flex: none;
-    font-size: 12.5px;
+    font-size: 13px;
     font-variant-numeric: tabular-nums;
     color: var(--text);
   }
   .clock span {
     color: var(--text-3);
   }
-  .grow {
-    flex: 1;
-    min-width: 0;
+  .divider {
+    width: 1px;
+    height: 20px;
+    background: var(--border-strong);
   }
-
-  .bottom {
-    display: flex;
-    align-items: center;
-    gap: 10px 22px;
-    flex-wrap: wrap;
-  }
-  .trim,
-  .audio,
-  .actions {
+  .trim {
     display: flex;
     align-items: center;
     gap: 6px;
   }
-  .audio {
-    gap: 14px;
-  }
-  .actions {
-    margin-left: auto;
-  }
-
   .chip {
-    display: inline-flex;
-    align-items: center;
-    gap: 4px;
+    display: inline-grid;
+    place-items: center;
+    min-width: 30px;
     height: 28px;
-    padding: 0 10px;
+    padding: 0 8px;
     border-radius: 7px;
-    font-size: 12.5px;
-    font-weight: 500;
     color: var(--text-2);
     background: var(--surface-2);
     box-shadow: inset 0 0 0 1px var(--border);
@@ -344,59 +310,36 @@
     color: var(--text);
     background: var(--surface-3);
   }
-  .chip {
-    justify-content: center;
-    min-width: 30px;
-  }
   .bracket {
     font-weight: 700;
     font-size: 14px;
     line-height: 1;
   }
   .selection {
+    white-space: nowrap;
     margin-left: 6px;
     font-size: 12.5px;
     color: var(--text-3);
     font-variant-numeric: tabular-nums;
   }
-
-  .slider {
+  .selection.trimmed {
+    color: var(--accent);
+  }
+  .note {
     display: flex;
     align-items: center;
-    gap: 8px;
-  }
-  .slider-label {
-    display: grid;
-    place-items: center;
-    color: var(--text-2);
-  }
-  .percent {
-    width: 40px;
+    gap: 6px;
+    margin: -4px 0 0 212px;
     font-size: 12px;
     color: var(--text-3);
-    font-variant-numeric: tabular-nums;
-  }
-  input[type='range'] {
-    appearance: none;
-    width: 84px;
-    height: 4px;
-    border-radius: 4px;
-    background: linear-gradient(to right, var(--accent) var(--fill), var(--surface-3) var(--fill));
-    cursor: pointer;
-  }
-  input[type='range']::-webkit-slider-thumb {
-    appearance: none;
-    width: 14px;
-    height: 14px;
-    border-radius: 50%;
-    background: #fff;
-    box-shadow: 0 1px 4px rgba(0, 0, 0, 0.5);
-    transition: transform var(--fast) var(--ease-out);
-  }
-  input[type='range']:active::-webkit-slider-thumb {
-    transform: scale(1.2);
   }
 
+  .actions {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    margin-left: auto;
+  }
   .button {
     display: inline-flex;
     align-items: center;
@@ -406,6 +349,7 @@
     border-radius: 8px;
     font-size: 13px;
     font-weight: 600;
+    white-space: nowrap;
     background: var(--surface-3);
     box-shadow: inset 0 0 0 1px var(--border-strong);
     transition:
@@ -415,9 +359,6 @@
   .button:hover {
     background: #2a2b31;
   }
-  .split {
-    display: flex;
-  }
   .button.primary {
     color: var(--accent-fg);
     background: var(--accent);
@@ -426,53 +367,5 @@
   .button.primary:hover {
     filter: brightness(1.08);
   }
-  .split .button.primary:first-child {
-    border-radius: 8px 0 0 8px;
-  }
-  .button.more {
-    width: 30px;
-    padding: 0;
-    justify-content: center;
-    border-radius: 0 8px 8px 0;
-    border-left: 1px solid color-mix(in srgb, var(--accent-fg) 25%, transparent);
-  }
 
-  .progress {
-    position: relative;
-    display: flex;
-    align-items: center;
-    width: 280px;
-    height: 34px;
-    padding: 0 6px 0 14px;
-    border-radius: 8px;
-    background: var(--surface-3);
-    overflow: hidden;
-  }
-  .bar {
-    position: absolute;
-    inset: 0;
-    background: var(--accent-soft);
-    transform-origin: left;
-    transition: transform 200ms linear;
-  }
-  .progress .label {
-    position: relative;
-    flex: 1;
-    font-size: 13px;
-    font-weight: 600;
-    font-variant-numeric: tabular-nums;
-  }
-  .cancel {
-    position: relative;
-    display: grid;
-    place-items: center;
-    width: 24px;
-    height: 24px;
-    border-radius: 6px;
-    color: var(--text-2);
-  }
-  .cancel:hover {
-    background: rgba(255, 255, 255, 0.08);
-    color: var(--text);
-  }
 </style>
