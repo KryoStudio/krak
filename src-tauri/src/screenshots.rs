@@ -27,7 +27,7 @@ use crate::capture::{self, Stamp, naming};
 use crate::editor::naming::{MAX_ATTEMPTS, copy_stem};
 use crate::media::mp4_writer::{part_path, rename_no_replace};
 use crate::media::{ComGuard, png};
-use crate::replay::{self, CAPTURE_FAILED};
+use crate::replay;
 use crate::state::{AppState, lock};
 use crate::{clipboard, i18n, library, shell};
 
@@ -87,7 +87,7 @@ pub fn request(app: &AppHandle) {
         .name("kryo-screenshot".into())
         .spawn(move || {
             if let Err(code) = take(&app) {
-                let _ = app.emit(CAPTURE_FAILED, code);
+                replay::capture_failed(&app, code);
             }
         });
     if spawned.is_err() {

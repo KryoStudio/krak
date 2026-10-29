@@ -1,6 +1,11 @@
 //! Connects the capture engine to the app: starts it at launch (in the background), restarts
 //! it when capture settings change, pause/resume, saves on the hotkey, and the events:
-//! `capture-status` (CaptureStatus), `shard-saved` (Shard) and `capture-failed` (code).
+//! `capture-status` (CaptureStatus), `shard-saving` (SavingShard), `shard-saved` (Shard) and
+//! `capture-failed` (code).
+//!
+//! A press is acknowledged at once (the chime, `shard-saving` for the in-game notification):
+//! the moment is kept as soon as the engine took its snapshot, while writing the file can take
+//! seconds (a long replay, a slow disk). Only a failure is heard again, with its own sound.
 //! A continuous recording goes on across restarts (`crate::recording`).
 //!
 //! Starting and stopping happen on one control thread: stopping joins the engine's threads,
@@ -12,6 +17,7 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager};
 
 use crate::capture::{
@@ -23,10 +29,22 @@ use crate::state::{AppState, lock};
 use crate::{i18n, library, recording, storage, tray};
 
 pub const CAPTURE_STATUS: &str = "capture-status";
+/// A press was accepted: the clip is being written.
+pub const SHARD_SAVING: &str = "shard-saving";
 pub const SHARD_SAVED: &str = "shard-saved";
 pub const CAPTURE_FAILED: &str = "capture-failed";
 /// Presses closer than this to the previous accepted one are ignored.
 const DEBOUNCE: Duration = Duration::from_secs(1);
+
+/// `shard-saving`: what the in-game notification says right after the press.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SavingShard {
+    /// `None` for a desktop clip.
+    game: Option<String>,
+    /// Length of the clip being written, s.
+    duration: f64,
+}
 
 enum Control {
     Start(EngineConfig),
@@ -189,9 +207,10 @@ pub fn request_save(app: &AppHandle) {
     }
     let settings = app.state::<AppState>().settings();
     // The game is whatever is in front at the moment of the press.
+    let game = capture::game::foreground_game();
     let request = SaveRequest {
         clips_dir: settings.clips_dir.clone().into(),
-        game: capture::game::foreground_game(),
+        game: game.clone(),
         desktop_label: i18n::labels(settings.language.as_deref()).desktop.into(),
         stamp: Stamp::now(),
     };
@@ -199,9 +218,24 @@ pub fn request_save(app: &AppHandle) {
         Some(engine) if !replay.is_paused() => engine.save(request),
         _ => Err(capture::NOT_READY),
     };
-    if let Err(code) = result {
-        let _ = app.emit(CAPTURE_FAILED, code);
+    match result {
+        Ok(duration) => {
+            if settings.capture_sound {
+                capture::sound::play_chime();
+            }
+            let _ = app.emit(SHARD_SAVING, SavingShard { game, duration });
+        }
+        Err(code) => capture_failed(app, code),
     }
+}
+
+/// A clip or screenshot that was asked for will not exist: the failure sound, and
+/// `capture-failed` for the notification and the main window.
+pub fn capture_failed(app: &AppHandle, code: &'static str) {
+    if app.state::<AppState>().settings().capture_sound {
+        capture::sound::play_error();
+    }
+    let _ = app.emit(CAPTURE_FAILED, code);
 }
 
 struct AppEvents {
@@ -214,10 +248,8 @@ impl EngineEvents for AppEvents {
     }
 
     fn saved(&self, path: &Path) {
+        // The chime already played at the press (`request_save`).
         let state = self.app.state::<AppState>();
-        if state.settings().capture_sound {
-            capture::sound::play_chime();
-        }
         let dir = state.clips_dir();
         // The clips folder may have changed while saving: then the clip is not in the library.
         let Some(id) = shard_id(&dir, path) else {
@@ -235,7 +267,7 @@ impl EngineEvents for AppEvents {
     }
 
     fn save_failed(&self, code: &'static str) {
-        let _ = self.app.emit(CAPTURE_FAILED, code);
+        capture_failed(&self.app, code);
     }
 
     fn recording_saved(&self, path: &Path) {

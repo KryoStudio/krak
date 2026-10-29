@@ -1,6 +1,9 @@
 //! In-game notification: a small transparent window (label `overlay`, page `/overlay`) shown in
-//! the top-right corner of the primary display after each capture (clip, screenshot,
-//! recording) and failure.
+//! the top-right corner of the primary display after each capture (a clip as soon as the press
+//! is accepted, a screenshot, a recording) and failure.
+//!
+//! A game in exclusive fullscreen owns the screen: no window can show over it (only overlays
+//! injected into the game can, which Krak never does). There the capture sounds say it.
 //!
 //! It must never take focus from the game, so it is shown with raw Win32 calls
 //! (`SWP_NOACTIVATE`) instead of Tauri's `show()`, which activates the window. It is
@@ -17,7 +20,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 use crate::recording::{RECORDING_FAILED, RECORDING_SAVED};
-use crate::replay::{CAPTURE_FAILED, SHARD_SAVED};
+use crate::replay::{CAPTURE_FAILED, SHARD_SAVING};
 use crate::screenshots::SCREENSHOT_SAVED;
 use crate::state::AppState;
 
@@ -36,7 +39,7 @@ pub fn init(app: &AppHandle) {
     };
     let _ = window.set_ignore_cursor_events(true);
     for event in [
-        SHARD_SAVED,
+        SHARD_SAVING,
         CAPTURE_FAILED,
         SCREENSHOT_SAVED,
         RECORDING_SAVED,

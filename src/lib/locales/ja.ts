@@ -133,9 +133,9 @@ export const ja: Translation = {
   'settings.microphone': 'マイクを録音',
   'settings.microphoneHint': '別トラックに録音され、編集時に音量を調整できます。',
   'settings.sound': 'キャプチャ音',
-  'settings.soundHint': 'shard を保存するたびに短い音でお知らせします。',
+  'settings.soundHint': 'shard を確保した瞬間に短い音、失敗したときは低い音でお知らせします。',
   'settings.overlay': 'ゲーム内通知',
-  'settings.overlayHint': 'ゲームの上に表示され、クリップには一切映りません。',
+  'settings.overlayHint': 'ゲームの上に表示され、クリップには一切映りません。排他的フルスクリーンのゲームでは表示されないため、ボーダーレスウィンドウにするか、サウンドで確認してください。',
 
   'editor.video': 'ビデオ',
   'editor.mute': 'ミュート',

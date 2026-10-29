@@ -6,7 +6,8 @@
 //!   adapter's Media Foundation H.264 encoder, else the software one, into a ring of whole GOPs;
 //! - audio: WASAPI loopback of the default output (and the chosen or default microphone when
 //!   enabled) into continuous PCM timelines on the same clock;
-//! - one short-lived thread per save, which mixes and encodes the audio and writes the MP4;
+//! - one short-lived thread per save, which mixes and encodes the audio and writes the MP4, at
+//!   background priority (CPU, disk and memory) so a game never waits for it;
 //! - during a continuous recording, one more thread that gets every video packet the ring gets
 //!   and encodes the audio as it comes into a growing MP4 (`record`).
 //!
@@ -342,8 +343,9 @@ impl Engine {
 
     /// Saves the last `bufferSeconds` (from the keyframe before) in the background: the result
     /// arrives through [`EngineEvents::saved`] / [`EngineEvents::save_failed`]. Fails at once
-    /// with "not_ready" or "empty".
-    pub fn save(&self, request: SaveRequest) -> Result<(), &'static str> {
+    /// with "not_ready" or "empty". Returns the clip's length in seconds: what it holds is
+    /// fixed from here on.
+    pub fn save(&self, request: SaveRequest) -> Result<f64, &'static str> {
         let shared = &self.shared;
         if lock(&shared.status).state != CaptureState::Ready {
             return Err(NOT_READY);
@@ -357,6 +359,11 @@ impl Engine {
         if video.is_empty() {
             return Err(EMPTY);
         }
+        let frame = TICKS_PER_SECOND / i64::from(params.fps.max(1));
+        let (first, last) = video.iter().fold((i64::MAX, i64::MIN), |(first, last), p| {
+            (first.min(p.pts), last.max(p.pts))
+        });
+        let seconds = (last - first + frame) as f64 / TICKS_PER_SECOND as f64;
         let snapshot = save::Snapshot {
             params,
             video,
@@ -368,6 +375,7 @@ impl Engine {
         std::thread::Builder::new()
             .name("kryo-save".into())
             .spawn(move || {
+                save::in_background();
                 let result = save::write_clip(&snapshot, &request);
                 drop(snapshot);
                 match result {
@@ -375,7 +383,7 @@ impl Engine {
                     Err(code) => events.save_failed(code),
                 }
             })
-            .map(drop)
+            .map(|_| seconds)
             .map_err(|_| WRITE_FAILED)
     }
 

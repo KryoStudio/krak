@@ -1,5 +1,7 @@
 <!-- The in-game notification. Its window is transparent, click-through, never focused and
-     excluded from screen capture; the backend shows it and hides it again after ~3.4 s. -->
+     excluded from screen capture; the backend shows it and hides it again after ~3.4 s.
+     A clip shows the moment the press is accepted (writing the file comes after, and only a
+     failure shows again). -->
 <script lang="ts">
   import { onMount } from 'svelte';
   import Icon from '$lib/components/Icon.svelte';
@@ -32,11 +34,11 @@
   onMount(() => {
     document.documentElement.classList.add('overlay');
     const listeners = [
-      on('shard-saved', (shard) =>
+      on('shard-saving', (clip) =>
         present(
           false,
           () => t('toast.captured'),
-          () => `${shard.game ?? t('game.desktop')} · ${t('overlay.lastSeconds', { seconds: Math.round(shard.duration) })}`,
+          () => `${clip.game ?? t('game.desktop')} · ${t('overlay.lastSeconds', { seconds: Math.round(clip.duration) })}`,
         ),
       ),
       on('screenshot-saved', (shot) =>

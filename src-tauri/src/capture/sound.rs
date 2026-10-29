@@ -1,25 +1,44 @@
-//! The "clip saved" sound: a short two-note chime (C6 then G6, ~180 ms, peak -12 dBFS),
-//! synthesized once as an in-memory WAV.
+//! Capture sounds, synthesized once as in-memory WAVs (mono, 16-bit, 48 kHz, peak -12 dBFS):
+//! the "clip kept" chime (C6 then G6, ~180 ms), played the moment a press is accepted, and the
+//! "nothing was saved" tone (G5 then C5, lower and longer), played when a clip fails.
 
 use std::sync::OnceLock;
 
 const RATE: u32 = 48_000;
-const LENGTH_MS: u32 = 180;
 /// -12 dBFS.
 const PEAK: f64 = 0.251;
 
-/// The chime as a complete WAV file (mono, 16-bit, 48 kHz).
+/// (frequency, start s, decay time constant s)
+type Note = (f64, f64, f64);
+
+const CHIME: (&[Note], u32) = (&[(1046.5, 0.0, 0.035), (1568.0, 0.07, 0.04)], 180);
+const ERROR: (&[Note], u32) = (&[(784.0, 0.0, 0.06), (523.25, 0.11, 0.08)], 320);
+
+/// The chime as a complete WAV file.
 pub fn chime_wav() -> &'static [u8] {
     static WAV: OnceLock<Vec<u8>> = OnceLock::new();
-    WAV.get_or_init(|| wav(&chime()))
+    WAV.get_or_init(|| wav(&tone(CHIME.0, CHIME.1)))
+}
+
+/// The failure tone as a complete WAV file.
+pub fn error_wav() -> &'static [u8] {
+    static WAV: OnceLock<Vec<u8>> = OnceLock::new();
+    WAV.get_or_init(|| wav(&tone(ERROR.0, ERROR.1)))
 }
 
 /// Plays the chime without blocking (and without the default beep if audio is unavailable).
-#[cfg(windows)]
 pub fn play_chime() {
+    play(chime_wav());
+}
+
+/// Plays the failure tone without blocking.
+pub fn play_error() {
+    play(error_wav());
+}
+
+fn play(wav: &'static [u8]) {
     use windows::Win32::Media::Audio::{PlaySoundW, SND_ASYNC, SND_MEMORY, SND_NODEFAULT};
     use windows::core::PCWSTR;
-    let wav = chime_wav();
     // SAFETY: with SND_MEMORY the "name" is a pointer to the WAV image, which is 'static, so it
     // outlives the asynchronous playback.
     unsafe {
@@ -31,11 +50,9 @@ pub fn play_chime() {
     }
 }
 
-fn chime() -> Vec<i16> {
-    let total = (RATE * LENGTH_MS / 1000) as usize;
+fn tone(notes: &[Note], length_ms: u32) -> Vec<i16> {
+    let total = (RATE * length_ms / 1000) as usize;
     let rate = f64::from(RATE);
-    // (frequency, start s, decay time constant s)
-    let notes = [(1046.5, 0.0, 0.035), (1568.0, 0.07, 0.04)];
     let mut samples: Vec<f64> = (0..total)
         .map(|i| {
             let t = i as f64 / rate;
@@ -87,23 +104,29 @@ fn wav(samples: &[i16]) -> Vec<u8> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn builds_a_valid_short_wav_at_minus_12_dbfs() {
-        let wav = chime_wav();
+    fn samples(wav: &[u8]) -> Vec<i16> {
         assert_eq!(&wav[..4], b"RIFF");
         assert_eq!(&wav[8..16], b"WAVEfmt ");
         let riff_len = u32::from_le_bytes(wav[4..8].try_into().unwrap()) as usize;
         assert_eq!(riff_len + 8, wav.len());
-        let samples: Vec<i16> = wav[44..]
+        wav[44..]
             .as_chunks::<2>()
             .0
             .iter()
             .map(|b| i16::from_le_bytes(*b))
-            .collect();
-        assert_eq!(samples.len(), 48_000 * 180 / 1000);
-        let peak = samples.iter().map(|s| s.unsigned_abs()).max().unwrap();
-        assert!((8200..=8230).contains(&peak), "{peak}");
-        assert_eq!(*samples.last().unwrap(), 0);
-        assert!(samples[0].unsigned_abs() < 100, "starts without a click");
+            .collect()
+    }
+
+    #[test]
+    fn builds_valid_short_wavs_at_minus_12_dbfs() {
+        for (wav, ms) in [(chime_wav(), 180), (error_wav(), 320)] {
+            let samples = samples(wav);
+            assert_eq!(samples.len(), 48_000 * ms / 1000);
+            let peak = samples.iter().map(|s| s.unsigned_abs()).max().unwrap();
+            assert!((8200..=8230).contains(&peak), "{peak}");
+            assert_eq!(*samples.last().unwrap(), 0);
+            assert!(samples[0].unsigned_abs() < 100, "starts without a click");
+        }
+        assert_ne!(chime_wav(), error_wav());
     }
 }

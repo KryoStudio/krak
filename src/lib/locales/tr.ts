@@ -134,9 +134,9 @@ export const tr: Translation = {
   'settings.microphone': 'Mikrofonu kaydet',
   'settings.microphoneHint': 'Ayrı bir kanalda, düzenlerken ayarlanabilir.',
   'settings.sound': 'Yakalama sesi',
-  'settings.soundHint': 'Kaydedilen her shard kısa bir sesle onaylanır.',
+  'settings.soundHint': 'Bir shard tutulduğu anda kısa bir ses, başarısız olursa daha kalın bir ses.',
   'settings.overlay': 'Oyun içi bildirim',
-  'settings.overlayHint': 'Oyunun üstünde görünür, kliplerine asla girmez.',
+  'settings.overlayHint': 'Oyunun üstünde görünür, kliplerine asla girmez. Özel tam ekran modu onu gizler: kenarlıksız pencerede oyna ya da sese güven.',
 
   'editor.video': 'Video',
   'editor.mute': 'Sesi kapat',

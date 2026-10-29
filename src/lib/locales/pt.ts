@@ -134,9 +134,9 @@ export const pt: Translation = {
   'settings.microphone': 'Gravar o microfone',
   'settings.microphoneHint': 'Em uma faixa separada, ajustável na edição.',
   'settings.sound': 'Som de captura',
-  'settings.soundHint': 'Um som curto confirma cada shard salvo.',
+  'settings.soundHint': 'Um som curto assim que um shard é guardado, um mais grave se falhar.',
   'settings.overlay': 'Notificação no jogo',
-  'settings.overlayHint': 'Aparece por cima do jogo e nunca sai nos seus clipes.',
+  'settings.overlayHint': 'Aparece por cima do jogo e nunca sai nos seus clipes. Jogos em tela cheia exclusiva a escondem: use janela sem bordas ou confie no som.',
 
   'editor.video': 'Vídeo',
   'editor.mute': 'Silenciar',

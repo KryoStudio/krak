@@ -86,13 +86,25 @@ fn tracks(
     }
 }
 
-/// Encodes every track in parallel (each on its own thread with COM/MF).
+/// Lowers the calling thread's CPU, disk and memory priorities (Windows' background mode):
+/// a save then only uses what the game leaves, at the cost of taking a little longer under
+/// load. The press was acknowledged already (`crate::replay`).
+pub(super) fn in_background() {
+    use windows::Win32::System::Threading::{
+        GetCurrentThread, SetThreadPriority, THREAD_MODE_BACKGROUND_BEGIN,
+    };
+    // SAFETY: changes the priority of our own thread only.
+    let _ = unsafe { SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_BEGIN) };
+}
+
+/// Encodes every track in parallel (each on its own background thread with COM/MF).
 fn encode(tracks: &[Track]) -> Result<Vec<AacStream>, &'static str> {
     std::thread::scope(|scope| {
         let jobs: Vec<_> = tracks
             .iter()
             .map(|track| {
                 scope.spawn(move || {
+                    in_background();
                     let _com = ComGuard::new();
                     let _mf = MfGuard::new().map_err(|_| ENCODE_FAILED)?;
                     let config = AacConfig {

@@ -133,9 +133,9 @@ export const ko: Translation = {
   'settings.microphone': '마이크 녹음',
   'settings.microphoneHint': '별도 트랙에 녹음되어 편집할 때 조절할 수 있어요.',
   'settings.sound': '캡처 효과음',
-  'settings.soundHint': 'shard가 저장될 때마다 짧은 소리로 알려 줘요.',
+  'settings.soundHint': 'shard가 확보되는 즉시 짧은 소리로, 실패하면 더 낮은 소리로 알려 줘요.',
   'settings.overlay': '게임 내 알림',
-  'settings.overlayHint': '게임 위에 표시되며, 클립에는 절대 나타나지 않아요.',
+  'settings.overlayHint': '게임 위에 표시되며, 클립에는 절대 나타나지 않아요. 전용 전체 화면 게임에서는 보이지 않으니 테두리 없는 창 모드를 쓰거나 효과음을 믿으세요.',
 
   'editor.video': '비디오',
   'editor.mute': '음소거',

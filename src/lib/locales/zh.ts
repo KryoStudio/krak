@@ -133,9 +133,9 @@ export const zh: Translation = {
   'settings.microphone': '录制麦克风',
   'settings.microphoneHint': '单独一条音轨，编辑时可调节。',
   'settings.sound': '捕获提示音',
-  'settings.soundHint': '每保存一个 shard，都会响起简短的提示音。',
+  'settings.soundHint': '一保存 shard 就会响起简短的提示音，失败时则是更低的音。',
   'settings.overlay': '游戏内通知',
-  'settings.overlayHint': '显示在游戏画面上方，绝不会出现在你的片段中。',
+  'settings.overlayHint': '显示在游戏画面上方，绝不会出现在你的片段中。独占全屏的游戏会挡住它：请改用无边框窗口，或留意提示音。',
 
   'editor.video': '视频',
   'editor.mute': '静音',

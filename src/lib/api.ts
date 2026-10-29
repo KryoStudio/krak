@@ -187,6 +187,13 @@ export interface ExportResult {
   reencoded: boolean;
 }
 
+/** A press of the clip hotkey was accepted: the clip is being written (`shard-saved` follows). */
+export interface SavingShard {
+  game: string | null;
+  /** Seconds. */
+  duration: number;
+}
+
 export const api = {
   getSettings: () => invoke<Settings>('get_settings'),
   updateSettings: (patch: Partial<Settings>) => invoke<Settings>('update_settings', { patch }),
@@ -229,6 +236,7 @@ export const api = {
 type Events = {
   'library-changed': null;
   'capture-status': CaptureStatus;
+  'shard-saving': SavingShard;
   'shard-saved': Shard;
   'recording-saved': Shard;
   'screenshot-saved': Screenshot;

@@ -138,9 +138,9 @@ export const pl: Translation = {
   'settings.microphone': 'Nagrywaj mikrofon',
   'settings.microphoneHint': 'Na osobnej ścieżce, z regulacją przy edycji.',
   'settings.sound': 'Dźwięk przechwycenia',
-  'settings.soundHint': 'Krótki dźwięk potwierdza każdy zapisany shard.',
+  'settings.soundHint': 'Krótki dźwięk, gdy tylko shard zostanie zachowany, niższy, jeśli się nie uda.',
   'settings.overlay': 'Powiadomienie w grze',
-  'settings.overlayHint': 'Wyświetla się nad grą i nigdy nie trafia do Twoich klipów.',
+  'settings.overlayHint': 'Wyświetla się nad grą i nigdy nie trafia do Twoich klipów. Gra w wyłącznym trybie pełnoekranowym ją zasłania: wybierz okno bez ramek albo polegaj na dźwięku.',
 
   'editor.video': 'Wideo',
   'editor.mute': 'Wycisz',

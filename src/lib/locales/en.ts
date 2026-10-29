@@ -132,9 +132,9 @@ export const en = {
   'settings.microphone': 'Record the microphone',
   'settings.microphoneHint': 'On its own track, adjustable when editing.',
   'settings.sound': 'Capture sound',
-  'settings.soundHint': 'A short sound confirms every saved shard.',
+  'settings.soundHint': 'A short sound as soon as a shard is kept, a lower one if it failed.',
   'settings.overlay': 'In-game notification',
-  'settings.overlayHint': 'Shows on top of the game, and never appears in your clips.',
+  'settings.overlayHint': 'Shows on top of the game and never in your clips. Games in exclusive fullscreen hide it: play in borderless, or count on the sound.',
 
   'editor.video': 'Video',
   'editor.mute': 'Mute',

@@ -134,9 +134,9 @@ export const de: Translation = {
   'settings.microphone': 'Mikrofon aufnehmen',
   'settings.microphoneHint': 'Auf einer eigenen Spur, beim Bearbeiten einstellbar.',
   'settings.sound': 'Erfassungston',
-  'settings.soundHint': 'Ein kurzer Ton bestätigt jeden gespeicherten Shard.',
+  'settings.soundHint': 'Ein kurzer Ton, sobald ein Shard gesichert ist, ein tieferer, wenn es nicht geklappt hat.',
   'settings.overlay': 'Benachrichtigung im Spiel',
-  'settings.overlayHint': 'Erscheint über dem Spiel und taucht nie in deinen Clips auf.',
+  'settings.overlayHint': 'Erscheint über dem Spiel und nie in deinen Clips. Exklusiver Vollbildmodus verdeckt sie: Spiel im randlosen Fenster oder verlass dich auf den Ton.',
 
   'editor.video': 'Video',
   'editor.mute': 'Stummschalten',
