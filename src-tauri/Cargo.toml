@@ -4,7 +4,7 @@ version = "0.3.0"
 description = "Free, open-source game clipping for Windows. 100% local."
 authors = ["Kryo Studio"]
 license = "GPL-3.0-only"
-repository = "https://github.com/KryoStudio/kryo-shard"
+repository = "https://github.com/KryoStudio/krak"
 edition = "2024"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html

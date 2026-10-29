@@ -46,7 +46,7 @@ const CLIENT_ID: &str = "1565168468159103067";
 const LARGE_IMAGE: &str = "logo";
 const IMAGE_READY: &str = "ready";
 const IMAGE_RECORDING: &str = "rec";
-const DOWNLOAD_URL: &str = "https://github.com/KryoStudio/kryo-shard/releases/latest";
+const DOWNLOAD_URL: &str = "https://github.com/KryoStudio/krak/releases/latest";
 /// Emitted when a continuous recording is saved (payload: the shard).
 const RECORDING_SAVED: &str = "recording-saved";
 
@@ -868,7 +868,7 @@ mod tests {
                         },
                         "buttons": [{
                             "label": "Get Krak",
-                            "url": "https://github.com/KryoStudio/kryo-shard/releases/latest"
+                            "url": "https://github.com/KryoStudio/krak/releases/latest"
                         }],
                         "instance": false
                     }

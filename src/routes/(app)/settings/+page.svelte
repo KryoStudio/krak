@@ -28,7 +28,7 @@
   const status = $derived(capture.status);
   const encoder = $derived(capture.encoder);
   const motion = $derived(prefersReducedMotion.current ? 0 : 1);
-  const REPO = 'https://github.com/KryoStudio/kryo-shard';
+  const REPO = 'https://github.com/KryoStudio/krak';
 
   const sections: { id: SettingsSection; icon: IconName }[] = [
     { id: 'general', icon: 'settings' },

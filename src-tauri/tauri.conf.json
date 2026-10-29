@@ -143,7 +143,7 @@
     "updater": {
       "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDAxRDVGMTgyMjhCQTU3RUQKUldUdFY3b29ndkhWQWZlbTlqbDdhVmpJZm1vcDc4dEhrNkRoUU0yWTVHbk43K0h5T3RmRlpxOG0K",
       "endpoints": [
-        "https://github.com/KryoStudio/kryo-shard/releases/latest/download/latest.json"
+        "https://github.com/KryoStudio/krak/releases/latest/download/latest.json"
       ],
       "windows": {
         "installMode": "passive"

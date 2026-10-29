@@ -20,4 +20,4 @@ The code of Krak is free software under the [GPL-3.0](LICENSE). The **names and 
 
 Pick your own name and logo, replace the files in `assets/brand` and `src-tauri/icons`, and keep the "Based on Krak by Kryo Studio" notice required by the [NOTICE](NOTICE) file.
 
-Questions: open an issue on [GitHub](https://github.com/KryoStudio/kryo-shard/issues).
+Questions: open an issue on [GitHub](https://github.com/KryoStudio/krak/issues).
