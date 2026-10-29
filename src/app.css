@@ -1,20 +1,20 @@
 :root {
-  /* Surfaces: neutral graphite, from the canvas up to popovers. */
-  --bg: #0a0b0d;
-  --bg-raised: #0e0f12;
-  --surface: #131418;
-  --surface-2: #191a1f;
-  --surface-3: #212228;
-  --border: rgba(255, 255, 255, 0.06);
-  --border-strong: rgba(255, 255, 255, 0.1);
+  /* Krak — Nuit / Givre / Glacier. Surfaces from the page up to popovers. */
+  --bg: #06090d;
+  --bg-raised: #0a0e14;
+  --surface: #0a0e14;
+  --surface-2: #10161f;
+  --surface-3: #1b2430;
+  --border: #141b25;
+  --border-strong: #1b2430;
 
-  --text: #ededef;
-  --text-2: #a1a2a9;
-  --text-3: #6e6f77;
+  --text: #e8f1f2;
+  --text-2: #b3bec7;
+  --text-3: #7c8794;
 
   /* One accent, used sparingly. Overridden by [data-accent]. */
-  --accent: #5aa9ff;
-  --accent-fg: #04111f;
+  --accent: #7fc6db;
+  --accent-fg: #0a0e14;
   --accent-soft: color-mix(in srgb, var(--accent) 14%, transparent);
   --accent-line: color-mix(in srgb, var(--accent) 45%, transparent);
 
@@ -22,14 +22,15 @@
   --success: #3dd68c;
   --rec: #ff4f5e;
 
-  /* Brand colors of the logo: fixed, whatever the accent. */
-  --face: #1aa0e6;
-  --glace: #e8fbff;
+  /* The Krak mark: Givre on dark, Nuit on light, whatever the accent. */
+  --face: #e8f1f2;
+  --glace: #e8f1f2;
+  --nuit: #0a0e14;
 
-  --font-ui: 'Inter Variable', 'Segoe UI Variable Text', system-ui, sans-serif;
-  --font-brand: 'Unbounded Variable', var(--font-ui);
+  --font-ui: 'Space Grotesk Variable', 'Segoe UI Variable Text', system-ui, sans-serif;
+  --font-brand: var(--font-ui);
 
-  --radius-sm: 6px;
+  --radius-sm: 7px;
   --radius: 10px;
   --radius-lg: 14px;
 
@@ -39,7 +40,7 @@
   --normal: 200ms;
   --slow: 320ms;
 
-  --shadow-pop: 0 0 0 1px var(--border-strong), 0 16px 40px -12px rgba(0, 0, 0, 0.7);
+  --shadow-pop: 0 0 0 1px var(--border-strong), 0 18px 44px -14px rgba(0, 0, 0, 0.8);
 
   --titlebar: 44px;
   --sidebar: 244px;
@@ -49,11 +50,11 @@
 }
 
 :root[data-accent='aurora'] {
-  --accent: #9a8cff;
+  --accent: #a89cff;
   --accent-fg: #0e0a24;
 }
 :root[data-accent='jade'] {
-  --accent: #3fd49a;
+  --accent: #5fd3a4;
   --accent-fg: #03170f;
 }
 :root[data-accent='ember'] {
@@ -65,7 +66,7 @@
   --accent-fg: #22050f;
 }
 :root[data-accent='frost'] {
-  --accent: #e6e8ec;
+  --accent: #e8f1f2;
   --accent-fg: #0a0b0d;
 }
 
@@ -82,7 +83,6 @@ body {
   font-family: var(--font-ui);
   font-size: 14px;
   line-height: 1.45;
-  font-feature-settings: 'cv11', 'ss03';
   -webkit-font-smoothing: antialiased;
   user-select: none;
   overflow: hidden;

@@ -5,22 +5,31 @@
   import Logo from './Logo.svelte';
   import Icon from './Icon.svelte';
   import GameIcon from './GameIcon.svelte';
-  import { t } from '$lib/i18n.svelte';
+  import { formatSize, t } from '$lib/i18n.svelte';
   import { library } from '$lib/library.svelte';
+  import { screens } from '$lib/screenshots.svelte';
   import { settings } from '$lib/settings.svelte';
-  import { capture } from '$lib/capture.svelte';
+  import { capture, formatClock } from '$lib/capture.svelte';
   import { showError } from '$lib/shard-actions';
   import { tooltip } from '$lib/tooltip';
   import { filterFor, ui, type Filter } from '$lib/ui.svelte';
 
   const collapsed = $derived(settings.value.sidebarCollapsed);
-  const onSettings = $derived(page.url.pathname.startsWith('/settings'));
-  const active = $derived(onSettings ? 'settings' : ui.filter);
+  const path = $derived(page.url.pathname);
+  const active = $derived(
+    path.startsWith('/settings')
+      ? 'settings'
+      : path.startsWith('/screenshots')
+        ? 'screenshots'
+        : path.startsWith('/glacier')
+          ? ui.filter
+          : 'home',
+  );
 
   function show(filter: Filter) {
     ui.filter = filter;
     ui.playing = null;
-    if (onSettings) goto('/');
+    if (!path.startsWith('/glacier')) goto('/glacier');
   }
 
   // One highlight slides between the items of the list instead of each item lighting up.
@@ -47,21 +56,25 @@
     return () => ro.disconnect();
   });
 
-  const engineState = $derived(capture.status.state);
+  const recording = $derived(capture.status.recording);
+  const engineState = $derived(recording ? 'recording' : capture.status.state);
   const seconds = $derived(settings.value.bufferSeconds);
   const status = $derived(
-    {
-      starting: { label: t('capture.starting'), hint: t('capture.hintStarting'), action: '' },
-      ready: { label: t('capture.ready'), hint: t('capture.hint', { seconds }), action: t('capture.pause') },
-      paused: { label: t('capture.paused'), hint: t('capture.hintPaused'), action: t('capture.resume') },
-      error: { label: t('capture.error'), hint: t('capture.hintError'), action: t('nav.settings') },
-    }[engineState],
+    recording
+      ? { label: `${t('record.live')} · ${formatClock(recording.seconds)}`, hint: formatSize(recording.bytes), action: t('record.stop') }
+      : {
+          starting: { label: t('capture.starting'), hint: t('capture.hintStarting'), action: '' },
+          ready: { label: t('capture.ready'), hint: t('capture.hint', { seconds }), action: t('capture.pause') },
+          paused: { label: t('capture.paused'), hint: t('capture.hintPaused'), action: t('capture.resume') },
+          error: { label: t('capture.error'), hint: t('capture.hintError'), action: t('nav.settings') },
+        }[capture.status.state],
   );
   // The buffer fills up after (re)starting: show it until it holds the full length.
   const fill = $derived(engineState === 'ready' ? Math.min(1, capture.status.bufferedSeconds / seconds) : 0);
 
   function onStatus() {
-    if (engineState === 'ready') capture.setPaused(true).catch(showError);
+    if (recording) capture.toggleRecording();
+    else if (engineState === 'ready') capture.setPaused(true).catch(showError);
     else if (engineState === 'paused') capture.setPaused(false).catch(showError);
     else if (engineState === 'error') goto('/settings');
   }
@@ -82,6 +95,8 @@
   </button>
 {/snippet}
 
+{#snippet imageIcon()}<Icon name="image" size={16} />{/snippet}
+{#snippet homeIcon()}<Icon name="home" size={16} />{/snippet}
 {#snippet gridIcon()}<Icon name="grid" size={16} />{/snippet}
 {#snippet starIcon()}<Icon name="star" size={16} />{/snippet}
 {#snippet gearIcon()}<Icon name="settings" size={16} />{/snippet}
@@ -89,7 +104,7 @@
 <aside class:collapsed>
   <div class="brand" data-tauri-drag-region>
     <Logo size={26} />
-    <span class="wordmark" data-tauri-drag-region>KRYO <span>SHARD</span></span>
+    <span class="wordmark" data-tauri-drag-region>krak</span>
   </div>
 
   <button
@@ -119,8 +134,10 @@
         style:height="{highlight.h}px"
       ></span>
 
+      {@render item('home', t('nav.home'), null, homeIcon, () => ((ui.playing = null), goto('/')))}
       {@render item('all', t('nav.glacier'), library.shards.length, gridIcon, () => show('all'))}
       {@render item('favorites', t('nav.favorites'), library.favorites, starIcon, () => show('favorites'))}
+      {@render item('screenshots', t('nav.screenshots'), screens.items.length, imageIcon, () => ((ui.playing = null), goto('/screenshots')))}
 
       {#if library.games.length}
         <div class="section">
@@ -186,14 +203,11 @@
     flex: none;
   }
   .wordmark {
-    font-family: var(--font-brand);
     font-weight: 700;
-    font-size: 14px;
-    letter-spacing: 0.02em;
-  }
-  .wordmark span {
-    font-weight: 400;
-    color: var(--text-2);
+    font-size: 21px;
+    line-height: 1;
+    letter-spacing: -0.05em;
+    padding-bottom: 2px;
   }
 
   .status {
@@ -226,8 +240,8 @@
     right: 0;
     bottom: 0;
     height: 2px;
-    background: var(--success);
-    opacity: 0.6;
+    background: var(--accent);
+    opacity: 0.7;
     transform-origin: left;
     transition: transform 1s linear;
   }
@@ -244,8 +258,8 @@
     background: var(--text-3);
   }
   [data-state='ready'] .dot {
-    background: var(--success);
-    box-shadow: 0 0 0 3px color-mix(in srgb, var(--success) 18%, transparent);
+    background: var(--accent);
+    box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 20%, transparent);
     animation: breathe 2.4s var(--ease-in-out) infinite;
   }
   [data-state='paused'] .dot {
@@ -253,6 +267,17 @@
   }
   [data-state='error'] .dot {
     background: var(--danger);
+  }
+  [data-state='recording'] .dot {
+    background: var(--rec);
+    box-shadow: 0 0 0 3px color-mix(in srgb, var(--rec) 22%, transparent);
+    animation: blink 1.2s var(--ease-in-out) infinite;
+  }
+  [data-state='recording'] {
+    border-color: color-mix(in srgb, var(--rec) 35%, transparent);
+  }
+  [data-state='recording'] strong {
+    font-variant-numeric: tabular-nums;
   }
   [data-state='starting'] .dot {
     animation: blink 1s var(--ease-in-out) infinite;
@@ -268,6 +293,9 @@
   .status-text strong {
     font-size: 13px;
     font-weight: 600;
+  }
+  [data-state='ready'] .status-text strong {
+    color: var(--accent);
   }
   .status-text span {
     font-size: 11.5px;
@@ -443,7 +471,7 @@
   }
   @keyframes breathe {
     50% {
-      box-shadow: 0 0 0 5px color-mix(in srgb, var(--success) 8%, transparent);
+      box-shadow: 0 0 0 5px color-mix(in srgb, var(--accent) 8%, transparent);
     }
   }
 </style>

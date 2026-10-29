@@ -12,13 +12,15 @@
   import ContextMenu from '$lib/components/ContextMenu.svelte';
   import ConfirmDialog from '$lib/components/ConfirmDialog.svelte';
   import Toasts from '$lib/components/Toasts.svelte';
+  import Onboarding from '$lib/components/Onboarding.svelte';
   import { native, on } from '$lib/api';
-  import { capture, saveReplay } from '$lib/capture.svelte';
+  import { capture, formatClock, saveReplay } from '$lib/capture.svelte';
   import { hasKey, t } from '$lib/i18n.svelte';
   import { library } from '$lib/library.svelte';
+  import { screens } from '$lib/screenshots.svelte';
   import { settings } from '$lib/settings.svelte';
-  import { announce } from '$lib/shard-actions';
-  import { toast, ui } from '$lib/ui.svelte';
+  import { announce, showError } from '$lib/shard-actions';
+  import { selection, toast, ui } from '$lib/ui.svelte';
   import { updates } from '$lib/updates.svelte';
 
   let { children } = $props();
@@ -28,13 +30,17 @@
   $effect(() => {
     void page.url.pathname;
     ui.playing = null;
+    ui.viewing = null;
+    selection.clear();
   });
 
   onMount(() => {
     library.load().catch(console.error);
+    screens.load().catch(console.error);
     if (!native) return;
 
     capture.refresh().catch(console.error);
+    capture.loadEncoder();
     // Look for an update once things have settled.
     const updateCheck = setTimeout(() => updates.check(true), 8000);
     // Buffer fill and memory move every second; only ask while someone is looking.
@@ -47,7 +53,10 @@
       on('library-changed', () => {
         if (library.demo) return;
         clearTimeout(reload);
-        reload = setTimeout(() => library.load().catch(console.error), 150);
+        reload = setTimeout(() => {
+          library.load().catch(console.error);
+          screens.load().catch(console.error);
+        }, 150);
       }),
       on('capture-status', (status) => {
         capture.status = status;
@@ -56,6 +65,25 @@
       on('capture-failed', (code) => {
         const key = `capture.failed.${code}`;
         toast({ kind: 'error', title: t(hasKey(key) ? key : 'capture.failed.encode_failed') });
+      }),
+      on('recording-saved', (shard) => {
+        library.upsert(shard);
+        toast({
+          kind: 'success',
+          title: t('record.saved'),
+          body: `${shard.game ?? t('game.desktop')} · ${formatClock(shard.duration)}`,
+          action: { label: t('toast.view'), run: () => (ui.playing = shard.id) },
+        });
+      }),
+      on('recording-failed', (code) => showError(code)),
+      on('screenshot-saved', (shot) => {
+        screens.upsert(shot);
+        toast({
+          kind: 'success',
+          title: t('screens.saved'),
+          body: shot.game ?? t('game.desktop'),
+          action: { label: t('toast.view'), run: () => goto('/screenshots').then(() => (ui.viewing = shot.id)) },
+        });
       }),
       on('navigate', (route) => goto(route)),
     ];
@@ -109,6 +137,9 @@
   </div>
 </div>
 
+{#if !settings.value.onboarded}
+  <Onboarding />
+{/if}
 <ContextMenu />
 <ConfirmDialog />
 <Toasts />

@@ -9,7 +9,26 @@
   import { tooltip } from '$lib/tooltip';
   import { openMenu, ui } from '$lib/ui.svelte';
 
-  let { shard, fresh = false }: { shard: Shard; fresh?: boolean } = $props();
+  let {
+    shard,
+    fresh = false,
+    selected = false,
+    selecting = false,
+    onselect,
+  }: {
+    shard: Shard;
+    fresh?: boolean;
+    selected?: boolean;
+    /** Some shard is selected: a click selects instead of playing. */
+    selecting?: boolean;
+    /** Given, the card can be selected (shift = extend the range). */
+    onselect?: (shard: Shard, shift: boolean) => void;
+  } = $props();
+
+  function onThumbClick(e: MouseEvent) {
+    if (onselect && (selecting || e.ctrlKey || e.shiftKey)) onselect(shard, e.shiftKey);
+    else actions.play(shard);
+  }
 
   const tint = $derived(gameTint(shard.game));
   const title = $derived(actions.displayTitle(shard));
@@ -64,6 +83,8 @@
       openMenu(r.left + 24, r.top + 24, actions.shardMenu(shard));
       return;
     }
+    // In selection mode, Delete applies to the whole selection (handled by the Glacier).
+    if (selecting && e.key === 'Delete') return;
     actions.handleShardKey(e, shard);
   }
 
@@ -81,12 +102,12 @@
 
 <!-- Shortcuts and right-click from the focused thumbnail or buttons bubble up to the card. -->
 <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
-<article bind:this={card} class="card" class:renaming class:previewing class:fresh {onkeydown} {oncontextmenu}>
+<article bind:this={card} class="card" class:renaming class:previewing class:fresh class:selected {onkeydown} {oncontextmenu}>
   <button
     class="thumb"
     style:--a={tint[0]}
     style:--b={tint[1]}
-    onclick={() => actions.play(shard)}
+    onclick={onThumbClick}
     onmouseenter={startPreview}
     onmouseleave={stopPreview}
     aria-label="{t('shard.play')} · {title}"
@@ -113,7 +134,24 @@
     {#if duration > 0}<span class="duration">{formatDuration(duration)}</span>{/if}
   </button>
 
-  <div class="actions">
+  {#if onselect}
+    <button
+      class="check"
+      class:on={selected}
+      class:visible={selecting}
+      onclick={(e) => onselect(shard, e.shiftKey)}
+      role="checkbox"
+      aria-checked={selected}
+      aria-label={t('selection.select')}
+    >
+      <Icon name="check" size={13} stroke={3} />
+    </button>
+  {/if}
+
+  <div class="actions" class:hidden={selecting}>
+    <button class="more" onclick={openMore} aria-label={t('shard.more')} aria-haspopup="menu">
+      <Icon name="more" size={16} stroke={2.4} />
+    </button>
     <button
       class="fav"
       class:on={shard.favorite}
@@ -123,9 +161,6 @@
       use:tooltip={{ text: t(shard.favorite ? 'shard.unfavorite' : 'shard.favorite'), side: 'bottom' }}
     >
       <Icon name="star" size={15} fill={shard.favorite} />
-    </button>
-    <button class="more" onclick={openMore} aria-label={t('shard.more')} aria-haspopup="menu">
-      <Icon name="more" size={16} stroke={2.4} />
     </button>
   </div>
 
@@ -284,12 +319,18 @@
     backdrop-filter: blur(6px);
   }
 
+  /* Top-right: the star keeps its corner; "more" fades in to its left on hover. */
   .actions {
     position: absolute;
     top: 13px;
     right: 13px;
     display: flex;
     gap: 4px;
+    transition: opacity var(--normal);
+  }
+  .actions.hidden {
+    opacity: 0;
+    pointer-events: none;
   }
   .actions button {
     display: grid;
@@ -301,12 +342,17 @@
     background: rgba(10, 11, 13, 0.55);
     backdrop-filter: blur(8px);
     opacity: 0;
-    transform: translateY(-3px);
     transition:
-      opacity var(--normal),
-      transform var(--normal) var(--ease-out),
+      opacity var(--normal) var(--ease-out),
+      transform var(--slow) var(--ease-out),
       background var(--fast),
       color var(--fast);
+  }
+  .actions .more {
+    transform: translateX(6px) scale(0.9);
+  }
+  .actions .fav {
+    transform: scale(0.85);
   }
   .actions button:hover {
     background: rgba(10, 11, 13, 0.8);
@@ -326,6 +372,55 @@
   }
   .fav :global(svg) {
     transition: transform var(--fast) var(--ease-out);
+  }
+
+  /* Top-left: the selection box, shown on hover and whenever something is selected. */
+  .check {
+    position: absolute;
+    top: 13px;
+    left: 13px;
+    display: grid;
+    place-items: center;
+    width: 24px;
+    height: 24px;
+    border-radius: 7px;
+    color: transparent;
+    background: rgba(10, 11, 13, 0.5);
+    box-shadow: inset 0 0 0 1.5px rgba(255, 255, 255, 0.75);
+    backdrop-filter: blur(8px);
+    opacity: 0;
+    transform: scale(0.85);
+    transition:
+      opacity var(--normal) var(--ease-out),
+      transform var(--slow) var(--ease-out),
+      background var(--fast),
+      color var(--fast),
+      box-shadow var(--fast);
+  }
+  .card:hover .check,
+  .check.visible,
+  .check:focus-visible {
+    opacity: 1;
+    transform: none;
+  }
+  .check:hover {
+    background: rgba(10, 11, 13, 0.75);
+  }
+  .check.on {
+    color: var(--accent-fg);
+    background: var(--accent);
+    box-shadow: none;
+  }
+
+  .card.selected {
+    border-color: var(--accent);
+    box-shadow: 0 0 0 1px var(--accent);
+  }
+  .card.selected .thumb {
+    transform: scale(0.94);
+  }
+  .thumb {
+    transition: transform var(--slow) var(--ease-out);
   }
 
   .info {

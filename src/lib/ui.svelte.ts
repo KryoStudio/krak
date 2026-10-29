@@ -1,3 +1,4 @@
+import { SvelteSet } from 'svelte/reactivity';
 import type { IconName } from './components/Icon.svelte';
 
 /** 'desktop' = clips outside any game folder; `game:<name>` = one game. */
@@ -16,9 +17,18 @@ export const ui = $state({
   editing: false,
   /** Shard just captured: its card is highlighted for a moment. */
   fresh: null as string | null,
+  /** Screenshot open in the viewer. */
+  viewing: null as string | null,
+  /** Open category of the settings page. */
+  settingsSection: 'capture' as SettingsSection,
 });
 
+export type SettingsSection = 'general' | 'capture' | 'video' | 'audio' | 'storage' | 'appearance' | 'about';
+
 export const filterFor = (game: string | null): Filter => (game === null ? 'desktop' : `game:${game}`);
+
+/** Shards checked in the Glacier. Non-empty = selection mode (clicks select instead of play). */
+export const selection = new SvelteSet<string>();
 
 // Toasts -------------------------------------------------------------------------
 

@@ -2,22 +2,34 @@ import { api, errorCode, native, type Settings } from './api';
 
 const defaults: Settings = {
   hotkey: 'F9',
+  recordHotkey: 'Alt+F9',
+  screenshotHotkey: 'Ctrl+F9',
+  discordPresence: true,
+  watermark: false,
   bufferSeconds: 30,
-  fps: 60,
   quality: 'high',
-  clipsDir: 'C:\\Users\\you\\Videos\\Kryo Shard',
+  codec: 'auto',
+  resolution: 'native',
+  fps: 60,
+  bitrate: 40,
+  tenBit: true,
+  audioBitrate: 192,
+  clipsDir: 'C:\\Users\\you\\Videos\\Krak',
   language: null,
   accent: 'glacier',
   sidebarCollapsed: false,
   launchAtStartup: false,
   closeToTray: true,
   microphone: false,
+  microphoneDevice: null,
   captureSound: true,
   overlay: true,
+  storageLimitGb: null,
+  onboarded: false,
 };
 
 // Browser preview only: in the app, settings live in the backend.
-const STORAGE_KEY = 'kryo-shard.settings';
+const STORAGE_KEY = 'krak.settings';
 
 class SettingsStore {
   value = $state<Settings>({ ...defaults });

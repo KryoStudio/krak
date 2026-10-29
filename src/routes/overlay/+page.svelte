@@ -36,6 +36,20 @@
         present(
           false,
           () => t('toast.captured'),
+          () => `${shard.game ?? t('game.desktop')} · ${t('overlay.lastSeconds', { seconds: Math.round(shard.duration) })}`,
+        ),
+      ),
+      on('screenshot-saved', (shot) =>
+        present(
+          false,
+          () => t('screens.saved'),
+          () => shot.game ?? t('game.desktop'),
+        ),
+      ),
+      on('recording-saved', (shard) =>
+        present(
+          false,
+          () => t('record.saved'),
           () => `${shard.game ?? t('game.desktop')} · ${formatDuration(shard.duration)}`,
         ),
       ),
@@ -45,7 +59,7 @@
       }),
     ];
     // Browser preview of /overlay: show one.
-    if (!native) present(false, () => t('toast.captured'), () => 'Rocket League · 0:30');
+    if (!native) present(false, () => t('toast.captured'), () => `Rocket League · ${t('overlay.lastSeconds', { seconds: 30 })}`);
     return () => listeners.forEach((l) => l.then((unlisten) => unlisten()));
   });
 </script>
@@ -55,7 +69,7 @@
     <div class="card" class:shown class:failed={note.failed}>
       {#key note.id}
         <span class="badge">
-          {#if note.failed}<Icon name="alert" size={18} stroke={2} />{:else}<Logo size={26} />{/if}
+          {#if note.failed}<Icon name="alert" size={18} stroke={2} />{:else}<Logo size={26} color="var(--nuit)" />{/if}
         </span>
       {/key}
       <div class="text">
@@ -86,14 +100,14 @@
     position: relative;
     display: flex;
     align-items: center;
-    gap: 13px;
+    gap: 14px;
     width: 330px;
-    padding: 13px 16px 13px 13px;
+    padding: 14px 22px 14px 14px;
     border-radius: 14px;
-    background: rgba(17, 18, 22, 0.94);
+    background: rgba(10, 14, 20, 0.96);
     box-shadow:
-      0 0 0 1px rgba(255, 255, 255, 0.1),
-      0 12px 32px -8px rgba(0, 0, 0, 0.7);
+      inset 0 0 0 1px #1b2430,
+      0 14px 34px -10px rgba(0, 0, 0, 0.75);
     overflow: hidden;
     opacity: 0;
     transform: translateX(24px) scale(0.98);
@@ -109,33 +123,34 @@
   .badge {
     display: grid;
     place-items: center;
-    width: 38px;
-    height: 38px;
+    width: 40px;
+    height: 40px;
     flex: none;
     border-radius: 10px;
-    background: rgba(255, 255, 255, 0.05);
+    background: var(--face);
     animation: pop 520ms var(--ease-out);
   }
   .failed .badge {
     color: var(--danger);
-    background: color-mix(in srgb, var(--danger) 14%, transparent);
+    background: color-mix(in srgb, var(--danger) 16%, transparent);
   }
 
   .text {
     display: flex;
     flex-direction: column;
-    gap: 1px;
+    gap: 2px;
     min-width: 0;
-    line-height: 1.35;
+    line-height: 1.3;
   }
   strong {
-    font-size: 14.5px;
-    font-weight: 650;
-    color: #fff;
+    font-size: 16px;
+    font-weight: 700;
+    letter-spacing: -0.01em;
+    color: var(--text);
   }
   .text span {
     font-size: 13px;
-    color: var(--text-2);
+    color: var(--text-3);
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;

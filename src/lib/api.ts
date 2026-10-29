@@ -5,22 +5,99 @@ import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 
 export const native = isTauri();
 
-export type Quality = 'balanced' | 'high' | 'ultra';
+export type Quality = 'standard' | 'high' | 'premium' | 'custom';
+export type Codec = 'h264' | 'hevc' | 'av1';
+export type Backend = 'nvenc' | 'mediafoundation' | 'software';
 
 export interface Settings {
   hotkey: string;
+  /** Starts / stops continuous recording. */
+  recordHotkey: string;
+  /** Saves the current frame as a PNG. */
+  screenshotHotkey: string;
+  /** Show what you play and clip on your Discord profile. */
+  discordPresence: boolean;
+  /** Exports carry a small "by krak" badge (off by default: no watermark unless asked). */
+  watermark: boolean;
   bufferSeconds: number;
-  fps: number;
   quality: Quality;
+  /** 'auto' lets the preset decide. */
+  codec: 'auto' | Codec;
+  /** Cap on the short side; never upscales. */
+  resolution: 'native' | '1440' | '1080' | '720';
+  /** 30 | 60 | 120 | 144, capped to the monitor refresh rate by the engine. */
+  fps: number;
+  /** Mbit/s, custom quality only. */
+  bitrate: number;
+  /** Custom quality only, HEVC/AV1. */
+  tenBit: boolean;
+  /** AAC kbps for the game and mix tracks. */
+  audioBitrate: number;
   clipsDir: string;
-  language: 'fr' | 'en' | null;
+  /** A language code from locales/index.ts, null = follow Windows. */
+  language: string | null;
   accent: string;
   sidebarCollapsed: boolean;
   launchAtStartup: boolean;
   closeToTray: boolean;
   microphone: boolean;
+  /** WASAPI endpoint id, null = Windows default. */
+  microphoneDevice: string | null;
   captureSound: boolean;
   overlay: boolean;
+  /** Oldest non-favorite clips go to the Recycle Bin beyond this. null = no limit. */
+  storageLimitGb: number | null;
+  /** First-run wizard done. */
+  onboarded: boolean;
+}
+
+/** What the engine would record with given settings. */
+export interface ResolvedVideo {
+  backend: Backend;
+  codec: Codec;
+  tenBit: boolean;
+  width: number;
+  height: number;
+  fps: number;
+  /** Average bit/s to expect. */
+  bitrate: number;
+}
+
+export interface EncoderInfo {
+  gpu: string;
+  vendor: 'nvidia' | 'amd' | 'intel' | null;
+  nvenc: boolean;
+  codecs: Record<Codec, boolean>;
+  tenBit: { hevc: boolean; av1: boolean };
+  /** Whether Windows can play these formats on this PC. */
+  decoders: { hevc: boolean; av1: boolean };
+  refreshRate: number;
+  width: number;
+  height: number;
+}
+
+export interface Microphone {
+  id: string;
+  name: string;
+  isDefault: boolean;
+}
+
+export interface StorageInfo {
+  usedBytes: number;
+  clipCount: number;
+  freeBytes: number;
+}
+
+/** A PNG in <clipsDir>/Screenshots/<Game>/. */
+export interface Screenshot {
+  /** Path relative to the clips folder, forward slashes. */
+  id: string;
+  path: string;
+  game: string | null;
+  createdAt: number;
+  size: number;
+  width: number;
+  height: number;
 }
 
 export interface Shard {
@@ -39,7 +116,8 @@ export interface Shard {
 
 export interface CaptureStatus {
   state: 'starting' | 'ready' | 'paused' | 'error';
-  encoder: 'nvidia' | 'amd' | 'intel' | 'software' | null;
+  /** 'other': a hardware encoder from another maker. */
+  encoder: 'nvidia' | 'amd' | 'intel' | 'software' | 'other' | null;
   width: number;
   height: number;
   fps: number;
@@ -48,6 +126,13 @@ export interface CaptureStatus {
   microphone: boolean;
   error: string | null;
   audioError: string | null;
+  codec: Codec | null;
+  tenBit: boolean;
+  /** bit/s */
+  bitrate: number;
+  backend: Backend | null;
+  /** Continuous recording in progress (the replay keeps working meanwhile). */
+  recording: { seconds: number; bytes: number } | null;
 }
 
 /** What the editor needs to know about a clip. */
@@ -59,6 +144,13 @@ export interface ShardInfo {
   audioTracks: { name: string; kind: 'mix' | 'game' | 'mic' | 'other' }[];
 }
 
+/** Peak level (0..1 of full scale) per time slice, for one audio track. */
+export interface Waveform {
+  name: string;
+  kind: ShardInfo['audioTracks'][number]['kind'];
+  peaks: number[];
+}
+
 export interface ExportRequest {
   id: string;
   /** Seconds, within the clip. */
@@ -66,9 +158,13 @@ export interface ExportRequest {
   end: number;
   /** 0 to 2, 1 = unchanged. `mic` only matters when the clip has a separate microphone track. */
   gains: { game: number; mic: number };
-  /** copy: a new clip next to the original. discord: a file under `maxBytes`, put on the clipboard. */
-  target: 'copy' | 'discord';
+  /** copy: a new clip next to the original. discord: a file under `maxBytes`, put on the clipboard.
+   *  file: written to `path` (chosen with chooseExportPath), all tracks, original quality. */
+  target: 'copy' | 'discord' | 'file';
   maxBytes: number | null;
+  path?: string | null;
+  /** Burn a small "by krak" badge in the top right corner (forces a re-encode). */
+  watermark?: boolean;
 }
 
 export interface ExportResult {
@@ -95,12 +191,33 @@ export const api = {
   probeShard: (id: string) => invoke<ShardInfo>('probe_shard', { id }),
   exportShard: (request: ExportRequest) => invoke<ExportResult>('export_shard', { request }),
   cancelExport: () => invoke<void>('cancel_export'),
+  getEncoderInfo: () => invoke<EncoderInfo>('get_encoder_info'),
+  resolveVideo: (patch: Partial<Settings>) => invoke<ResolvedVideo>('resolve_video', { patch }),
+  listMicrophones: () => invoke<Microphone[]>('list_microphones'),
+  getStorageInfo: () => invoke<StorageInfo>('get_storage_info'),
+  startRecording: () => invoke<CaptureStatus>('start_recording'),
+  /** The finished file arrives as a `recording-saved` event. */
+  stopRecording: () => invoke<CaptureStatus>('stop_recording'),
+  takeScreenshot: () => invoke<void>('take_screenshot'),
+  listScreenshots: () => invoke<Screenshot[]>('list_screenshots'),
+  deleteScreenshots: (ids: string[]) => invoke<void>('delete_screenshots', { ids }),
+  copyScreenshot: (id: string) => invoke<void>('copy_screenshot', { id }),
+  revealScreenshot: (id: string) => invoke<void>('reveal_screenshot', { id }),
+  getPresence: () => invoke<{ enabled: boolean; connected: boolean }>('get_presence'),
+  getWaveforms: (id: string, buckets: number) => invoke<Waveform[]>('get_waveforms', { id, buckets }),
+  /** Native "Save as" dialog; null when cancelled. */
+  chooseExportPath: (suggestedName: string) => invoke<string | null>('choose_export_path', { suggestedName }),
+  /** Shows a file made by an export (this session) in Explorer. */
+  revealExport: (path: string) => invoke<void>('reveal_export', { path }),
 };
 
 type Events = {
   'library-changed': null;
   'capture-status': CaptureStatus;
   'shard-saved': Shard;
+  'recording-saved': Shard;
+  'screenshot-saved': Screenshot;
+  'recording-failed': string;
   'capture-failed': string;
   'export-progress': { id: string; progress: number };
   navigate: string;

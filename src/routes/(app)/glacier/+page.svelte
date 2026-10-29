@@ -7,13 +7,16 @@
   import GameIcon from '$lib/components/GameIcon.svelte';
   import Logo from '$lib/components/Logo.svelte';
   import ShardCard from '$lib/components/ShardCard.svelte';
+  import SelectionBar from '$lib/components/SelectionBar.svelte';
   import { api, native } from '$lib/api';
   import { capture, saveReplay } from '$lib/capture.svelte';
   import { formatHotkey, formatSize, t } from '$lib/i18n.svelte';
   import { library } from '$lib/library.svelte';
   import { settings } from '$lib/settings.svelte';
   import { tooltip } from '$lib/tooltip';
-  import { openMenu, ui, type Sort } from '$lib/ui.svelte';
+  import { confirm, openMenu, selection, toast, ui, type Sort } from '$lib/ui.svelte';
+  import { displayTitle, showError } from '$lib/shard-actions';
+  import type { Shard } from '$lib/api';
   import { view } from '$lib/view.svelte';
 
   const motion = $derived(prefersReducedMotion.current ? 0 : 1);
@@ -32,10 +35,79 @@
   });
 
   function onkeydown(e: KeyboardEvent) {
+    if (e.defaultPrevented) return;
+    const typing = (e.target as HTMLElement).closest('input, textarea');
     if (e.ctrlKey && e.key.toLowerCase() === 'f') {
       e.preventDefault();
       search.focus();
       search.select();
+    } else if (e.ctrlKey && e.key.toLowerCase() === 'a' && !typing && !ui.playing) {
+      e.preventDefault();
+      selectAll();
+    } else if (e.key === 'Escape' && selection.size && !ui.playing) {
+      selection.clear();
+    } else if (e.key === 'Delete' && selection.size && !typing && !ui.playing) {
+      e.preventDefault();
+      deleteSelected();
+    }
+  }
+
+  // Selection ----------------------------------------------------------------------
+  let anchor: string | null = null;
+
+  /** Click toggles; Shift+click selects everything between the last click and this one. */
+  function select(shard: Shard, shift: boolean) {
+    const list = view.shards;
+    if (shift && anchor) {
+      const a = list.findIndex((s) => s.id === anchor);
+      const b = list.findIndex((s) => s.id === shard.id);
+      if (a >= 0 && b >= 0) {
+        for (const s of list.slice(Math.min(a, b), Math.max(a, b) + 1)) selection.add(s.id);
+        return;
+      }
+    }
+    if (selection.has(shard.id)) selection.delete(shard.id);
+    else selection.add(shard.id);
+    anchor = shard.id;
+  }
+
+  function selectAll() {
+    for (const s of view.shards) selection.add(s.id);
+  }
+
+  const selected = $derived(library.shards.filter((s) => selection.has(s.id)));
+  const allFavorite = $derived(selected.length > 0 && selected.every((s) => s.favorite));
+
+  // A new filter starts a new selection; deleted shards leave it.
+  $effect(() => {
+    void ui.filter;
+    selection.clear();
+    anchor = null;
+  });
+  $effect(() => {
+    for (const id of selection) if (!library.find(id)) selection.delete(id);
+  });
+
+  function favoriteSelected() {
+    for (const s of selected) if (s.favorite === allFavorite) library.toggleFavorite(s.id).catch(showError);
+  }
+
+  async function deleteSelected() {
+    const ids = [...selection];
+    const only = ids.length === 1 ? library.find(ids[0]) : undefined;
+    const ok = await confirm({
+      title: only ? t('delete.title') : t('delete.titleMany', { count: ids.length }),
+      body: only ? t('delete.body', { name: displayTitle(only) }) : t('delete.bodyMany', { count: ids.length }),
+      confirm: t('shard.delete'),
+      danger: true,
+    });
+    if (!ok) return;
+    try {
+      await library.remove(ids);
+      selection.clear();
+      toast({ kind: 'info', title: t('toast.deleted') });
+    } catch (e) {
+      showError(e);
     }
   }
 
@@ -128,7 +200,13 @@
           animate:flip={{ duration: 320 * motion, easing: cubicOut }}
           in:scale={{ start: 0.96, opacity: 0, duration: 280 * motion, delay: Math.min(i, 12) * 22 * motion, easing: cubicOut }}
         >
-          <ShardCard {shard} fresh={ui.fresh === shard.id} />
+          <ShardCard
+            {shard}
+            fresh={ui.fresh === shard.id}
+            selected={selection.has(shard.id)}
+            selecting={selection.size > 0}
+            onselect={select}
+          />
         </div>
       {/each}
     </div>
@@ -149,6 +227,18 @@
     <p class="empty" in:fly={{ y: 6, duration: 240 * motion }}>{emptyMessage}</p>
   {/if}
 </section>
+
+{#if selection.size}
+  <SelectionBar
+    count={selection.size}
+    total={view.shards.length}
+    {allFavorite}
+    onall={selectAll}
+    onfavorite={favoriteSelected}
+    ondelete={deleteSelected}
+    onclear={() => selection.clear()}
+  />
+{/if}
 
 <style>
   .sentinel {
