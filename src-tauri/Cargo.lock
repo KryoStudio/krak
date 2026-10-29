@@ -2099,7 +2099,7 @@ dependencies = [
 
 [[package]]
 name = "krak"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "cc",
  "clipboard-win",
