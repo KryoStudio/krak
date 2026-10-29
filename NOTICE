@@ -1,4 +1,4 @@
-Kryo Shard
+Krak
 Copyright (C) 2026 Kryo Studio
 
 This program is free software: you can redistribute it and/or modify it under
@@ -20,13 +20,22 @@ section 7 of the GNU General Public License version 3:
 
 a) Attribution (section 7b). Any copy or modified version you convey must keep
    this NOTICE file and must keep, in the program's "About" information, the
-   notice "Based on Kryo Shard by Kryo Studio" with a link to
+   notice "Based on Krak by Kryo Studio" with a link to
    https://github.com/KryoStudio/kryo-shard.
 
 b) Modified versions (section 7c). A modified version must be clearly marked as
-   different from the original and must not be presented as Kryo Shard or as an
+   different from the original and must not be presented as Krak or as an
    official Kryo Studio product.
 
 c) Trademarks (section 7e). This license does not grant any right to use the
-   names "Kryo Shard" and "Kryo Studio", their logos, or any other trademark of
+   names "Krak" and "Kryo Studio", their logos, or any other trademark of
    Kryo Studio. See TRADEMARKS.md.
+
+
+THIRD-PARTY CODE
+
+src-tauri/native/nvenc/nvEncodeAPI.h: NVIDIA Video Codec SDK header (NVENC API
+12.2), Copyright (c) 2010-2023 NVIDIA Corporation, under the MIT license. Its
+source and full license text are in src-tauri/native/nvenc/LICENSE.txt. The
+NVENC library itself is part of the NVIDIA driver and is not distributed with
+this program.
