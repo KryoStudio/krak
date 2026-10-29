@@ -149,6 +149,9 @@
   {/if}
 
   <div class="actions" class:hidden={selecting}>
+    <button class="cut" onclick={() => actions.edit(shard)} aria-label={t('editor.edit')} use:tooltip={{ text: `${t('editor.edit')} · E`, side: 'bottom' }}>
+      <Icon name="scissors" size={15} />
+    </button>
     <button class="more" onclick={openMore} aria-label={t('shard.more')} aria-haspopup="menu">
       <Icon name="more" size={16} stroke={2.4} />
     </button>
@@ -319,7 +322,7 @@
     backdrop-filter: blur(6px);
   }
 
-  /* Top-right: the star keeps its corner; "more" fades in to its left on hover. */
+  /* Top-right: the star keeps its corner; "edit" and "more" fade in to its left on hover. */
   .actions {
     position: absolute;
     top: 13px;
@@ -348,7 +351,8 @@
       background var(--fast),
       color var(--fast);
   }
-  .actions .more {
+  .actions .more,
+  .actions .cut {
     transform: translateX(6px) scale(0.9);
   }
   .actions .fav {

@@ -32,6 +32,11 @@ export function announce(shard: Shard) {
 }
 
 export const play = (s: Shard) => (ui.playing = s.id);
+/** Opens the shard straight in the editor (trim, audio, export). */
+export function edit(s: Shard) {
+  ui.playing = s.id;
+  ui.editing = true;
+}
 export const rename = (s: Shard) => (ui.renaming = s.id);
 
 export function toggleFavorite(s: Shard) {
@@ -73,6 +78,7 @@ export async function remove(s: Shard) {
 export function shardMenu(s: Shard): MenuItem[] {
   return [
     { label: t('shard.play'), icon: 'play', shortcut: t('key.enter'), run: () => play(s) },
+    { label: t('editor.edit'), icon: 'scissors', shortcut: 'E', run: () => edit(s) },
     { label: t('shard.rename'), icon: 'pencil', shortcut: 'F2', run: () => rename(s) },
     { label: t(s.favorite ? 'shard.unfavorite' : 'shard.favorite'), icon: 'star', shortcut: 'F', run: () => toggleFavorite(s) },
     'separator',
@@ -88,6 +94,7 @@ export function handleShardKey(e: KeyboardEvent, s: Shard): boolean {
   if (e.key === 'F2') rename(s);
   else if (e.key === 'Delete') remove(s);
   else if (e.key.toLowerCase() === 'f' && !e.ctrlKey && !e.altKey) toggleFavorite(s);
+  else if (e.key.toLowerCase() === 'e' && !e.ctrlKey && !e.altKey && !ui.editing) edit(s);
   else if (e.key.toLowerCase() === 'c' && e.ctrlKey) copy(s);
   else return false;
   e.preventDefault();

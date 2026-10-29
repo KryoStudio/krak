@@ -58,8 +58,8 @@
 {#if shard}
   <div class="player" transition:fade={{ duration: 160 * motion }}>
     <header>
-      <button class="icon-btn" onclick={close} aria-label={t('common.close')} use:tooltip={{ text: `${t('common.close')} · Échap`, side: 'bottom' }}>
-        <Icon name="chevronLeft" size={18} />
+      <button class="back" onclick={close} use:tooltip={{ text: `${t('common.close')} · ${t('key.escape')}`, side: 'bottom' }}>
+        <Icon name="arrowLeft" size={16} />{t('player.back')}
       </button>
       <GameIcon game={shard.game} size={30} />
       <div class="heading">
@@ -255,6 +255,31 @@
   }
   .tools-panel {
     padding: 0 24px 16px;
+  }
+
+  /* Back to the page: a labeled button, so nobody has to hunt for a lone arrow. */
+  .back {
+    display: inline-flex;
+    align-items: center;
+    gap: 7px;
+    height: 34px;
+    padding: 0 14px 0 10px;
+    margin-right: 4px;
+    border-radius: 9px;
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--text);
+    background: var(--surface-2);
+    box-shadow: inset 0 0 0 1px var(--border-strong);
+    transition:
+      background var(--fast),
+      transform var(--fast) var(--ease-out);
+  }
+  .back:hover {
+    background: var(--surface-3);
+  }
+  .back:active {
+    transform: scale(0.97);
   }
 
   .edit {
