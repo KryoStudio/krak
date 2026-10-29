@@ -1,32 +1,56 @@
-import { fr } from './locales/fr';
-import { en } from './locales/en';
+import { fallback, languages, type Key, type Lang } from './locales';
 
-const locales = { fr, en };
+export type { Key, Lang };
 
-export type Lang = keyof typeof locales;
-export type Key = keyof typeof fr;
+/** The first of the PC's preferred languages that Krak speaks, else English. */
+function detect(): Lang {
+  for (const tag of navigator.languages?.length ? navigator.languages : [navigator.language]) {
+    const base = tag.toLowerCase().split('-')[0];
+    if (Object.hasOwn(languages, base)) return base as Lang;
+  }
+  return 'en';
+}
 
-export const systemLang: Lang = navigator.language.startsWith('fr') ? 'fr' : 'en';
+export const systemLang: Lang = detect();
 
 export const i18n = $state({ lang: systemLang as Lang });
 
-export const hasKey = (key: string): key is Key => key in fr;
+/** A saved language that this version doesn't have (removed, or from a newer version) → system. */
+export const resolveLang = (code: string | null | undefined): Lang =>
+  code && Object.hasOwn(languages, code) ? (code as Lang) : systemLang;
 
-/** Picks `<key>.one` for a singular `count` (0 and 1 in French, 1 in English) when that variant exists. */
+/** BCP 47 locale of the current language, for `lang` and Intl formats. */
+export const locale = (): string => languages[i18n.lang].locale ?? i18n.lang;
+
+export const hasKey = (key: string): key is Key => key in fallback;
+
+/**
+ * Translates `key`, filling `{name}` placeholders. With a numeric `count`, picks the plural
+ * variant of the language (`<key>.one`, `<key>.few`…) when it exists. Missing → English.
+ */
 export function t(key: Key, vars: Record<string, string | number> = {}): string {
-  const table: Record<string, string> = locales[i18n.lang];
-  const count = vars.count;
-  const singular = typeof count === 'number' && (i18n.lang === 'fr' ? count < 2 : count === 1);
-  const text = (singular && table[`${key}.one`]) || table[key];
+  const language = languages[i18n.lang];
+  const table: Record<string, string | undefined> = language.strings;
+  const base: Record<string, string> = fallback;
+  let id: string = key;
+  if (typeof vars.count === 'number') {
+    const category = new Intl.PluralRules(language.plurals ?? locale()).select(vars.count);
+    if (category !== 'other' && (table[`${key}.${category}`] ?? base[`${key}.${category}`])) id = `${key}.${category}`;
+  }
+  const text = table[id] ?? base[id] ?? key;
   return text.replace(/\{(\w+)\}/g, (_, name) => String(vars[name] ?? ''));
 }
 
+/** Bytes per MB and GB as Windows counts them, so sizes match File Explorer (and the backend's
+ *  storage limit). */
+export const MB = 1024 ** 2;
+export const GB = 1024 ** 3;
+
 export function formatSize(bytes: number): string {
-  const unit = i18n.lang === 'fr' ? ['Mo', 'Go'] : ['MB', 'GB'];
-  const mb = bytes / 1_000_000;
-  const fmt = (n: number) => n.toLocaleString(i18n.lang, { maximumFractionDigits: 1 });
-  if (mb >= 1000) return `${fmt(mb / 1000)} ${unit[1]}`;
-  return `${bytes > 0 ? Math.max(1, Math.round(mb)) : 0} ${unit[0]}`;
+  const mb = bytes / MB;
+  const fmt = (n: number) => n.toLocaleString(locale(), { maximumFractionDigits: 1 });
+  if (mb >= 1000) return `${fmt(bytes / GB)} ${t('unit.gb')}`;
+  return `${bytes > 0 ? Math.max(1, Math.round(mb)) : 0} ${t('unit.mb')}`;
 }
 
 export function formatDuration(seconds: number): string {
@@ -36,14 +60,14 @@ export function formatDuration(seconds: number): string {
 
 export function formatAge(timestamp: number): string {
   const minutes = Math.max(0, Math.round((Date.now() - timestamp) / 60_000));
-  const rtf = new Intl.RelativeTimeFormat(i18n.lang, { numeric: 'auto' });
+  const rtf = new Intl.RelativeTimeFormat(locale(), { numeric: 'auto' });
   if (minutes < 60) return rtf.format(-minutes, 'minute');
   if (minutes < 60 * 24) return rtf.format(-Math.round(minutes / 60), 'hour');
   if (minutes < 60 * 24 * 7) return rtf.format(-Math.round(minutes / (60 * 24)), 'day');
-  return new Date(timestamp).toLocaleDateString(i18n.lang, { day: 'numeric', month: 'short' });
+  return new Date(timestamp).toLocaleDateString(locale(), { day: 'numeric', month: 'short' });
 }
 
-/** "Ctrl+Shift+F9" → "Ctrl + Maj + F9" in French. */
+/** "Ctrl+Shift+F9" → ["Ctrl", "Maj", "F9"] in French. */
 export function formatHotkey(accelerator: string): string[] {
-  return accelerator.split('+').map((k) => (k === 'Shift' && i18n.lang === 'fr' ? 'Maj' : k));
+  return accelerator.split('+').map((k) => (k === 'Shift' ? t('key.shift') : k));
 }

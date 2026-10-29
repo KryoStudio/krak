@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/brand/banner.png" alt="Kryo Shard — Hit a key. Keep the moment." width="100%">
+  <img src="assets/brand/banner.png" alt="Krak — Your best moments. On your PC. Forever." width="100%">
 </p>
 
 <p align="center">
@@ -9,25 +9,25 @@
 </p>
 
 <p align="center">
-  <img alt="Status: early development" src="https://img.shields.io/badge/status-early%20development-3EC6FF?style=flat-square&labelColor=0C0E12">
-  <img alt="Platform: Windows" src="https://img.shields.io/badge/platform-Windows-3EC6FF?style=flat-square&labelColor=0C0E12">
-  <img alt="License: GPL-3.0" src="https://img.shields.io/badge/license-GPL--3.0-3EC6FF?style=flat-square&labelColor=0C0E12">
+  <img alt="Status: early development" src="https://img.shields.io/badge/status-early%20development-7FC6DB?style=flat-square&labelColor=0A0E14">
+  <img alt="Platform: Windows" src="https://img.shields.io/badge/platform-Windows-7FC6DB?style=flat-square&labelColor=0A0E14">
+  <img alt="License: GPL-3.0" src="https://img.shields.io/badge/license-GPL--3.0-7FC6DB?style=flat-square&labelColor=0A0E14">
 </p>
 
 ---
 
-> **Kryo Shard is in early development.** There is no download yet: the first public beta is on its way.
+> **Krak is in early development.** There is no download yet: the first public beta is on its way.
 
 <p align="center">
   <img src="assets/preview.png" alt="The Glacier, where your shards live" width="90%">
 </p>
 
-## Why Kryo Shard
+## Why Krak
 
 - **Always ready.** The last seconds of gameplay are kept in memory. Press a key and they are saved instantly, no re-encoding.
 - **Light.** Encoding runs on your graphics card (NVIDIA, AMD or Intel). The impact on your FPS should be invisible.
 - **Yours.** Everything stays on your PC. Clips are plain MP4 files. Nothing is uploaded unless you decide to.
-- **Anti-cheat safe.** Kryo Shard captures the screen like OBS or Discord do. It never injects into a game or reads its memory.
+- **Anti-cheat safe.** Krak captures the screen like OBS or Discord do. It never injects into a game or reads its memory.
 - **Simple.** Works out of the box. Advanced options are there, tucked away.
 
 A clip is called a **shard**. Your library is the **Glacier**.
@@ -63,14 +63,29 @@ Releases are built by GitHub Actions: push a tag such as `v0.2.0` (matching the 
 
 ### How capture works
 
-The screen is read with DXGI Desktop Duplication, the same Windows API that OBS and Discord use, so nothing is injected into games. Frames are encoded on the graphics card (NVENC, AMF or Quick Sync through Media Foundation, with a software fallback) and the last seconds are kept in memory. Game sound comes from WASAPI loopback and the microphone from its own device, on separate tracks. Pressing the hotkey writes an MP4 straight from memory, without re-encoding.
+The screen is read with DXGI Desktop Duplication, the same Windows API that OBS and Discord use, so nothing is injected into games. Frames are encoded on the graphics card and the last seconds are kept in memory: on NVIDIA through the driver's NVENC directly (H.264, HEVC and AV1 where the card has it, with B-frames, lookahead and adaptive quantization), on AMD and Intel through Media Foundation, with a software fallback. If the encoder cannot keep up (a heavy game, a high frame rate), it switches to lighter settings on the fly instead of dropping frames. Game sound comes from WASAPI loopback and the microphone from its own device, on separate tracks. Pressing the hotkey writes an MP4 straight from memory, without re-encoding.
+
+The quality presets and the measurements behind them (bitrates, tools, PSNR/SSIM, encoder speed) are documented in [`src-tauri/src/capture/quality.rs`](src-tauri/src/capture/quality.rs). The NVENC layer is a small C file compiled by `cargo` with the Visual Studio C++ tools, against NVIDIA's MIT-licensed `nvEncodeAPI.h` ([`src-tauri/native/nvenc`](src-tauri/native/nvenc)); the NVENC library itself ships with the NVIDIA driver and is loaded at run time, never redistributed.
 
 Built with Rust, [Tauri](https://tauri.app) and [Svelte](https://svelte.dev).
 
+### Translations
+
+Krak speaks English, French, Spanish, Brazilian Portuguese, German, Italian, Polish, Turkish, Russian, Japanese, Korean and Simplified Chinese, and follows the language of Windows on first launch. English is the reference: every text lives in [`src/lib/locales/en.ts`](src/lib/locales/en.ts) first.
+
+To add a language:
+
+1. Copy `en.ts` to `src/lib/locales/<code>.ts` (`<code>` is the language's two-letter code, like `nl`) and translate the values. Keep the `{placeholders}` as they are.
+2. Add the plural forms your language needs next to each text that has a `{count}`: `<key>.one`, `<key>.few`, `<key>.many`… as named by [`Intl.PluralRules`](https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/Intl/PluralRules) (the plain key is the "other" form).
+3. Register it in [`src/lib/locales/index.ts`](src/lib/locales/index.ts), with its name written in that language.
+4. Add the few texts the app shows outside its window (tray menu, file names) in [`src-tauri/src/i18n.rs`](src-tauri/src/i18n.rs), and the installer's language in `bundle.windows.nsis.languages` of [`tauri.conf.json`](src-tauri/tauri.conf.json).
+
+`npm run check` fails if a translation misses a text. Until it is finished, type the file `Partial<Strings>` instead of `Translation`: the missing texts show in English.
+
 ## License
 
-Kryo Shard is free software, released under the [GNU GPL v3.0](LICENSE). You can use it, study it, change it and share it. If you distribute a modified version, it must stay free and open source under the same license, with its source code available.
+Krak is free software, released under the [GNU GPL v3.0](LICENSE). You can use it, study it, change it and share it. If you distribute a modified version, it must stay free and open source under the same license, with its source code available.
 
-The **Kryo Shard** and **Kryo Studio** names and logos are not covered by this license. Forks must use their own name and logo: see [TRADEMARKS.md](TRADEMARKS.md) and [NOTICE](NOTICE).
+The **Krak** and **Kryo Studio** names and logos are not covered by this license. Forks must use their own name and logo: see [TRADEMARKS.md](TRADEMARKS.md) and [NOTICE](NOTICE).
 
 Copyright © 2026 Kryo Studio.
