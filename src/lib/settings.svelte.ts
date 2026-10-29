@@ -2,7 +2,7 @@ import { api, errorCode, native, type Settings } from './api';
 
 const defaults: Settings = {
   hotkey: 'F9',
-  recordHotkey: 'Alt+F9',
+  recordHotkey: 'Shift+F9',
   screenshotHotkey: 'Ctrl+F9',
   discordPresence: true,
   watermark: false,

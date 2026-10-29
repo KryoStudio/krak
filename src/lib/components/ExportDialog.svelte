@@ -79,7 +79,9 @@
         toast({ kind: 'info', title: t('toast.demo') });
         return;
       }
-      path = await api.chooseExportPath(`${displayTitle(shard)}.mp4`).catch((e) => {
+      // An untitled clip keeps its file name, which has the date ("Valorant 2026-10-29 21-04-37").
+      const name = shard.title ?? shard.path.split(/[\\/]/).pop()?.replace(/\.mp4$/i, '') ?? displayTitle(shard);
+      path = await api.chooseExportPath(`${name}.mp4`).catch((e) => {
         showError(errorCode(e));
         return null;
       });

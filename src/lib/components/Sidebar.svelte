@@ -5,7 +5,7 @@
   import Logo from './Logo.svelte';
   import Icon from './Icon.svelte';
   import GameIcon from './GameIcon.svelte';
-  import { formatSize, t } from '$lib/i18n.svelte';
+  import { formatHotkey, formatSize, t } from '$lib/i18n.svelte';
   import { library } from '$lib/library.svelte';
   import { screens } from '$lib/screenshots.svelte';
   import { settings } from '$lib/settings.svelte';
@@ -57,6 +57,7 @@
   });
 
   const recording = $derived(capture.status.recording);
+  const shortcut = $derived(formatHotkey(settings.value.hotkey).join('+'));
   const engineState = $derived(recording ? 'recording' : capture.status.state);
   const seconds = $derived(settings.value.bufferSeconds);
   const status = $derived(
@@ -120,7 +121,8 @@
       <strong>{status.label}</strong>
       <span>{status.hint}</span>
     </span>
-    <kbd>{settings.value.hotkey}</kbd>
+    <!-- The capture shortcut, when it fits; a recording shows its timer instead. -->
+    {#if !recording && shortcut.length <= 10}<kbd>{shortcut}</kbd>{/if}
     {#if fill > 0 && fill < 1}<span class="fill" style:transform="scaleX({fill})"></span>{/if}
   </button>
 
@@ -293,6 +295,15 @@
   .status-text strong {
     font-size: 13px;
     font-weight: 600;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  /* A long shortcut gives way to the text. */
+  .status kbd {
+    min-width: 0;
+    max-width: 48%;
+    overflow: hidden;
+    text-overflow: ellipsis;
   }
   [data-state='ready'] .status-text strong {
     color: var(--accent);

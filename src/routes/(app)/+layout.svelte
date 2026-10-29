@@ -75,7 +75,10 @@
           action: { label: t('toast.view'), run: () => (ui.playing = shard.id) },
         });
       }),
-      on('recording-failed', (code) => showError(code)),
+      on('recording-failed', (code) => {
+        const key = `error.${code}`;
+        toast({ kind: 'error', title: t('record.failed'), body: hasKey(key) ? t(key) : undefined });
+      }),
       on('screenshot-saved', (shot) => {
         screens.upsert(shot);
         toast({

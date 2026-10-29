@@ -84,7 +84,7 @@
     try {
       await settings.update({ screenshotHotkey });
     } catch (code) {
-      screenshotError = t(code === 'hotkey_taken' ? 'error.hotkey_taken' : 'error.hotkey_invalid');
+      screenshotError = shortcutError(code);
     }
   }
 
@@ -106,8 +106,14 @@
     try {
       await settings.update({ recordHotkey });
     } catch (code) {
-      recordError = t(code === 'hotkey_taken' ? 'error.hotkey_taken' : 'error.hotkey_invalid');
+      recordError = shortcutError(code);
     }
+  }
+
+  /** Taken by another app, by another Krak action, or not a valid shortcut. */
+  function shortcutError(code: unknown): string {
+    const key = `error.${code}`;
+    return t(typeof code === 'string' && code.startsWith('hotkey_') && hasKey(key) ? key : 'error.hotkey_invalid');
   }
 
   async function setHotkey(hotkey: string) {
@@ -115,7 +121,7 @@
     try {
       await settings.update({ hotkey });
     } catch (code) {
-      hotkeyError = t(code === 'hotkey_taken' ? 'error.hotkey_taken' : 'error.hotkey_invalid');
+      hotkeyError = shortcutError(code);
     }
   }
 
@@ -250,11 +256,16 @@
                   <div class="activity-row">
                     <div class="activity-art">
                       <Logo size={38} />
-                      <span class="activity-dot" class:rec={!!status.recording}></span>
+                      <!-- Like Discord: recording is the small image's tooltip, the game stays the main line. -->
+                      <span
+                        class="activity-dot"
+                        class:rec={!!status.recording}
+                        use:tooltip={{ text: t('presence.recording'), side: 'top', enabled: !!status.recording }}
+                      ></span>
                     </div>
                     <div class="activity-text">
                       <strong>Krak</strong>
-                      <span>{status.recording ? t('presence.recording') : presenceGame ? t('presence.playing', { game: presenceGame }) : t('presence.desktop')}</span>
+                      <span>{presenceGame ? t('presence.playing', { game: presenceGame }) : t('presence.desktop')}</span>
                       <span class="dim">{t('presence.today', { count: today })}</span>
                     </div>
                   </div>

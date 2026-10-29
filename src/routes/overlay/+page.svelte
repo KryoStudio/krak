@@ -57,6 +57,10 @@
         const key = `capture.failed.${code}`;
         present(true, () => t(hasKey(key) ? key : 'capture.failed.encode_failed'), () => '');
       }),
+      on('recording-failed', (code) => {
+        const key = `error.${code}`;
+        present(true, () => t('record.failed'), () => (hasKey(key) ? t(key) : ''));
+      }),
     ];
     // Browser preview of /overlay: show one.
     if (!native) present(false, () => t('toast.captured'), () => `Rocket League · ${t('overlay.lastSeconds', { seconds: 30 })}`);
