@@ -1,9 +1,9 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "Kryo Shard",
-  "mainBinaryName": "kryo-shard",
+  "productName": "Krak",
+  "mainBinaryName": "krak",
   "version": "0.1.0",
-  "identifier": "com.kryostudio.kryoshard",
+  "identifier": "com.kryostudio.krak",
   "build": {
     "beforeDevCommand": "npm run dev",
     "devUrl": "http://localhost:1420",
@@ -14,7 +14,7 @@
     "windows": [
       {
         "label": "main",
-        "title": "Kryo Shard",
+        "title": "Krak",
         "width": 1280,
         "height": 800,
         "minWidth": 960,
@@ -30,7 +30,7 @@
       {
         "label": "overlay",
         "url": "/overlay",
-        "title": "Kryo Shard",
+        "title": "Krak",
         "width": 372,
         "height": 100,
         "resizable": false,
@@ -112,15 +112,29 @@
       "nsis": {
         "installMode": "currentUser",
         "languages": [
+          "English",
           "French",
-          "English"
+          "Spanish",
+          "PortugueseBR",
+          "German",
+          "Italian",
+          "Polish",
+          "Turkish",
+          "Russian",
+          "Japanese",
+          "Korean",
+          "SimpChinese"
         ],
+        "customLanguageFiles": {
+          "Polish": "windows/Polish.nsh"
+        },
         "displayLanguageSelector": false,
         "installerIcon": "icons/icon.ico",
         "uninstallerIcon": "icons/icon.ico",
         "sidebarImage": "icons/installer-sidebar.bmp",
         "headerImage": "icons/installer-header.bmp",
-        "uninstallerHeaderImage": "icons/installer-header.bmp"
+        "uninstallerHeaderImage": "icons/installer-header.bmp",
+        "installerHooks": "windows/hooks.nsh"
       }
     },
     "createUpdaterArtifacts": true
