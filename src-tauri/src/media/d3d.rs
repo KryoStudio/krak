@@ -15,7 +15,8 @@ use windows::Win32::Graphics::Direct3D11::{
     D3D11_BIND_FLAG, D3D11_CPU_ACCESS_READ, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
     D3D11_CREATE_DEVICE_VIDEO_SUPPORT, D3D11_MAP_READ, D3D11_MAPPED_SUBRESOURCE, D3D11_SDK_VERSION,
     D3D11_SUBRESOURCE_DATA, D3D11_TEX2D_VPIV, D3D11_TEX2D_VPOV, D3D11_TEXTURE2D_DESC,
-    D3D11_USAGE_DEFAULT, D3D11_USAGE_STAGING, D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE,
+    D3D11_USAGE_DEFAULT, D3D11_USAGE_STAGING, D3D11_VIDEO_COLOR, D3D11_VIDEO_COLOR_0,
+    D3D11_VIDEO_COLOR_RGBA, D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE,
     D3D11_VIDEO_PROCESSOR_COLOR_SPACE, D3D11_VIDEO_PROCESSOR_CONTENT_DESC,
     D3D11_VIDEO_PROCESSOR_FORMAT_SUPPORT_INPUT, D3D11_VIDEO_PROCESSOR_FORMAT_SUPPORT_OUTPUT,
     D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC, D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC_0,
@@ -121,52 +122,142 @@ pub fn primary_display() -> MediaResult<Display> {
     Err(MediaError::new(NO_DISPLAY))
 }
 
-/// Refresh rate of `display` in Hz: exact (59.94, 119.88...) from the display configuration,
-/// else the whole number GDI reports, else 0.
-pub fn refresh_rate(display: &Display) -> f64 {
+/// The active display configuration path of `display` (matched by its GDI name).
+fn display_path(
+    display: &Display,
+) -> Option<windows::Win32::Devices::Display::DISPLAYCONFIG_PATH_INFO> {
     use windows::Win32::Devices::Display::{
         DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME, DISPLAYCONFIG_MODE_INFO,
         DISPLAYCONFIG_PATH_INFO, DISPLAYCONFIG_SOURCE_DEVICE_NAME, DisplayConfigGetDeviceInfo,
         GetDisplayConfigBufferSizes, QDC_ONLY_ACTIVE_PATHS, QueryDisplayConfig,
     };
-    use windows::Win32::Graphics::Gdi::{DEVMODEW, ENUM_CURRENT_SETTINGS, EnumDisplaySettingsW};
     let name = utf16(&display.device_name);
     // SAFETY: buffers sized by GetDisplayConfigBufferSizes; the device-name request carries its
     // own size in its header.
     unsafe {
         let (mut paths, mut modes) = (0u32, 0u32);
-        if GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &mut paths, &mut modes).is_ok() {
-            let mut path_info = vec![DISPLAYCONFIG_PATH_INFO::default(); paths as usize];
-            let mut mode_info = vec![DISPLAYCONFIG_MODE_INFO::default(); modes as usize];
-            if QueryDisplayConfig(
-                QDC_ONLY_ACTIVE_PATHS,
-                &mut paths,
-                path_info.as_mut_ptr(),
-                &mut modes,
-                mode_info.as_mut_ptr(),
-                None,
-            )
-            .is_ok()
-            {
-                for path in &path_info[..paths as usize] {
-                    let mut source = DISPLAYCONFIG_SOURCE_DEVICE_NAME::default();
-                    source.header.r#type = DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME;
-                    source.header.size =
-                        u32::try_from(std::mem::size_of::<DISPLAYCONFIG_SOURCE_DEVICE_NAME>())
-                            .unwrap_or(0);
-                    source.header.adapterId = path.sourceInfo.adapterId;
-                    source.header.id = path.sourceInfo.id;
-                    if DisplayConfigGetDeviceInfo(&mut source.header) == 0
-                        && utf16(&source.viewGdiDeviceName) == name
-                    {
-                        let rate = path.targetInfo.refreshRate;
-                        if rate.Denominator > 0 && rate.Numerator > 0 {
-                            return f64::from(rate.Numerator) / f64::from(rate.Denominator);
-                        }
-                    }
-                }
-            }
+        if GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &mut paths, &mut modes).is_err() {
+            return None;
         }
+        let mut path_info = vec![DISPLAYCONFIG_PATH_INFO::default(); paths as usize];
+        let mut mode_info = vec![DISPLAYCONFIG_MODE_INFO::default(); modes as usize];
+        if QueryDisplayConfig(
+            QDC_ONLY_ACTIVE_PATHS,
+            &mut paths,
+            path_info.as_mut_ptr(),
+            &mut modes,
+            mode_info.as_mut_ptr(),
+            None,
+        )
+        .is_err()
+        {
+            return None;
+        }
+        path_info.truncate(paths as usize);
+        path_info.into_iter().find(|path| {
+            let mut source = DISPLAYCONFIG_SOURCE_DEVICE_NAME::default();
+            source.header.r#type = DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME;
+            source.header.size =
+                u32::try_from(std::mem::size_of::<DISPLAYCONFIG_SOURCE_DEVICE_NAME>()).unwrap_or(0);
+            source.header.adapterId = path.sourceInfo.adapterId;
+            source.header.id = path.sourceInfo.id;
+            DisplayConfigGetDeviceInfo(&mut source.header) == 0
+                && utf16(&source.viewGdiDeviceName) == name
+        })
+    }
+}
+
+/// How the screen scales a display mode that doesn't fill it (a game in 1440x1080 on a 16:9
+/// monitor): the GPU's or the monitor's "scaling" setting, as Windows reports it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Scaling {
+    /// Full screen, the image stretched (the default, and "stretched resolution" players).
+    Stretch,
+    /// As large as it fits with its own shape, black bars around.
+    Aspect,
+    /// Pixel for pixel in the middle.
+    Center,
+}
+
+/// What the screen shows besides the current display mode, all as shown (rotation applied).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScreenShape {
+    /// The desktop size set in Windows, which games' own modes temporarily replace.
+    pub desktop: Option<(u32, u32)>,
+    /// The monitor's native (preferred) mode.
+    pub native: Option<(u32, u32)>,
+    pub scaling: Scaling,
+}
+
+/// The [`ScreenShape`] of `display` right now (anything Windows doesn't say is left out).
+pub fn screen_shape(display: &Display) -> ScreenShape {
+    use windows::Win32::Devices::Display::{
+        DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_PREFERRED_MODE,
+        DISPLAYCONFIG_SCALING_ASPECTRATIOCENTEREDMAX, DISPLAYCONFIG_SCALING_CENTERED,
+        DISPLAYCONFIG_TARGET_PREFERRED_MODE, DisplayConfigGetDeviceInfo,
+    };
+    use windows::Win32::Graphics::Gdi::{DEVMODEW, ENUM_REGISTRY_SETTINGS, EnumDisplaySettingsW};
+    let rotated = matches!(
+        display.rotation,
+        DXGI_MODE_ROTATION_ROTATE90 | DXGI_MODE_ROTATION_ROTATE270
+    );
+    let valid = |w: u32, h: u32| (w > 0 && h > 0).then_some((w, h));
+    let path = display_path(display);
+    let scaling = match path.map(|p| p.targetInfo.scaling) {
+        Some(DISPLAYCONFIG_SCALING_ASPECTRATIOCENTEREDMAX) => Scaling::Aspect,
+        Some(DISPLAYCONFIG_SCALING_CENTERED) => Scaling::Center,
+        _ => Scaling::Stretch,
+    };
+    // SAFETY: the preferred-mode request carries its own size in its header; DEVMODEW is
+    // sized before the call.
+    unsafe {
+        let native = path.and_then(|path| {
+            let mut preferred = DISPLAYCONFIG_TARGET_PREFERRED_MODE::default();
+            preferred.header.r#type = DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_PREFERRED_MODE;
+            preferred.header.size =
+                u32::try_from(std::mem::size_of::<DISPLAYCONFIG_TARGET_PREFERRED_MODE>())
+                    .unwrap_or(0);
+            preferred.header.adapterId = path.targetInfo.adapterId;
+            preferred.header.id = path.targetInfo.id;
+            if DisplayConfigGetDeviceInfo(&mut preferred.header) != 0 {
+                return None;
+            }
+            // In the panel's own orientation: turn it like the desktop.
+            valid(preferred.width, preferred.height)
+                .map(|(w, h)| if rotated { (h, w) } else { (w, h) })
+        });
+        let mut mode = DEVMODEW {
+            dmSize: u16::try_from(std::mem::size_of::<DEVMODEW>()).unwrap_or(0),
+            ..Default::default()
+        };
+        let desktop = EnumDisplaySettingsW(
+            windows::core::PCWSTR(display.device_name.as_ptr()),
+            ENUM_REGISTRY_SETTINGS,
+            &mut mode,
+        )
+        .as_bool()
+        .then(|| valid(mode.dmPelsWidth, mode.dmPelsHeight))
+        .flatten();
+        ScreenShape {
+            desktop,
+            native,
+            scaling,
+        }
+    }
+}
+
+/// Refresh rate of `display` in Hz: exact (59.94, 119.88...) from the display configuration,
+/// else the whole number GDI reports, else 0.
+pub fn refresh_rate(display: &Display) -> f64 {
+    use windows::Win32::Graphics::Gdi::{DEVMODEW, ENUM_CURRENT_SETTINGS, EnumDisplaySettingsW};
+    if let Some(path) = display_path(display) {
+        let rate = path.targetInfo.refreshRate;
+        if rate.Denominator > 0 && rate.Numerator > 0 {
+            return f64::from(rate.Numerator) / f64::from(rate.Denominator);
+        }
+    }
+    // SAFETY: DEVMODEW is sized before the call.
+    unsafe {
         let mut mode = DEVMODEW {
             dmSize: u16::try_from(std::mem::size_of::<DEVMODEW>()).unwrap_or(0),
             ..Default::default()
@@ -503,6 +594,21 @@ impl Nv12Converter {
             vc.VideoProcessorSetStreamSourceRect(&processor, 0, true, Some(&src));
             vc.VideoProcessorSetStreamDestRect(&processor, 0, true, Some(&dst));
             vc.VideoProcessorSetOutputTargetRect(&processor, true, Some(&dst));
+            // What a smaller destination rectangle leaves around the picture.
+            vc.VideoProcessorSetOutputBackgroundColor(
+                &processor,
+                false,
+                &D3D11_VIDEO_COLOR {
+                    Anonymous: D3D11_VIDEO_COLOR_0 {
+                        RGBA: D3D11_VIDEO_COLOR_RGBA {
+                            R: 0.0,
+                            G: 0.0,
+                            B: 0.0,
+                            A: 1.0,
+                        },
+                    },
+                },
+            );
             if rotation != D3D11_VIDEO_PROCESSOR_ROTATION_IDENTITY {
                 vc.VideoProcessorSetStreamRotation(&processor, 0, true, rotation);
             }
@@ -538,6 +644,19 @@ impl Nv12Converter {
                 input_view: None,
                 output_views: Vec::new(),
             })
+        }
+    }
+
+    /// Puts the picture in `rect` of the output from now on (the rest is black).
+    pub fn set_dest_rect(&mut self, gpu: &Gpu, rect: RECT) {
+        // SAFETY: our processor; the rectangle lies within the output size (caller's contract).
+        unsafe {
+            gpu.video_context.VideoProcessorSetStreamDestRect(
+                &self.processor,
+                0,
+                true,
+                Some(&rect),
+            );
         }
     }
 

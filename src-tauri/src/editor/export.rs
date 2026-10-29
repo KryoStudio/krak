@@ -14,7 +14,9 @@
 //! fit.
 //!
 //! The "by krak" badge ([`super::watermark`]) needs new pictures: with it, every target
-//! re-encodes (copies and files at the source's size and bitrate).
+//! re-encodes (copies and files at the source's size and bitrate). So does stretching a clip
+//! narrower than 16:9 (a stretched-resolution 4:3) over 16:9: the output is planned for the
+//! 16:9 size and the GPU's video processor scales each picture to it, filling it.
 //!
 //! Timing: media time zero of an output is its first video decode time, which comes before the
 //! first picture when there are B-frames; audio is taken from that instant too, and the
@@ -71,6 +73,8 @@ pub struct Request {
     pub destination: Destination,
     /// Burn the "by krak" badge in.
     pub watermark: bool,
+    /// Stretch a clip narrower than 16:9 over 16:9.
+    pub stretch: bool,
     /// Fallback paths (tests).
     pub options: transcode::Options,
 }
@@ -87,8 +91,10 @@ enum Output<'a> {
 /// How the video of an export may be produced.
 #[derive(Clone, Copy)]
 struct VideoJob {
-    /// The badge: no passthrough.
+    /// The badge.
     watermark: bool,
+    /// New pictures are needed (the badge, or stretching): no passthrough.
+    fresh: bool,
     options: transcode::Options,
 }
 
@@ -291,13 +297,26 @@ pub fn export(
     request: &Request,
     progress: &Progress,
 ) -> Result<Exported, &'static str> {
-    let source = Source::open(source)?;
+    let mut source = Source::open(source)?;
     progress.check()?;
     let (start, end) = range(request.start, request.end, source.duration)?;
     let gains = clamp_gains(request.gains);
+    // Stretched: everything is planned for the 16:9 size, and our video processor (which fills
+    // the output) does the scaling, not the reader's (which may keep the shape).
+    let stretched = request
+        .stretch
+        .then(|| plan::widescreen(source.size))
+        .flatten();
+    if let Some(size) = stretched {
+        source.size = size;
+    }
     let job = VideoJob {
         watermark: request.watermark,
-        options: request.options,
+        fresh: request.watermark || stretched.is_some(),
+        options: transcode::Options {
+            gpu_scaling: request.options.gpu_scaling || stretched.is_some(),
+            ..request.options
+        },
     };
     match &request.destination {
         Destination::Copy { label } => copy(
@@ -497,7 +516,7 @@ fn copy(
     progress: &Progress,
 ) -> Result<Exported, &'static str> {
     let plan = plan::audio_plan(&source_tracks(source), false);
-    let passthrough = source.passthrough().filter(|_| !job.watermark);
+    let passthrough = source.passthrough().filter(|_| !job.fresh);
     if let Some((video, config, file)) = passthrough {
         let video = passthrough_video(video, config, file, start, end)?;
         // Audio covers the kept pictures from the first decode time; the edit list hides the
@@ -588,10 +607,11 @@ fn discord(
     let fits = |size: u64| size as f64 <= max_bytes as f64 * plan::DISCORD_PASSTHROUGH;
     let plan = plan::audio_plan(&source_tracks(source), true);
 
-    // Discord always gets H.264: other codecs are re-encoded (and everything with the badge).
+    // Discord always gets H.264: other codecs are re-encoded (and everything with the badge or
+    // stretched).
     let h264 = source
         .passthrough()
-        .filter(|(_, config, _)| config.codec() == VideoCodec::H264 && !job.watermark);
+        .filter(|(_, config, _)| config.codec() == VideoCodec::H264 && !job.fresh);
     if let Some((video, config, file)) = h264 {
         let video = passthrough_video(video, config, file, start, end)?;
         let video_bytes: u64 = video.samples.iter().map(|s| s.data.len() as u64).sum();

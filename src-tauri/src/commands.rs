@@ -12,6 +12,7 @@ use crate::capture::CaptureStatus;
 use crate::capture::audio::{self, Microphone};
 use crate::capture::encoders::{self, EncoderInfo};
 use crate::capture::quality::{self, ResolvedVideo, Tier};
+use crate::capture::screen;
 use crate::editor::export::{self, Destination};
 use crate::editor::waveform::{self, Waveform};
 use crate::editor::{
@@ -19,7 +20,7 @@ use crate::editor::{
     Progress, ShardInfo, Target, WRITE_FAILED, naming,
 };
 use crate::library::{self, NOT_FOUND, Shard};
-use crate::media::{ComGuard, MfGuard};
+use crate::media::{ComGuard, MfGuard, d3d};
 use crate::settings::{Settings, SettingsPatch};
 use crate::state::{AppState, lock};
 use crate::storage::{self, StorageInfo};
@@ -323,6 +324,7 @@ pub async fn export_shard(app: AppHandle, request: ExportRequest) -> CmdResult<E
         gains: request.gains,
         destination,
         watermark: request.watermark,
+        stretch: request.stretch,
         options: editor::transcode::Options::default(),
     };
     let cancel = slot.cancel_flag();
@@ -420,15 +422,16 @@ pub async fn get_encoder_info() -> CmdResult<EncoderInfo> {
 pub async fn resolve_video(app: AppHandle, patch: SettingsPatch) -> CmdResult<ResolvedVideo> {
     let settings = app.state::<AppState>().settings().merge(patch);
     let video = replay::video_settings(&settings);
+    let fit = settings.screen_fit;
     media_thread("kryo-encoders", move || {
         let (display, refresh, caps) = encoders::detect().map_err(|err| err.code)?;
-        let plan = quality::plan(
-            &video,
+        // The frame the engine would record in (the desktop's, even while a game changes it).
+        let frame = screen::frame(
             (display.width, display.height),
-            refresh,
-            &caps,
-            Tier::Best,
+            &d3d::screen_shape(&display),
+            fit,
         );
+        let plan = quality::plan(&video, frame, refresh, &caps, Tier::Best);
         Ok(plan.resolved)
     })
     .await

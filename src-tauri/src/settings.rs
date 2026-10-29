@@ -67,6 +67,19 @@ pub enum Resolution {
     P720,
 }
 
+/// How a game's own resolution (a "stretched" 1440x1080...) goes into the recording.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ScreenFit {
+    /// In the desktop's frame, the way the screen shows it (stretched, or with bars).
+    #[default]
+    Screen,
+    /// In the desktop's frame, always stretched over it: never black bars.
+    Stretch,
+    /// Each resolution as it is (a new stream when it changes).
+    Original,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Settings {
@@ -87,6 +100,8 @@ pub struct Settings {
     pub bitrate: u32,
     /// Custom quality only, HEVC/AV1.
     pub ten_bit: bool,
+    /// How a game's own resolution is recorded.
+    pub screen_fit: ScreenFit,
     /// AAC kbit/s of the Game and Mix tracks (the microphone stays mono 96).
     pub audio_bitrate: u32,
     /// Absolute path of the clips folder.
@@ -131,6 +146,7 @@ pub struct SettingsPatch {
     pub resolution: Option<Resolution>,
     pub bitrate: Option<f64>,
     pub ten_bit: Option<bool>,
+    pub screen_fit: Option<ScreenFit>,
     pub audio_bitrate: Option<f64>,
     pub clips_dir: Option<String>,
     /// Outer `None` = field absent, `Some(None)` = explicit `null` (follow system).
@@ -172,6 +188,7 @@ impl Settings {
             fps: DEFAULT_FPS,
             bitrate: DEFAULT_BITRATE,
             ten_bit: true,
+            screen_fit: ScreenFit::Screen,
             audio_bitrate: DEFAULT_AUDIO_BITRATE,
             clips_dir,
             language: None,
@@ -223,6 +240,9 @@ impl Settings {
         }
         if let Some(ten_bit) = patch.ten_bit {
             next.ten_bit = ten_bit;
+        }
+        if let Some(fit) = patch.screen_fit {
+            next.screen_fit = fit;
         }
         if let Some(kbps) = patch.audio_bitrate {
             next.audio_bitrate = snap_audio_bitrate(kbps);
@@ -668,5 +688,21 @@ mod tests {
         assert_eq!(parse(&rewritten, defaults()), Some(defaults()));
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reads_how_other_resolutions_are_recorded() {
+        assert_eq!(defaults().screen_fit, ScreenFit::Screen);
+        for (text, fit) in [
+            ("stretch", ScreenFit::Stretch),
+            ("original", ScreenFit::Original),
+            ("screen", ScreenFit::Screen),
+            ("sideways", ScreenFit::Screen),
+        ] {
+            let s = parse(&format!(r#"{{"screenFit": "{text}"}}"#), defaults()).expect("object");
+            assert_eq!(s.screen_fit, fit, "{text}");
+        }
+        let json = serde_json::to_value(defaults()).unwrap();
+        assert_eq!(json["screenFit"], "screen");
     }
 }

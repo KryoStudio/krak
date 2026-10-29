@@ -13,6 +13,7 @@ const defaults: Settings = {
   fps: 60,
   bitrate: 40,
   tenBit: true,
+  screenFit: 'screen',
   audioBitrate: 192,
   clipsDir: 'C:\\Users\\you\\Videos\\Krak',
   language: null,

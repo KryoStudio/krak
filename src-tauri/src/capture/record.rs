@@ -940,6 +940,7 @@ mod tests {
         encoder.finish(&mut packets).expect("finish");
 
         let config = super::super::EngineConfig {
+            screen_fit: crate::settings::ScreenFit::Screen,
             video: super::super::VideoSettings {
                 quality: Quality::High,
                 codec: CodecChoice::Auto,

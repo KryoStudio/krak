@@ -65,7 +65,7 @@
 
   // What the current settings record, for the "Result" line and the memory estimate.
   $effect(() => {
-    void [s.quality, s.fps, s.resolution, s.codec, s.bitrate, s.tenBit, encoder];
+    void [s.quality, s.fps, s.resolution, s.codec, s.bitrate, s.tenBit, s.screenFit, encoder];
     let alive = true;
     resolveVideo().then((r) => alive && (output = r));
     return () => {
@@ -169,6 +169,9 @@
         detail: c === 'auto' ? undefined : t(`settings.codecTag.${c}`),
         tag: c === 'auto' ? t('settings.recommended') : undefined,
       })),
+  );
+  const screenFits = $derived(
+    (['screen', 'stretch', 'original'] as const).map((v) => ({ value: v, label: t(`settings.screenFit.${v}`) })),
   );
   const audioRates = [128, 160, 192, 256, 320].map((v) => ({ value: v, label: `${v}` }));
   const limits = $derived([
@@ -364,6 +367,11 @@
               encoder?.refreshRate ? t('settings.fpsCapped', { fps: encoder.refreshRate }) : t('settings.fpsHint'),
               fps,
             )}
+
+            {#snippet screenFit()}
+              <Segmented label={t('settings.screenFit')} options={screenFits} value={s.screenFit} onchange={(v) => set({ screenFit: v })} />
+            {/snippet}
+            {@render row(t('settings.screenFit'), t(`settings.screenFitHint.${s.screenFit}`), screenFit)}
 
             {#if s.quality === 'custom'}
               {#snippet codec()}

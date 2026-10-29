@@ -64,6 +64,7 @@ pub fn video_settings(settings: &Settings) -> VideoSettings {
 fn engine_config(settings: &Settings) -> EngineConfig {
     EngineConfig {
         video: video_settings(settings),
+        screen_fit: settings.screen_fit,
         audio_bitrate: settings.audio_bitrate * 1000,
         buffer_seconds: settings.buffer_seconds,
         microphone: settings.microphone,

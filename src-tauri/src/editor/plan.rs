@@ -199,6 +199,16 @@ fn output_fps(source_fps: f64, cap: u32) -> u32 {
     (source_fps.round() as u32).clamp(1, cap)
 }
 
+/// The 16:9 size of a landscape picture narrower than 16:9 (4:3, 5:4...: a stretched
+/// resolution), same height; `None` for 16:9, wider or portrait pictures.
+pub fn widescreen((width, height): (u32, u32)) -> Option<(u32, u32)> {
+    let wide = f64::from(height) * 16.0 / 9.0;
+    if height == 0 || width < height || f64::from(width) >= wide * 0.99 {
+        return None;
+    }
+    Some(((wide / 2.0).round() as u32 * 2, height))
+}
+
 /// Scales `source` so its short side is at most `short_side` (never up), within the H.264
 /// limits, keeping the aspect ratio with even dimensions.
 pub fn fit((width, height): (u32, u32), short_side: u32) -> (u32, u32) {
@@ -437,6 +447,23 @@ mod tests {
             passthrough_cut(&open, &dts, &sync, FRAME, 13 * FRAME, 20 * FRAME),
             None
         );
+    }
+
+    #[test]
+    fn stretches_only_narrow_landscape_pictures() {
+        assert_eq!(widescreen((1440, 1080)), Some((1920, 1080)));
+        assert_eq!(widescreen((1280, 1024)), Some((1820, 1024)));
+        assert_eq!(widescreen((1024, 768)), Some((1366, 768)));
+        // Already 16:9 (or a pixel off), wider, portrait, empty: left alone.
+        for size in [
+            (1920, 1080),
+            (1918, 1080),
+            (3440, 1440),
+            (1080, 1920),
+            (0, 0),
+        ] {
+            assert_eq!(widescreen(size), None, "{size:?}");
+        }
     }
 
     #[test]

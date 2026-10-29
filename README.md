@@ -39,10 +39,11 @@ A clip is called a **shard**. Your library is the **Glacier**.
 - [x] Glacier: shards sorted by game, favorites, search, rename, multi-select, built-in player, Recycle Bin
 - [x] Always-on replay buffer, encoded natively with NVENC on NVIDIA (H.264, HEVC), with Standard, High and Premium presets
 - [x] Continuous recording while the replay keeps working, safe from crashes
+- [x] Custom and stretched resolutions recorded as the screen shows them (or always stretched), the replay going on through Alt+Tab
 - [x] Screenshots, with their own page and a crop tool (copy the part you keep, or save it)
 - [x] Separate audio tracks: game and microphone, plus a mix that every player picks by default
 - [x] Editor: trim bar, waveforms, volume of each audio track, remembered per clip
-- [x] Export to a file, to the Glacier or to Discord under 10 MB, 50 MB or 500 MB, with an optional "by krak" badge
+- [x] Export to a file, to the Glacier or to Discord under 10 MB, 50 MB or 500 MB, with an optional "by krak" badge, and 4:3 clips stretched to 16:9
 - [x] Discord Rich Presence
 - [x] Installer and signed automatic updates
 - [ ] Windows code signing (no SmartScreen warning)
@@ -66,7 +67,7 @@ Releases are built by GitHub Actions: push a tag such as `v0.2.0` (matching the 
 
 ### How capture works
 
-The screen is read with DXGI Desktop Duplication, the same Windows API that OBS and Discord use, so nothing is injected into games. Frames are encoded on the graphics card and the last seconds are kept in memory: on NVIDIA through the driver's NVENC directly (H.264, HEVC and AV1 where the card has it, with B-frames, lookahead and adaptive quantization), on AMD and Intel through Media Foundation, with a software fallback. If the encoder cannot keep up (a heavy game, a high frame rate), it switches to lighter settings on the fly instead of dropping frames. Game sound comes from WASAPI loopback and the microphone from its own device, on separate tracks. Pressing the hotkey writes an MP4 straight from memory, without re-encoding. Continuous recording reuses the same encoded video and writes a fragmented MP4 as it goes, so a crash loses at most a second; screenshots are full-resolution PNGs of the same capture.
+The screen is read with DXGI Desktop Duplication, the same Windows API that OBS and Discord use, so nothing is injected into games. Frames are encoded on the graphics card and the last seconds are kept in memory: on NVIDIA through the driver's NVENC directly (H.264, HEVC and AV1 where the card has it, with B-frames, lookahead and adaptive quantization), on AMD and Intel through Media Foundation, with a software fallback. If the encoder cannot keep up (a heavy game, a high frame rate), it switches to lighter settings on the fly instead of dropping frames. The video keeps the desktop's size: when a game switches the display to its own resolution (a stretched 1440x1080), its image is scaled into that frame the way the monitor shows it, so the stream and the replay go on through the change. Game sound comes from WASAPI loopback and the microphone from its own device, on separate tracks. Pressing the hotkey writes an MP4 straight from memory, without re-encoding. Continuous recording reuses the same encoded video and writes a fragmented MP4 as it goes, so a crash loses at most a second; screenshots are full-resolution PNGs of the same capture.
 
 The quality presets and the measurements behind them (bitrates, tools, PSNR/SSIM, encoder speed) are documented in [`src-tauri/src/capture/quality.rs`](src-tauri/src/capture/quality.rs). The NVENC layer is a small C file compiled by `cargo` with the Visual Studio C++ tools, against NVIDIA's MIT-licensed `nvEncodeAPI.h` ([`src-tauri/native/nvenc`](src-tauri/native/nvenc)); the NVENC library itself ships with the NVIDIA driver and is loaded at run time, never redistributed.
 

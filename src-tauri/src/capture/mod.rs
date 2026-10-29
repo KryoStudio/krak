@@ -24,6 +24,7 @@ pub mod quality;
 mod record;
 mod ring;
 mod save;
+pub mod screen;
 pub mod screenshot;
 pub mod sound;
 #[cfg(test)]
@@ -42,6 +43,7 @@ use serde::Serialize;
 use crate::media::TICKS_PER_SECOND;
 use crate::media::codec::VideoCodec;
 use crate::media::h264::Vendor;
+use crate::settings::ScreenFit;
 use crate::state::lock;
 
 pub use quality::{Backend, VideoSettings};
@@ -64,6 +66,8 @@ const AUDIO_MARGIN_SECONDS: u32 = 3;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EngineConfig {
     pub video: VideoSettings,
+    /// How other display modes (a game's own resolution) are recorded (`screen`).
+    pub screen_fit: ScreenFit,
     /// AAC bit/s of the stereo tracks.
     pub audio_bitrate: u32,
     pub buffer_seconds: u32,

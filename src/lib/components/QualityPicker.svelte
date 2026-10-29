@@ -22,7 +22,7 @@
   // Re-resolve when anything that changes the result does.
   $effect(() => {
     const s = settings.value;
-    void [s.fps, s.resolution, s.codec, s.bitrate, s.tenBit, capture.encoder, presets];
+    void [s.fps, s.resolution, s.codec, s.bitrate, s.tenBit, s.screenFit, capture.encoder, presets];
     let alive = true;
     Promise.all(presets.map((q) => resolveVideo({ quality: q }))).then((list) => {
       if (!alive) return;

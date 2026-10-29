@@ -140,6 +140,10 @@ pub struct ExportRequest {
     /// Burn the "by krak" badge in (forces a re-encode).
     #[serde(default)]
     pub watermark: bool,
+    /// Stretch a clip narrower than 16:9 (a stretched-resolution 4:3) over 16:9, like the
+    /// player saw it (forces a re-encode).
+    #[serde(default)]
+    pub stretch: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]

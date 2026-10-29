@@ -20,12 +20,15 @@
     start,
     end,
     gains,
+    size = null,
     onclose,
   }: {
     shard: Shard;
     start: number;
     end: number;
     gains: { game: number; mic: number };
+    /** The clip's picture size, when known. */
+    size?: [number, number] | null;
     onclose: () => void;
   } = $props();
 
@@ -47,6 +50,27 @@
   const selection = $derived(Math.max(0, end - start));
   /** The trimmed clip at its current quality, roughly. */
   const estimate = $derived(shard.size * (shard.duration ? selection / shard.duration : 1));
+
+  // A clip narrower than 16:9 (a stretched 4:3 resolution) can be stretched to fill the player.
+  const narrow = $derived(!!size && size[0] >= size[1] && size[0] < ((size[1] * 16) / 9) * 0.99);
+  let stretch = $state(readStretch());
+
+  function readStretch(): boolean {
+    try {
+      return localStorage.getItem('krak.export-stretch') !== 'false';
+    } catch {
+      return true;
+    }
+  }
+
+  function pickStretch(on: boolean) {
+    stretch = on;
+    try {
+      localStorage.setItem('krak.export-stretch', String(on));
+    } catch {
+      // no storage
+    }
+  }
 
   function readLimit(): Limit {
     try {
@@ -113,6 +137,7 @@
         maxBytes: target === 'discord' ? limit * 1_000_000 : null,
         path,
         watermark: settings.value.watermark,
+        stretch: narrow && stretch,
       });
       if (done.shard) library.upsert(done.shard);
       result = done;
@@ -195,6 +220,17 @@
         </div>
         <Toggle label={t('export.watermark')} checked={settings.value.watermark} onchange={(v) => settings.update({ watermark: v }).catch(() => {})} />
       </div>
+
+      {#if narrow && size}
+        <div class="badge-row">
+          <span class="stretch-preview" class:on={stretch} aria-hidden="true"><span></span></span>
+          <div class="badge-text">
+            <strong>{t('export.stretch')}</strong>
+            <span>{t('export.stretchHint', { size: `${size[0]}×${size[1]}` })}</span>
+          </div>
+          <Toggle label={t('export.stretch')} checked={stretch} onchange={pickStretch} />
+        </div>
+      {/if}
 
       <footer>
         <span class="estimate">≈ {formatSize(target === 'discord' ? Math.min(estimate, limit * 0.95e6) : estimate)}</span>
@@ -449,6 +485,27 @@
     font-weight: 700;
     letter-spacing: -0.05em;
     color: var(--text);
+  }
+  /* A 16:9 frame; the picture inside is 4:3 off, the whole frame on. */
+  .stretch-preview {
+    display: grid;
+    place-items: center;
+    width: 46px;
+    height: 26px;
+    flex: none;
+    border-radius: 5px;
+    background: #000;
+    box-shadow: inset 0 0 0 1px var(--border-strong);
+  }
+  .stretch-preview span {
+    width: 34px;
+    height: 26px;
+    border-radius: 4px;
+    background: linear-gradient(135deg, color-mix(in srgb, var(--accent) 70%, #000), color-mix(in srgb, var(--accent) 30%, #000));
+    transition: width var(--slow) var(--ease-out);
+  }
+  .stretch-preview.on span {
+    width: 46px;
   }
   .badge-text {
     display: flex;

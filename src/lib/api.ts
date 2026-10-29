@@ -27,6 +27,9 @@ export interface Settings {
   resolution: 'native' | '1440' | '1080' | '720';
   /** 30 | 60 | 120 | 144, capped to the monitor refresh rate by the engine. */
   fps: number;
+  /** A game in its own resolution (stretched 4:3...): as the screen shows it, always stretched,
+   *  or as it is. */
+  screenFit: 'screen' | 'stretch' | 'original';
   /** Mbit/s, custom quality only. */
   bitrate: number;
   /** Custom quality only, HEVC/AV1. */
@@ -173,6 +176,8 @@ export interface ExportRequest {
   path?: string | null;
   /** Burn a small "by krak" badge in the top right corner (forces a re-encode). */
   watermark?: boolean;
+  /** Stretch a clip narrower than 16:9 (a stretched 4:3) over 16:9 (forces a re-encode). */
+  stretch?: boolean;
 }
 
 export interface ExportResult {

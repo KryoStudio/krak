@@ -238,7 +238,7 @@
 </div>
 
 {#if exporting}
-  <ExportDialog {shard} {start} {end} gains={{ ...gains }} onclose={() => (exporting = false)} />
+  <ExportDialog {shard} {start} {end} gains={{ ...gains }} size={info ? [info.width, info.height] : null} onclose={() => (exporting = false)} />
 {/if}
 
 <style>

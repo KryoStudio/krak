@@ -19,13 +19,22 @@
 //! new encoder's (that path costs one to three late ticks: the flush occupies the GPU's encoder).
 //! Either way the stream keeps its parameter sets (`nvenc::Shape`), so the replay keeps every
 //! frame.
+//!
+//! The video is recorded in a frame (`screen`): the desktop's, with the monitor's shape. When a
+//! game switches the display to its own mode (a stretched 1440x1080) or back, the new image
+//! goes into the same frame the way the screen shows it (stretched, with bars or centered):
+//! a new duplication, texture and converter, but the same encoder and stream, so the replay
+//! keeps its seconds. Only a different frame (the desktop's size changed in Windows, or the
+//! "original" setting) rebuilds the pipeline and starts a new stream.
 
 use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use windows::Win32::Foundation::{CloseHandle, E_ACCESSDENIED, HANDLE};
-use windows::Win32::Graphics::Direct3D11::{D3D11_BIND_RENDER_TARGET, ID3D11Texture2D};
+use windows::Win32::Graphics::Direct3D11::{
+    D3D11_BIND_RENDER_TARGET, D3D11_VIDEO_PROCESSOR_ROTATION, ID3D11Texture2D,
+};
 use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_NV12, DXGI_FORMAT_P010, DXGI_MODE_ROTATION_ROTATE90,
     DXGI_MODE_ROTATION_ROTATE270,
@@ -43,6 +52,7 @@ use super::duplication::{Acquire, Duplication};
 use super::encoders;
 use super::quality::{self, Backend, Capabilities, EncoderPlan, Plan, Tier};
 use super::ring::StreamParams;
+use super::screen;
 use super::screenshot::Source;
 use super::{CaptureState, Shared, clock};
 use crate::media::codec::{CodecConfig, VideoPacket};
@@ -50,6 +60,7 @@ use crate::media::d3d::{self, Display, Gpu, Nv12Converter, Nv12Readback};
 use crate::media::h264::{self, Frame, H264Encoder, Vendor};
 use crate::media::nvenc::{EncodeStats, NvencEncoder};
 use crate::media::{ComGuard, MediaError, MediaResult, MfGuard, TICKS_PER_SECOND};
+use crate::settings::ScreenFit;
 use crate::state::lock;
 
 const CAPTURE_FAILED: &str = "capture_failed";
@@ -264,6 +275,11 @@ struct Pipeline {
     lost_since: i64,
     /// Size of the duplicated image.
     input: (u32, u32),
+    /// What the video is recorded in (`screen::frame`), fixed for the pipeline's life.
+    frame: (u32, u32),
+    /// Converter settings, to make another one for a new input size.
+    rotation: D3D11_VIDEO_PROCESSOR_ROTATION,
+    ten_bit_input: bool,
     health: Health,
     caps: Capabilities,
     gpu: Gpu,
@@ -279,30 +295,39 @@ impl Pipeline {
             hresult: err.code().0,
         })?;
         let input = dup.size();
-        let rotated = matches!(
-            display.rotation,
-            DXGI_MODE_ROTATION_ROTATE90 | DXGI_MODE_ROTATION_ROTATE270
-        );
-        let shown = if rotated { (input.1, input.0) } else { input };
+        let shown = shown(input, &display);
+        let shape = d3d::screen_shape(&display);
+        let fit = shared.config.screen_fit;
+        let frame = screen::frame(shown, &shape, fit);
         let refresh = match dup.refresh() {
             r if r > 0.0 => r,
             _ => d3d::refresh_rate(&display),
         };
         let caps = capabilities(&gpu);
         let tier = tier_from(shared.tier.load(std::sync::atomic::Ordering::Relaxed));
-        let plan = quality::plan(&shared.config.video, shown, refresh, &caps, tier);
+        let plan = quality::plan(&shared.config.video, frame, refresh, &caps, tier);
         let rotation = d3d::display_rotation(display.rotation);
-        let (encoder, plan, converter, target) = open_encoder(
+        let (encoder, plan, mut converter, target) = open_encoder(
             &gpu,
             plan,
             &shared.config.video,
-            shown,
+            frame,
             refresh,
             &caps,
             input,
             rotation,
         )?;
+        let output = (plan.resolved.width, plan.resolved.height);
+        let scaling = screen::scaling(fit, shape.scaling);
+        converter.set_dest_rect(&gpu, screen::placement(shown, frame, output, scaling));
+        let ten_bit_input = matches!(plan.encoder, EncoderPlan::Nvenc(s) if s.input_ten_bit);
         log_pipeline(&display, &dup, &encoder, &plan, refresh);
+        if frame != shown {
+            eprintln!(
+                "krak: the {}x{} display mode goes into the {}x{} frame ({scaling:?})",
+                shown.0, shown.1, frame.0, frame.1
+            );
+        }
 
         let desktop = gpu.texture(
             input.0,
@@ -325,6 +350,9 @@ impl Pipeline {
             retry_at: 0,
             lost_since: 0,
             input,
+            frame,
+            rotation,
+            ten_bit_input,
             desktop,
             converter,
             target,
@@ -382,7 +410,7 @@ impl Pipeline {
             let pts = due(tick);
             tick += 1;
 
-            if let Some(exit) = self.poll_desktop(now) {
+            if let Some(exit) = self.poll_desktop(shared, now) {
                 return Ok(exit);
             }
             if stats.ticks == 1 {
@@ -607,11 +635,16 @@ impl Pipeline {
     }
 
     /// Takes the latest desktop image if there is one, and manages duplication loss.
-    fn poll_desktop(&mut self, now: i64) -> Option<Exit> {
+    fn poll_desktop(&mut self, shared: &Shared, now: i64) -> Option<Exit> {
         if let Some(dup) = &mut self.dup {
             match dup.acquire(&self.gpu, &self.desktop) {
                 Acquire::Updated | Acquire::Unchanged => {}
-                Acquire::Resized => return Some(Exit::Rebuild),
+                // Another size: a new duplication says which, right away.
+                Acquire::Resized => {
+                    self.dup = None;
+                    self.retry_at = now;
+                    self.lost_since = now;
+                }
                 Acquire::Lost(code) => {
                     eprintln!("krak: desktop duplication lost ({code}), retrying");
                     self.dup = None;
@@ -626,7 +659,7 @@ impl Pipeline {
         }
         match Duplication::new(&self.display, &self.gpu) {
             Ok(dup) if dup.size() == self.input => self.dup = Some(dup),
-            Ok(_) => return Some(Exit::Rebuild),
+            Ok(dup) => return self.adopt(shared, dup),
             Err(err) => {
                 self.retry_at = now + DUPLICATION_RETRY;
                 if err.code() != E_ACCESSDENIED && now - self.lost_since > DUPLICATION_GIVE_UP {
@@ -634,6 +667,58 @@ impl Pipeline {
                 }
             }
         }
+        None
+    }
+
+    /// A duplication of another size (a game's own display mode, or back to the desktop): its
+    /// image goes into the same frame and the stream goes on, unless the frame itself changed
+    /// or each mode is recorded as it is ("original"): then the pipeline is rebuilt.
+    fn adopt(&mut self, shared: &Shared, dup: Duplication) -> Option<Exit> {
+        let input = dup.size();
+        let shown = shown(input, &self.display);
+        let shape = d3d::screen_shape(&self.display);
+        let fit = shared.config.screen_fit;
+        if fit == ScreenFit::Original || screen::frame(shown, &shape, fit) != self.frame {
+            return Some(Exit::Rebuild);
+        }
+        let scaling = screen::scaling(fit, shape.scaling);
+        let output = (self.plan.resolved.width, self.plan.resolved.height);
+        let converter = Nv12Converter::with_output(
+            &self.gpu,
+            input,
+            output,
+            self.rotation,
+            self.plan.resolved.fps,
+            self.ten_bit_input,
+        );
+        let desktop = self.gpu.texture(
+            input.0,
+            input.1,
+            DXGI_FORMAT_B8G8R8A8_UNORM,
+            D3D11_BIND_RENDER_TARGET,
+            true,
+        );
+        let (Ok(mut converter), Ok(desktop)) = (converter, desktop) else {
+            return Some(Exit::Rebuild);
+        };
+        converter.set_dest_rect(
+            &self.gpu,
+            screen::placement(shown, self.frame, output, scaling),
+        );
+        self.converter = converter;
+        self.desktop = desktop;
+        self.input = input;
+        self.dup = Some(dup);
+        shared.set_screen(Some(Source::new(
+            &self.gpu,
+            &self.desktop,
+            self.input,
+            self.display.rotation,
+        )));
+        eprintln!(
+            "krak: display mode {}x{}, kept in the {}x{} frame ({scaling:?}): the stream goes on",
+            shown.0, shown.1, self.frame.0, self.frame.1
+        );
         None
     }
 
@@ -677,6 +762,15 @@ impl Pipeline {
             });
         }
     }
+}
+
+/// The duplicated image's size as the monitor shows it (rotated displays turn it).
+fn shown(input: (u32, u32), display: &Display) -> (u32, u32) {
+    let rotated = matches!(
+        display.rotation,
+        DXGI_MODE_ROTATION_ROTATE90 | DXGI_MODE_ROTATION_ROTATE270
+    );
+    if rotated { (input.1, input.0) } else { input }
 }
 
 fn tier_from(value: u8) -> Tier {

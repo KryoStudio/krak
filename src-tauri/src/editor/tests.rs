@@ -83,6 +83,7 @@ impl Events {
 fn record(dir: &Path, seconds: u32) -> (PathBuf, CaptureStatus) {
     let events = Arc::new(Events::default());
     let config = EngineConfig {
+        screen_fit: crate::settings::ScreenFit::Screen,
         video: VideoSettings {
             quality: Quality::High,
             codec: CodecChoice::Auto,
@@ -255,6 +256,7 @@ fn run(
         gains,
         destination,
         watermark: false,
+        stretch: false,
         options,
     };
     let started = Instant::now();
@@ -1784,6 +1786,7 @@ fn export_once(
         },
         destination,
         watermark,
+        stretch: false,
         options,
     };
     let started = Instant::now();
@@ -2134,4 +2137,80 @@ fn editor_badge_and_file_exports() {
     if !keep {
         let _ = std::fs::remove_dir_all(&dir);
     }
+}
+
+/// A 4:3 clip (a stretched resolution) exported stretched: a 16:9 file filled to its edges (no
+/// black bars), to a file and for Discord; without the option it keeps its picture.
+#[test]
+#[ignore = "needs Media Foundation and the GPU; run with --ignored"]
+fn editor_stretches_narrow_clips_to_16_9() {
+    let _com = ComGuard::new();
+    let _mf = MfGuard::new().expect("media foundation");
+    let dir = std::env::temp_dir().join("kryo-editor-stretch");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("dir");
+    let source = dir.join("Stretched 4-3.mp4");
+    let y = 160u8;
+    flat_clip(&source, (1440, 1080), y, 60);
+    let cancel = AtomicBool::new(false);
+    let report = |_| {};
+    let progress = Progress::new(&cancel, &report);
+    let export = |destination: Destination, stretch: bool| {
+        let request = Request {
+            start: 0.0,
+            end: 1.5,
+            gains: Gains {
+                game: 1.0,
+                mic: 1.0,
+            },
+            destination,
+            watermark: false,
+            stretch,
+            options: Options::default(),
+        };
+        export::export(&source, &request, &progress).expect("export")
+    };
+    for (name, destination) in [
+        (
+            "file",
+            Destination::File {
+                path: dir.join("File.mp4"),
+            },
+        ),
+        (
+            "discord",
+            Destination::Discord {
+                dir: dir.join("discord"),
+                max_bytes: 10_000_000,
+            },
+        ),
+    ] {
+        let e = export(destination, true);
+        let (width, luma) = luma_frame(&e.path, 5);
+        let height = luma.len() / width;
+        // The left and right edges, halfway down: the picture, not black bars.
+        let row = height / 2 * width;
+        let (left, right) = (luma[row + 2], luma[row + width - 3]);
+        println!(
+            "{name}: {width}x{height}, edges {left}/{right} ({})",
+            e.detail
+        );
+        assert!(e.reencoded, "{name}");
+        assert_eq!((width, height), (1920, 1080), "{name}");
+        assert!(
+            left.abs_diff(y) < 10 && right.abs_diff(y) < 10,
+            "{name}: edges {left}/{right}"
+        );
+    }
+    // Without it: the clip's own picture (and no re-encode for a copy).
+    let e = export(
+        Destination::File {
+            path: dir.join("Kept.mp4"),
+        },
+        false,
+    );
+    let (width, _) = luma_frame(&e.path, 5);
+    assert_eq!(width, 1440);
+    assert!(!e.reencoded);
+    let _ = std::fs::remove_dir_all(&dir);
 }

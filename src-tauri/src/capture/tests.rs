@@ -10,11 +10,16 @@ use std::sync::{Condvar, Mutex};
 use std::time::Instant;
 
 use windows::Win32::Foundation::FILETIME;
+use windows::Win32::Graphics::Gdi::{
+    CDS_FULLSCREEN, CDS_TYPE, ChangeDisplaySettingsExW, DEVMODEW, DISP_CHANGE_SUCCESSFUL,
+    ENUM_CURRENT_SETTINGS, ENUM_DISPLAY_SETTINGS_MODE, EnumDisplaySettingsW,
+};
 use windows::Win32::Media::MediaFoundation::{
     MFAudioFormat_AAC, MFMediaType_Audio, MFMediaType_Video, MFVideoFormat_AV1, MFVideoFormat_H264,
     MFVideoFormat_HEVC,
 };
 use windows::Win32::System::Threading::{GetCurrentProcess, GetProcessTimes};
+use windows::core::PCWSTR;
 
 use super::*;
 use crate::media::{ComGuard, MfGuard, testing};
@@ -120,6 +125,7 @@ fn run(label: &str, video: VideoSettings, microphone: bool, software: bool) -> P
     video::tests::FORCE_SOFTWARE.store(software, std::sync::atomic::Ordering::Relaxed);
     let recorder = Arc::new(Recorder::default());
     let config = EngineConfig {
+        screen_fit: crate::settings::ScreenFit::Screen,
         video,
         audio_bitrate: 192_000,
         buffer_seconds: 5,
@@ -406,6 +412,7 @@ fn engine_records_continuously() {
     std::fs::create_dir_all(&dir).expect("dir");
     let recorder = Arc::new(Recorder::default());
     let config = EngineConfig {
+        screen_fit: crate::settings::ScreenFit::Screen,
         video: video(Quality::High, 60),
         audio_bitrate: 192_000,
         buffer_seconds: 10,
@@ -645,4 +652,167 @@ fn save_keeps_av_sync_with_b_frames() {
             (flash_mf - click_mf) as f64 / 1e4
         );
     }
+}
+
+/// A display mode set for a test (as a game does: not saved in Windows), put back on drop,
+/// even when the test fails.
+struct TemporaryMode([u16; 32]);
+
+impl TemporaryMode {
+    fn set(display: &crate::media::d3d::Display, mode: &DEVMODEW) -> Self {
+        // SAFETY: a full DEVMODEW from EnumDisplaySettingsW; the device name is NUL-terminated.
+        let result = unsafe {
+            ChangeDisplaySettingsExW(
+                PCWSTR(display.device_name.as_ptr()),
+                Some(mode),
+                None,
+                CDS_FULLSCREEN,
+                None,
+            )
+        };
+        assert_eq!(result, DISP_CHANGE_SUCCESSFUL, "display mode change");
+        println!(
+            "display switched to {}x{}",
+            mode.dmPelsWidth, mode.dmPelsHeight
+        );
+        Self(display.device_name)
+    }
+}
+
+impl Drop for TemporaryMode {
+    fn drop(&mut self) {
+        // SAFETY: no mode = back to the one saved in Windows.
+        let result = unsafe {
+            ChangeDisplaySettingsExW(PCWSTR(self.0.as_ptr()), None, None, CDS_TYPE(0), None)
+        };
+        println!("display restored ({result:?})");
+    }
+}
+
+/// The largest 4:3 mode of `display` at its current refresh rate and no taller than it.
+fn four_by_three_mode(display: &crate::media::d3d::Display) -> Option<DEVMODEW> {
+    let size = u16::try_from(std::mem::size_of::<DEVMODEW>()).unwrap_or(0);
+    let name = PCWSTR(display.device_name.as_ptr());
+    let mut current = DEVMODEW {
+        dmSize: size,
+        ..Default::default()
+    };
+    // SAFETY: DEVMODEW sized before each call; the device name is NUL-terminated.
+    unsafe {
+        if !EnumDisplaySettingsW(name, ENUM_CURRENT_SETTINGS, &mut current).as_bool() {
+            return None;
+        }
+        let mut best: Option<DEVMODEW> = None;
+        for i in 0.. {
+            let mut mode = DEVMODEW {
+                dmSize: size,
+                ..Default::default()
+            };
+            if !EnumDisplaySettingsW(name, ENUM_DISPLAY_SETTINGS_MODE(i), &mut mode).as_bool() {
+                break;
+            }
+            let (w, h) = (mode.dmPelsWidth, mode.dmPelsHeight);
+            if w * 3 == h * 4
+                && h <= current.dmPelsHeight
+                && mode.dmBitsPerPel == 32
+                && mode.dmDisplayFrequency == current.dmDisplayFrequency
+                && best.is_none_or(|b| h > b.dmPelsHeight)
+            {
+                best = Some(mode);
+            }
+        }
+        best
+    }
+}
+
+/// A game switching the display to its own mode (4:3, like a "stretched" resolution) and back,
+/// recorded "as on screen": the replay goes on in the same frame (no restart), so a clip saved
+/// afterwards covers the whole time, at one size. Switches the screen's resolution for 5 s.
+#[test]
+#[ignore = "switches the screen to a 4:3 resolution for 5 s and records it (silently); run with --ignored --nocapture"]
+fn engine_keeps_the_replay_through_a_mode_change() {
+    let _com = ComGuard::new();
+    let _mf = MfGuard::new().expect("media foundation");
+    let display = crate::media::d3d::primary_display().expect("display");
+    let Some(mode) = four_by_three_mode(&display) else {
+        println!("no 4:3 mode on this display");
+        return;
+    };
+    let recorder = Arc::new(Recorder::default());
+    let config = EngineConfig {
+        screen_fit: crate::settings::ScreenFit::Screen,
+        video: video(Quality::High, 60),
+        audio_bitrate: 192_000,
+        buffer_seconds: 30,
+        microphone: false,
+        microphone_device: None,
+    };
+    let engine = Engine::start(config, recorder.clone());
+    recorder
+        .wait(Duration::from_secs(10), |seen| {
+            seen.statuses
+                .iter()
+                .any(|s| s.state == CaptureState::Ready)
+                .then_some(())
+        })
+        .expect("engine never became ready");
+    let ready = Instant::now();
+    let before = engine.status();
+    std::thread::sleep(Duration::from_secs(3));
+    {
+        let _mode = TemporaryMode::set(&display, &mode);
+        std::thread::sleep(Duration::from_secs(5));
+        println!("in the 4:3 mode: {:?}", engine.status());
+    }
+    std::thread::sleep(Duration::from_secs(4));
+    let status = engine.status();
+    let elapsed = ready.elapsed().as_secs_f64();
+    println!("after: {status:?}, {elapsed:.1} s since ready");
+
+    // Never restarted, same size, and the buffer kept everything since it was ready.
+    let restarted = lock(&recorder.events)
+        .statuses
+        .iter()
+        .skip_while(|s| s.state != CaptureState::Ready)
+        .any(|s| s.state != CaptureState::Ready);
+    assert!(!restarted, "the capture restarted");
+    assert_eq!(status.state, CaptureState::Ready);
+    assert_eq!((status.width, status.height), (before.width, before.height));
+    assert!(
+        status.buffered_seconds >= elapsed - 1.5,
+        "buffered {} s of {elapsed:.1}",
+        status.buffered_seconds
+    );
+
+    engine
+        .save(SaveRequest {
+            clips_dir: out_dir(),
+            game: None,
+            desktop_label: "ModeChange".into(),
+            stamp: Stamp::now(),
+        })
+        .expect("save accepted");
+    let path = match recorder
+        .wait(Duration::from_secs(30), |seen| {
+            seen.saved.clone().map(Ok).or_else(|| seen.failed.map(Err))
+        })
+        .expect("save timed out")
+    {
+        Ok(path) => path,
+        Err(code) => panic!("save failed: {code}"),
+    };
+    drop(engine);
+    let duration = check_recording(&path, 1, status.fps);
+    let info = testing::probe(&path);
+    let video = info
+        .streams
+        .iter()
+        .find(|s| s.major == MFMediaType_Video)
+        .expect("video");
+    assert_eq!((video.width, video.height), (status.width, status.height));
+    assert!(
+        duration >= elapsed - 1.5,
+        "clip {duration:.2} s of {elapsed:.1}"
+    );
+    println!("clip: {}", path.display());
 }
