@@ -163,7 +163,12 @@
   const codecs = $derived(
     (['auto', 'h264', 'hevc', 'av1'] as const)
       .filter((c) => c === 'auto' || !encoder || encoder.codecs[c])
-      .map((c) => ({ value: c, label: c === 'auto' ? t('settings.codec.auto') : codecName(c) })),
+      .map((c) => ({
+        value: c,
+        label: c === 'auto' ? t('settings.codec.auto') : codecName(c),
+        detail: c === 'auto' ? undefined : t(`settings.codecTag.${c}`),
+        tag: c === 'auto' ? t('settings.recommended') : undefined,
+      })),
   );
   const audioRates = [128, 160, 192, 256, 320].map((v) => ({ value: v, label: `${v}` }));
   const limits = $derived([

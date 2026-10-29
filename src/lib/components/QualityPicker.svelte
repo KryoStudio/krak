@@ -3,7 +3,7 @@
   import Icon from './Icon.svelte';
   import type { Quality, ResolvedVideo } from '$lib/api';
   import { capture, resolveVideo, videoLabel } from '$lib/capture.svelte';
-  import { formatSize, t } from '$lib/i18n.svelte';
+  import { formatSize, t, type Key } from '$lib/i18n.svelte';
   import { settings } from '$lib/settings.svelte';
 
   let {
@@ -14,6 +14,8 @@
 
   const presets = $derived<Quality[]>(custom ? ['standard', 'high', 'premium', 'custom'] : ['standard', 'high', 'premium']);
   const icons = { standard: 'film', high: 'sparkles', premium: 'zap', custom: 'sliders' } as const;
+  /** What each profile is good for, at a glance; High is the one to pick. */
+  const tags: Partial<Record<Quality, Key>> = { standard: 'settings.tag.light', high: 'settings.recommended', premium: 'settings.tag.best' };
 
   let resolved = $state<Partial<Record<Quality, ResolvedVideo | null>>>({});
 
@@ -40,7 +42,7 @@
     <button class="preset" class:on={value === q} role="radio" aria-checked={value === q} onclick={() => onchange(q)}>
       <span class="top">
         <span class="icon"><Icon name={icons[q]} size={16} /></span>
-        {#if q === 'high'}<span class="badge">{t('settings.recommended')}</span>{/if}
+        {#if tags[q]}<span class="badge" class:neutral={q !== 'high'}>{t(tags[q])}</span>{/if}
         <span class="check"><Icon name="check" size={12} stroke={3} /></span>
       </span>
       <strong>{t(`settings.quality.${q}`)}</strong>
@@ -119,12 +121,20 @@
     background: var(--accent-soft);
   }
   .badge {
+    min-width: 0;
     padding: 2px 7px;
     border-radius: 999px;
     font-size: 10.5px;
     font-weight: 600;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
     color: var(--accent);
     background: var(--accent-soft);
+  }
+  .badge.neutral {
+    color: var(--text-2);
+    background: rgba(255, 255, 255, 0.06);
   }
   .check {
     display: grid;
