@@ -1,6 +1,6 @@
 [package]
 name = "krak"
-version = "0.1.0"
+version = "0.2.0"
 description = "Free, open-source game clipping for Windows. 100% local."
 authors = ["Kryo Studio"]
 license = "GPL-3.0-only"
