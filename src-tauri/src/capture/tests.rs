@@ -133,6 +133,11 @@ fn run(label: &str, video: VideoSettings, microphone: bool, software: bool) -> P
         microphone_device: None,
     };
     let cpu_before = process_cpu();
+    // This process's use of each GPU engine (3D is the one games need; the video encoder and
+    // copy engines are separate hardware). An idle GPU runs at low clocks, which inflates
+    // these shares and makes them vary a lot from run to run: they say which engines we use,
+    // not what a game would lose.
+    let mut gpu = testing::GpuUsage::start();
     let started = Instant::now();
     let engine = Engine::start(config, recorder.clone());
     let ready_after = recorder
@@ -143,7 +148,12 @@ fn run(label: &str, video: VideoSettings, microphone: bool, software: bool) -> P
                 .then(|| started.elapsed())
         })
         .expect("engine never became ready");
-    std::thread::sleep(Duration::from_secs(8).saturating_sub(started.elapsed()));
+    while started.elapsed() < Duration::from_secs(8) {
+        std::thread::sleep(Duration::from_secs(1).min(Duration::from_secs(8) - started.elapsed()));
+        if let Some(gpu) = gpu.as_mut() {
+            gpu.sample();
+        }
+    }
 
     let status = engine.status();
     println!("before save: {status:?}");
@@ -268,6 +278,14 @@ fn run(label: &str, video: VideoSettings, microphone: bool, software: bool) -> P
         engine_cpu.as_secs_f64() / wall.as_secs_f64() * 100.0,
         process.as_secs_f64() / wall.as_secs_f64() * 100.0
     );
+    if let Some(gpu) = gpu {
+        let engines: Vec<String> = gpu
+            .averages()
+            .iter()
+            .map(|(engine, percent)| format!("{engine} {percent:.2}%"))
+            .collect();
+        println!("GPU engines while capturing: {}", engines.join(", "));
+    }
     path
 }
 
