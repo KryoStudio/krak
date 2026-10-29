@@ -1,4 +1,5 @@
-﻿; Polish texts for the installer's own pages (Tauri ships no Polish table; NSIS has the rest).
+; Polish texts for the installer's own pages (Tauri ships none; NSIS has the rest). Saved without a BOM:
+; Tauri adds one when it copies the file.
 LangString addOrReinstall ${LANG_POLISH} "Dodaj/zainstaluj ponownie komponenty"
 LangString alreadyInstalled ${LANG_POLISH} "Już zainstalowano"
 LangString alreadyInstalledLong ${LANG_POLISH} "${PRODUCTNAME} ${VERSION} jest już zainstalowany. Wybierz, co chcesz zrobić, i kliknij Dalej, aby kontynuować."
