@@ -14,6 +14,7 @@
   import { tooltip } from '$lib/tooltip';
   import { ui } from '$lib/ui.svelte';
   import { view } from '$lib/view.svelte';
+  import { appWindow } from '$lib/app-window.svelte';
 
   const shard = $derived(ui.playing ? library.find(ui.playing) : undefined);
   const index = $derived(shard ? view.shards.indexOf(shard) : -1);
@@ -21,6 +22,11 @@
   const motion = $derived(prefersReducedMotion.current ? 0 : 1);
 
   let video = $state<HTMLVideoElement>();
+
+  // Krak minimized or sent to the tray: the clip (and the editor) stop playing.
+  $effect(() => {
+    if (!appWindow.shown) video?.pause();
+  });
 
   // The shard was deleted or filtered away: close.
   $effect(() => {

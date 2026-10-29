@@ -9,6 +9,7 @@
   import Logo from '$lib/components/Logo.svelte';
   import ShardCard from '$lib/components/ShardCard.svelte';
   import { mediaSrc } from '$lib/api';
+  import { appWindow } from '$lib/app-window.svelte';
   import { capture, codecName, formatClock, saveReplay } from '$lib/capture.svelte';
   import { gameTint } from '$lib/games';
   import { GB, formatAge, formatDuration, formatHotkey, formatSize, hasKey, t } from '$lib/i18n.svelte';
@@ -60,18 +61,12 @@
   );
 
   // The latest shard loops on the home page, but not under the player or the first-launch
-  // setup, nor while the window is hidden (Krak in the tray while you play).
+  // setup, and only while Krak is in front: not in the tray, minimized, or behind the game
+  // (a playing video keeps the graphics card busy).
   let preview = $state<HTMLVideoElement>();
-  let visible = $state(true);
-  $effect(() => {
-    const update = () => (visible = document.visibilityState === 'visible');
-    update();
-    document.addEventListener('visibilitychange', update);
-    return () => document.removeEventListener('visibilitychange', update);
-  });
   $effect(() => {
     if (!preview) return;
-    if (visible && settings.value.onboarded && !ui.playing) preview.play().catch(() => {});
+    if (appWindow.focused && settings.value.onboarded && !ui.playing) preview.play().catch(() => {});
     else preview.pause();
   });
 
