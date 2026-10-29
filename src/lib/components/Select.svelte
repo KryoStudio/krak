@@ -9,7 +9,14 @@
     label,
     onchange,
     width = 240,
-  }: { options: { value: T; label: string }[]; value: T; label: string; onchange: (value: T) => void; width?: number } = $props();
+  }: {
+    /** `detail` is shown dimmed on the right of the option, `tag` as a pill (e.g. "Recommended"). */
+    options: { value: T; label: string; detail?: string; tag?: string }[];
+    value: T;
+    label: string;
+    onchange: (value: T) => void;
+    width?: number;
+  } = $props();
 
   let button: HTMLButtonElement;
   const current = $derived(options.find((o) => o.value === value)?.label ?? '');
@@ -19,7 +26,13 @@
     openMenu(
       r.left,
       r.bottom + 6,
-      options.map((o) => ({ label: o.label, icon: o.value === value ? 'check' : undefined, run: () => onchange(o.value) })),
+      options.map((o) => ({
+        label: o.label,
+        icon: o.value === value ? 'check' : undefined,
+        shortcut: o.detail,
+        tag: o.tag,
+        run: () => onchange(o.value),
+      })),
     );
   }
 </script>

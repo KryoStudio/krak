@@ -1,7 +1,8 @@
 //! Audio waveforms for the editor's timeline (`get_waveforms`): one row of peaks per audio
 //! track, in `probe_shard`'s order and with its names/kinds. Each peak is the largest absolute
-//! sample (channels mixed to mono first) of one slice of the whole clip, against full scale, so
-//! a quiet microphone looks quiet. Decoding goes through the export's audio path; results are
+//! sample (of any channel: what you hear, even when left and right differ) of one slice of the
+//! whole clip, against full scale, so a quiet microphone looks quiet. The timeline draws them
+//! on a decibel scale. Decoding goes through the export's audio path; results are
 //! cached in memory (a few clips, keyed by path, size, modification time and bucket count).
 
 use std::collections::VecDeque;
@@ -41,11 +42,8 @@ pub fn peaks(samples: &[i16], channels: u16, buckets: usize) -> Vec<f32> {
             let from = b * frames / buckets;
             let to = ((b + 1) * frames / buckets).max(from);
             let peak = samples[from * channels..to * channels]
-                .chunks_exact(channels)
-                .map(|frame| {
-                    let sum: i32 = frame.iter().map(|&v| i32::from(v)).sum();
-                    (sum / channels as i32).unsigned_abs()
-                })
+                .iter()
+                .map(|&v| v.unsigned_abs())
                 .max()
                 .unwrap_or(0);
             (peak as f32 / 32768.0).min(1.0)
@@ -98,7 +96,7 @@ mod tests {
 
     #[test]
     fn buckets_and_normalizes_against_full_scale() {
-        // Stereo, 10 frames: a quiet part then a loud one; channels are averaged first.
+        // Stereo, 10 frames: a quiet part then a loud one.
         let mut samples = Vec::new();
         for i in 0..10i16 {
             let v = if i < 5 { 1000 } else { -16384 };
@@ -108,8 +106,9 @@ mod tests {
         assert_eq!(p.len(), 2);
         assert!((p[0] - 1000.0 / 32768.0).abs() < 1e-6);
         assert!((p[1] - 0.5).abs() < 1e-6);
-        // Opposite channels cancel in the mono mix.
-        assert_eq!(peaks(&[20_000, -20_000], 2, 1), [0.0]);
+        // The loudest channel counts: opposite or one-sided channels don't cancel out.
+        assert_eq!(peaks(&[20_000, -20_000], 2, 1), [20_000.0 / 32_768.0]);
+        assert_eq!(peaks(&[0, -16_384, 0, 8192], 2, 1), [0.5]);
         // Exactly `buckets` values, even with fewer frames than buckets (empty slices are 0).
         let p = peaks(&[32_767, 0, 0], 1, 64);
         assert_eq!(p.len(), 64);

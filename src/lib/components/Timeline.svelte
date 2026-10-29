@@ -91,6 +91,12 @@
     };
   });
 
+  /** Range drawn by a waveform: from silence at -48 dB up to full scale. */
+  const FLOOR_DB = 48;
+  /** Height (0..1) of a level (0..1 of full scale) on a decibel scale, like audio editors: a
+   *  normal game mix (peaks around -12 dB) fills most of the lane instead of a quarter of it. */
+  const loudness = (level: number) => (level > 0 ? Math.max(0, 1 + (20 * Math.log10(level)) / FLOOR_DB) : 0);
+
   /** Draws a mirrored waveform scaled by the lane's gain; what would clip is drawn in orange. */
   function wave(canvas: HTMLCanvasElement, params: { peaks: number[] | null; gain: number }) {
     let current = params;
@@ -125,7 +131,7 @@
         for (let j = from; j < to; j++) peak = Math.max(peak, peaks[j]);
         const level = peak * gain;
         const x = i * (bar + gap);
-        const half = Math.max(dpr / 2, Math.min(1, level) * (mid - dpr));
+        const half = Math.max(dpr / 2, Math.min(1, loudness(level)) * (mid - dpr));
         ctx.globalAlpha = 0.9;
         ctx.fillStyle = color;
         ctx.fillRect(x, mid - half, bar, half * 2);

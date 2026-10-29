@@ -39,16 +39,38 @@
     return t(hasKey(key) ? key : 'capture.error.capture_failed');
   });
   const fill = $derived(status.state === 'ready' ? Math.min(1, status.bufferedSeconds / settings.value.bufferSeconds) : 0);
+  // The format being recorded. Paused or restarting, the last one stays (dimmed), so the card
+  // keeps its height and nothing below it jumps.
+  let format = $state<Pick<typeof status, 'encoder' | 'codec' | 'tenBit' | 'height' | 'fps'> | null>(null);
+  $effect(() => {
+    if (status.state === 'ready') format = { encoder: status.encoder, codec: status.codec, tenBit: status.tenBit, height: status.height, fps: status.fps };
+  });
   const chips = $derived(
-    status.state === 'ready'
+    format
       ? [
-          status.encoder ? t(`encoder.${status.encoder}`) : '',
-          status.codec ? `${codecName(status.codec)}${status.tenBit ? ` ${t('settings.tenBitShort')}` : ''}` : '',
-          status.height ? `${status.height}p` : '',
-          status.fps ? `${status.fps} ${t('settings.fpsUnit')}` : '',
+          format.encoder ? t(`encoder.${format.encoder}`) : '',
+          format.codec ? `${codecName(format.codec)}${format.tenBit ? ` ${t('settings.tenBitShort')}` : ''}` : '',
+          format.height ? `${format.height}p` : '',
+          format.fps ? `${format.fps} ${t('settings.fpsUnit')}` : '',
         ].filter(Boolean)
       : [],
   );
+
+  // The latest shard loops on the home page, but not under the player or the first-launch
+  // setup, nor while the window is hidden (Krak in the tray while you play).
+  let preview = $state<HTMLVideoElement>();
+  let visible = $state(true);
+  $effect(() => {
+    const update = () => (visible = document.visibilityState === 'visible');
+    update();
+    document.addEventListener('visibilitychange', update);
+    return () => document.removeEventListener('visibilitychange', update);
+  });
+  $effect(() => {
+    if (!preview) return;
+    if (visible && settings.value.onboarded && !ui.playing) preview.play().catch(() => {});
+    else preview.pause();
+  });
 
   const latest = $derived(library.shards.reduce<(typeof library.shards)[number] | undefined>((a, b) => (!a || b.createdAt > a.createdAt ? b : a), undefined));
   const recent = $derived([...library.shards].sort((a, b) => b.createdAt - a.createdAt).slice(1, 5));
@@ -64,11 +86,6 @@
   function openGlacier(game?: string | null) {
     ui.filter = game === undefined ? 'all' : filterFor(game);
     goto('/glacier');
-  }
-
-  function edit(id: string) {
-    ui.playing = id;
-    ui.editing = true;
   }
 </script>
 
@@ -86,7 +103,7 @@
         <strong>{title}</strong>
       </div>
       {#if errorLine}
-        <p class="error">{errorLine}</p>
+        <p class="press error">{errorLine}</p>
       {:else}
         <p class="press">
           {t('home.press')}
@@ -94,11 +111,14 @@
           {t('home.toCapture')}
         </p>
       {/if}
-      {#if chips.length}
-        <button class="chips" onclick={() => ((ui.settingsSection = 'video'), goto('/settings'))} use:tooltip={{ text: t('settings.section.video'), side: 'bottom' }}>
-          {#each chips as chip (chip)}<span>{chip}</span>{/each}
-        </button>
-      {/if}
+      <button
+        class="chips"
+        class:dim={status.state !== 'ready'}
+        onclick={() => ((ui.settingsSection = 'video'), goto('/settings'))}
+        use:tooltip={{ text: t('settings.section.video'), side: 'bottom' }}
+      >
+        {#each chips as chip (chip)}<span>{chip}</span>{:else}<span class="placeholder">1080p</span>{/each}
+      </button>
     </div>
     <div class="hero-side">
       <button class="capture" onclick={() => saveReplay()} disabled={!capture.live}>
@@ -119,16 +139,18 @@
             {t('record.start')}
           {/if}
         </button>
-        {#if status.state === 'ready' || status.state === 'paused'}
+        {#if status.state !== 'error'}
+          <!-- Stays in place while the engine restarts (disabled, so it can't be spammed). -->
           <button
             class="ghost square"
             onclick={() => capture.setPaused(status.state === 'ready').catch(actions.showError)}
-            aria-label={t(status.state === 'ready' ? 'capture.pause' : 'capture.resume')}
-            use:tooltip={{ text: t(status.state === 'ready' ? 'capture.pause' : 'capture.resume'), side: 'bottom' }}
+            disabled={status.state === 'starting'}
+            aria-label={t(status.state === 'paused' ? 'capture.resume' : 'capture.pause')}
+            use:tooltip={{ text: t(status.state === 'paused' ? 'capture.resume' : 'capture.pause'), side: 'bottom' }}
           >
-            <Icon name={status.state === 'ready' ? 'pause' : 'play'} size={14} />
+            <Icon name={status.state === 'paused' ? 'play' : 'pause'} size={14} />
           </button>
-        {:else if status.state === 'error'}
+        {:else}
           <button class="ghost square" onclick={() => ((ui.settingsSection = 'capture'), goto('/settings'))} aria-label={t('nav.settings')}>
             <Icon name="settings" size={14} />
           </button>
@@ -145,7 +167,7 @@
           <span class="art"></span>
           {#if latest.path}
             {#key latest.id}
-              <video src={mediaSrc(latest.path)} muted autoplay loop playsinline></video>
+              <video bind:this={preview} src={mediaSrc(latest.path)} muted loop playsinline></video>
             {/key}
           {/if}
           <span class="shade"></span>
@@ -160,7 +182,7 @@
             </span>
           </div>
           <div class="latest-actions">
-            <button class="button" onclick={() => edit(latest.id)}><Icon name="scissors" size={14} />{t('home.edit')}</button>
+            <button class="button" onclick={() => actions.edit(latest)}><Icon name="scissors" size={14} />{t('home.edit')}</button>
             <button class="button" onclick={() => actions.copy(latest)} use:tooltip={{ text: t('toast.copiedBody'), side: 'top' }}>
               <Icon name="copy" size={14} />{t('shard.copy')}
             </button>
@@ -313,8 +335,9 @@
   .plus {
     color: var(--text-3);
   }
-  .error {
-    margin-top: 10px;
+  /* Same height as the shortcut line it replaces. */
+  .press.error {
+    min-height: 26px;
     color: var(--danger);
   }
   .chips {
@@ -335,12 +358,23 @@
   .chips:hover span {
     background: rgba(255, 255, 255, 0.09);
   }
+  .chips {
+    transition: opacity var(--normal);
+  }
+  .chips.dim {
+    opacity: 0.45;
+  }
+  .chips .placeholder {
+    visibility: hidden;
+  }
 
+  /* A fixed width: the record button's timer or a longer word never squeezes the text. */
   .hero-side {
     display: flex;
     flex-direction: column;
     gap: 8px;
     flex: none;
+    width: 234px;
   }
   .capture,
   .ghost {
@@ -392,6 +426,8 @@
   .side-row .ghost.rec {
     flex: 1;
     min-width: 0;
+    white-space: nowrap;
+    overflow: hidden;
   }
   .ghost.square {
     min-width: 36px;

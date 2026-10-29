@@ -93,6 +93,7 @@
         >
           <span class="icon">{#if item.icon}<Icon name={item.icon} size={15} />{/if}</span>
           <span class="label">{item.label}</span>
+          {#if item.tag}<span class="tag">{item.tag}</span>{/if}
           {#if item.shortcut}<span class="shortcut">{item.shortcut}</span>{/if}
         </button>
       {/if}
@@ -101,15 +102,19 @@
 {/if}
 
 <style>
+  /* Above every layer, dialogs and the first-launch setup included: their dropdowns open here. */
   .catcher {
     position: fixed;
     inset: 0;
-    z-index: 40;
+    z-index: 80;
   }
   .menu {
     position: fixed;
-    z-index: 41;
+    z-index: 81;
     min-width: 220px;
+    max-height: calc(100vh - 16px);
+    overflow-y: auto;
+    overscroll-behavior: contain;
     padding: 5px;
     border-radius: var(--radius);
     background: color-mix(in srgb, var(--surface-2) 92%, transparent);
@@ -144,6 +149,14 @@
   .shortcut {
     font-size: 11.5px;
     color: var(--text-3);
+  }
+  .tag {
+    padding: 1px 7px;
+    border-radius: 999px;
+    font-size: 10.5px;
+    font-weight: 600;
+    color: var(--accent);
+    background: var(--accent-soft);
   }
   .danger,
   .danger .icon {

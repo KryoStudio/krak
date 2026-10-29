@@ -56,7 +56,7 @@ export function dismissToast(id: number) {
 // Context menu --------------------------------------------------------------------
 
 export type MenuItem =
-  | { label: string; icon?: IconName; shortcut?: string; danger?: boolean; run: () => void }
+  | { label: string; icon?: IconName; shortcut?: string; tag?: string; danger?: boolean; run: () => void }
   | 'separator';
 
 export const menu = $state({ open: false, x: 0, y: 0, items: [] as MenuItem[] });
