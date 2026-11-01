@@ -305,7 +305,8 @@ impl NvencSettings {
 pub struct EncodeStats {
     pub frames_in: u64,
     pub frames_out: u64,
-    /// Time spent waiting for the encoder to finish a picture (locks over 1 ms).
+    /// Time spent waiting for the encoder: every call over 1 ms, submitting a picture (the
+    /// driver makes it wait while its queue is full, often with HEVC) or locking an output.
     pub blocked: Duration,
     pub blocked_frames: u64,
     /// Longest wait for one frame.
@@ -560,6 +561,7 @@ impl NvencEncoder {
         }
         self.collect(out, false)?;
         let slot = self.free_slot()?;
+        let started = Instant::now();
         // SAFETY: same size and format (the caller's contract); queued on the immediate
         // context, which NVENC's map synchronizes with.
         unsafe { self.context.CopyResource(&self.slots[slot].texture, frame) };
@@ -593,6 +595,7 @@ impl NvencEncoder {
                 flags,
             )
         };
+        self.count_wait(started.elapsed());
         match status {
             ffi::SUCCESS | ffi::ERR_NEED_MORE_INPUT => {}
             _ => {
@@ -688,12 +691,7 @@ impl NvencEncoder {
         let started = Instant::now();
         // SAFETY: the oldest output buffer submitted to this session, locked once.
         let status = unsafe { ffi::kryo_nv_lock(self.session.0, bitstream, 0, &mut packet) };
-        let waited = started.elapsed();
-        if waited > Duration::from_millis(1) {
-            self.stats.blocked += waited;
-            self.stats.blocked_frames += 1;
-            self.stats.worst_block = self.stats.worst_block.max(waited);
-        }
+        self.count_wait(started.elapsed());
         self.checked(status, "lock")?;
         let bytes = if packet.data.is_null() {
             Vec::new()
@@ -739,6 +737,15 @@ impl NvencEncoder {
             });
         }
         Ok(())
+    }
+
+    /// Counts a call that made the caller wait (over 1 ms) in the stats.
+    fn count_wait(&mut self, waited: Duration) {
+        if waited > Duration::from_millis(1) {
+            self.stats.blocked += waited;
+            self.stats.blocked_frames += 1;
+            self.stats.worst_block = self.stats.worst_block.max(waited);
+        }
     }
 
     /// Decode time of the `n`-th output: the `n - reorder`-th input's time, extrapolated one

@@ -18,7 +18,12 @@
 //! old one flushes what it holds on another thread too; its packets reach the ring before the
 //! new encoder's (that path costs one to three late ticks: the flush occupies the GPU's encoder).
 //! Either way the stream keeps its parameter sets (`nvenc::Shape`), so the replay keeps every
-//! frame.
+//! frame. "Behind" counts every wait the encoder imposes: HEVC mostly makes the submission of a
+//! picture wait, H.264 the lock of an output. When even the lightest tier falls behind (a GPU
+//! busy with a heavy game, an encoder shared with a stream), only every second tick, then every
+//! fourth, is encoded, down to 30 fps: the pictures stay evenly spaced in the same stream,
+//! where a synchronous encoder that cannot keep up gives bursts of four (one B-frame run)
+//! between long waits.
 //!
 //! The video is recorded in a frame (`screen`): the desktop's, with the monitor's shape. When a
 //! game switches the display to its own mode (a stretched 1440x1080) or back, the new image
@@ -71,6 +76,8 @@ const DUPLICATION_RETRY: i64 = TICKS_PER_SECOND / 2;
 /// A duplication failing this long for another reason than the secure desktop means the
 /// display itself changed: rebuild everything.
 const DUPLICATION_GIVE_UP: i64 = 3 * TICKS_PER_SECOND;
+/// Encoding fewer ticks never goes below this rate.
+const MIN_PACED_FPS: i64 = 30;
 
 /// Frame-rate health of a pipeline, logged when it ends.
 #[derive(Debug, Default, Clone, Copy)]
@@ -113,7 +120,7 @@ pub(super) fn run(shared: &Arc<Shared>) {
                 s.encoder = Some(pipeline.encoder.vendor());
                 s.width = video.width;
                 s.height = video.height;
-                s.fps = video.fps;
+                s.fps = pipeline.encoded_fps();
                 s.codec = Some(video.codec);
                 s.ten_bit = video.ten_bit;
                 s.bitrate = video.bitrate;
@@ -262,6 +269,8 @@ struct Pipeline {
     encoder: VideoEncoder,
     plan: Plan,
     step_down: StepDown,
+    /// Ticks per encoded frame (`Shared::pace`).
+    pace: i64,
     params_sent: bool,
     readback: Option<Nv12Readback>,
     cpu_frame: Vec<u8>,
@@ -361,6 +370,12 @@ impl Pipeline {
             encoder,
             plan,
             step_down: StepDown::Idle,
+            pace: i64::from(
+                shared
+                    .pace
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                    .max(1),
+            ),
             params_sent: false,
             health: Health::default(),
             caps,
@@ -401,14 +416,16 @@ impl Pipeline {
             }
             timer.wait_until(due(tick));
             let now = clock::now();
-            // Late (busy encoder, starved thread): skip to the latest tick that is due.
-            let current = tick.max((now - start) * fps / TICKS_PER_SECOND);
-            let late = u64::try_from(current - tick).unwrap_or(0);
+            // Late (busy encoder, starved thread): skip to the latest tick that is due, on the
+            // pace (every tick, or every second or fourth one).
+            let pace = self.pace;
+            let current = tick.max((now - start) * fps / TICKS_PER_SECOND / pace * pace);
+            let late = u64::try_from((current - tick) / pace).unwrap_or(0);
             stats.late += late;
             stats.ticks += 1;
             tick = current;
             let pts = due(tick);
-            tick += 1;
+            tick += pace;
 
             if let Some(exit) = self.poll_desktop(shared, now) {
                 return Ok(exit);
@@ -432,6 +449,10 @@ impl Pipeline {
                     let slow = slow || tests::force_scale_down(stats.ticks);
                     if slow && let Some(exit) = self.begin_step_down(shared) {
                         return Ok(exit);
+                    }
+                    #[cfg(test)]
+                    if tests::force_slow_down(stats.ticks) {
+                        self.slow_down(shared);
                     }
                 }
                 VideoEncoder::MediaFoundation(encoder) => {
@@ -462,19 +483,15 @@ impl Pipeline {
         }
     }
 
-    /// Starts opening the next lighter NVENC encoder (`quality::lighter`) on another thread.
     /// Steps down to the next lighter tier (`quality::lighter`): in place when the driver
-    /// allows it, else starts opening a new session on another thread.
+    /// allows it, else starts opening a new session on another thread. Past the lightest one,
+    /// encodes fewer ticks (`slow_down`).
     fn begin_step_down(&mut self, shared: &Shared) -> Option<Exit> {
         if !matches!(self.step_down, StepDown::Idle) {
             return None;
         }
         let Some(plan) = quality::lighter(&self.plan, &self.caps) else {
-            eprintln!(
-                "krak: the encoder cannot keep up at {:?}, and nothing lighter would continue the stream faster",
-                self.plan.tier
-            );
-            self.step_down = StepDown::Done;
+            self.slow_down(shared);
             return None;
         };
         let (EncoderPlan::Nvenc(settings), VideoEncoder::Nvenc(encoder)) =
@@ -537,6 +554,38 @@ impl Pipeline {
             Err(_) => StepDown::Done,
         };
         None
+    }
+
+    /// Frames per second actually encoded.
+    fn encoded_fps(&self) -> u32 {
+        self.plan.resolved.fps / u32::try_from(self.pace).unwrap_or(1).max(1)
+    }
+
+    /// Even the lightest tools fall behind: encode every second tick from now on (module docs),
+    /// as long as that stays at or above [`MIN_PACED_FPS`].
+    fn slow_down(&mut self, shared: &Shared) {
+        let fps = i64::from(self.plan.resolved.fps);
+        if fps / (self.pace * 2) < MIN_PACED_FPS {
+            eprintln!(
+                "krak: the encoder cannot keep up at {:?} and {} fps, and nothing lighter would continue the stream faster",
+                self.plan.tier,
+                self.encoded_fps()
+            );
+            self.step_down = StepDown::Done;
+            return;
+        }
+        self.pace *= 2;
+        self.health = Health::default();
+        let encoded = self.encoded_fps();
+        shared.pace.store(
+            u32::try_from(self.pace).unwrap_or(1),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        shared.update(|s| s.fps = encoded);
+        eprintln!(
+            "krak: the encoder cannot keep up even at {:?}, encoding one tick in {} ({encoded} fps)",
+            self.plan.tier, self.pace
+        );
     }
 
     /// Swaps in the lighter encoder once it is open, and hands the ring the old encoder's last
@@ -1002,13 +1051,25 @@ pub(super) mod tests {
     /// Makes step downs open a new session instead of reconfiguring (the fallback path).
     pub static FORCE_NEW_SESSION: AtomicBool = AtomicBool::new(false);
 
-    pub fn force_scale_down(tick: u64) -> bool {
-        let at = SCALE_DOWN_AT.load(Ordering::Relaxed);
-        at != 0
-            && tick >= at
-            && SCALE_DOWN_AT
-                .compare_exchange(at, 0, Ordering::Relaxed, Ordering::Relaxed)
+    /// Makes the next NVENC pipeline encode one tick in two from this tick on (0 = never),
+    /// whatever its tier.
+    pub static SLOW_DOWN_AT: AtomicU64 = AtomicU64::new(0);
+
+    fn once_at(at: &AtomicU64, tick: u64) -> bool {
+        let value = at.load(Ordering::Relaxed);
+        value != 0
+            && tick >= value
+            && at
+                .compare_exchange(value, 0, Ordering::Relaxed, Ordering::Relaxed)
                 .is_ok()
+    }
+
+    pub fn force_scale_down(tick: u64) -> bool {
+        once_at(&SCALE_DOWN_AT, tick)
+    }
+
+    pub fn force_slow_down(tick: u64) -> bool {
+        once_at(&SLOW_DOWN_AT, tick)
     }
 
     fn stats(blocked_ms: u64) -> EncodeStats {

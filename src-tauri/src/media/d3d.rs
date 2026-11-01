@@ -5,7 +5,7 @@
 
 use std::mem::ManuallyDrop;
 
-use windows::Win32::Foundation::{HMODULE, LUID, RECT};
+use windows::Win32::Foundation::{HANDLE, HMODULE, LUID, RECT};
 use windows::Win32::Graphics::Direct3D::{
     D3D_DRIVER_TYPE_UNKNOWN, D3D_FEATURE_LEVEL, D3D_FEATURE_LEVEL_10_0, D3D_FEATURE_LEVEL_10_1,
     D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_11_1,
@@ -40,6 +40,7 @@ use windows::Win32::Graphics::Dxgi::{
     IDXGIDevice, IDXGIFactory1, IDXGIOutput1,
 };
 use windows::Win32::Media::MediaFoundation::{IMFDXGIDeviceManager, MFCreateDXGIDeviceManager};
+use windows::Win32::System::Threading::GetCurrentProcess;
 use windows::core::Interface;
 
 use super::{Code, MediaError, MediaResult};
@@ -297,6 +298,25 @@ pub fn display_rotation(rotation: DXGI_MODE_ROTATION) -> D3D11_VIDEO_PROCESSOR_R
 
 /// A D3D11 device on one adapter, usable from several threads and by Media Foundation.
 /// Clones share the device.
+/// Puts this process in the "high" GPU scheduling class, once (Windows grants it without
+/// administrator rights; "realtime" is not worth it for a few copies per frame).
+fn raise_process_gpu_priority() {
+    #[link(name = "gdi32")]
+    unsafe extern "system" {
+        fn D3DKMTSetProcessSchedulingPriorityClass(process: HANDLE, priority: i32) -> i32;
+    }
+    /// `D3DKMT_SCHEDULINGPRIORITYCLASS_HIGH`.
+    const HIGH: i32 = 4;
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        // SAFETY: a documented gdi32 export, on our own process's pseudo handle.
+        let status = unsafe { D3DKMTSetProcessSchedulingPriorityClass(GetCurrentProcess(), HIGH) };
+        if status != 0 {
+            eprintln!("krak: the GPU priority stays normal ({status:#x})");
+        }
+    });
+}
+
 #[derive(Clone)]
 pub struct Gpu {
     pub device: ID3D11Device,
@@ -345,10 +365,13 @@ impl Gpu {
                 .cast::<ID3D10Multithread>()
                 .code(DEVICE_FAILED)?
                 .SetMultithreadProtected(true);
-            // Keep capture smooth when a game saturates the GPU (best effort, may need rights).
+            // Keep capture smooth when a game saturates the GPU (best effort): the device's
+            // priority, and the process's class, which hardware-accelerated GPU scheduling (on by
+            // default on recent Windows) also goes by.
             if let Ok(dxgi) = device.cast::<IDXGIDevice>() {
                 let _ = dxgi.SetGPUThreadPriority(7);
             }
+            raise_process_gpu_priority();
             let video_device = device.cast::<ID3D11VideoDevice>().code(DEVICE_FAILED)?;
             let video_context = context.cast::<ID3D11VideoContext>().code(DEVICE_FAILED)?;
 

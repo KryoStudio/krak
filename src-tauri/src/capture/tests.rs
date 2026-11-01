@@ -361,6 +361,64 @@ fn engine_scales_down_without_losing_frames() {
     }
 }
 
+/// Past the lightest tier, the engine encodes one tick in two (forced at 3 s, at 60 fps): the
+/// saved clip must be one stream, every frame decoding, one tick apart before the switch and
+/// exactly two after it (evenly spaced, no burst), and the status must say 30 fps.
+#[test]
+#[ignore = "records the screen (silently) with NVENC; run with --ignored"]
+fn engine_slows_down_evenly() {
+    use std::sync::atomic::Ordering;
+    let _com = ComGuard::new();
+    let _mf = MfGuard::new().expect("media foundation");
+    let recorder = Arc::new(Recorder::default());
+    let config = EngineConfig {
+        screen_fit: crate::settings::ScreenFit::Screen,
+        video: video(Quality::Premium, 60),
+        audio_bitrate: 192_000,
+        buffer_seconds: 5,
+        microphone: false,
+        microphone_device: None,
+    };
+    video::tests::SLOW_DOWN_AT.store(180, Ordering::Relaxed);
+    let engine = Engine::start(config, recorder.clone());
+    std::thread::sleep(Duration::from_secs(6));
+    video::tests::SLOW_DOWN_AT.store(0, Ordering::Relaxed);
+    let status = engine.status();
+    println!("before save: {status:?}");
+    assert_eq!((status.backend, status.fps), (Some(Backend::Nvenc), 30));
+    engine
+        .save(SaveRequest {
+            clips_dir: out_dir(),
+            game: None,
+            desktop_label: "Slow down".into(),
+            stamp: Stamp::now(),
+        })
+        .expect("save accepted");
+    let path = recorder
+        .wait(Duration::from_secs(30), |seen| seen.saved.clone())
+        .expect("saved");
+    drop(engine);
+    let movie = crate::editor::demux::open(&path).expect("demux");
+    let samples = movie.video().expect("video").samples.len();
+    let frames = testing::decode_video_timestamps(&path, status.ten_bit);
+    assert_eq!(frames.len(), samples, "every frame decodes");
+    let tick = TICKS_PER_SECOND / 60;
+    let gaps: Vec<i64> = frames
+        .windows(2)
+        .map(|w| ((w[1] - w[0]) as f64 / tick as f64).round() as i64)
+        .collect();
+    println!("{} frames, gaps in ticks: {gaps:?}", frames.len());
+    let switch = gaps
+        .iter()
+        .position(|&g| g != 1)
+        .expect("a switch in the clip");
+    assert!(switch > 30, "the clip starts before the switch");
+    assert!(
+        gaps[switch..].iter().all(|&g| g == 2),
+        "evenly every second tick"
+    );
+}
+
 #[test]
 #[ignore = "records the screen and microphone (silently); run with --ignored"]
 fn engine_end_to_end_with_microphone() {
