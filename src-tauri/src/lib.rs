@@ -92,6 +92,7 @@ pub fn run() {
             commands::list_microphones,
             commands::get_storage_info,
             commands::get_waveforms,
+            commands::get_audio_stems,
             recording::start_recording,
             recording::stop_recording,
             screenshots::take_screenshot,

@@ -1,5 +1,7 @@
-<!-- Watching a shard, over the content area. ←/→ go through the shards on screen. -->
+<!-- Watching a shard, over the content area. ←/→ go through the shards on screen. With "play as
+     edited" on, a clip plays its last edit: from its start to its end, at its volumes. -->
 <script lang="ts">
+  import { untrack } from 'svelte';
   import { fade, fly, scale } from 'svelte/transition';
   import { prefersReducedMotion } from 'svelte/motion';
   import Icon from './Icon.svelte';
@@ -7,9 +9,12 @@
   import RenameInput from './RenameInput.svelte';
   import Editor from './Editor.svelte';
   import { mediaSrc } from '$lib/api';
+  import { getEdit, type Edit } from '$lib/edits';
   import { gameTint } from '$lib/games';
   import { formatAge, formatSize, t } from '$lib/i18n.svelte';
   import { library } from '$lib/library.svelte';
+  import { LiveMix } from '$lib/live-mix.svelte';
+  import { settings } from '$lib/settings.svelte';
   import * as actions from '$lib/shard-actions';
   import { tooltip } from '$lib/tooltip';
   import { ui } from '$lib/ui.svelte';
@@ -22,10 +27,79 @@
   const motion = $derived(prefersReducedMotion.current ? 0 : 1);
 
   let video = $state<HTMLVideoElement>();
+  let mix = $state<LiveMix>();
+  /** The clip's last edit; the editor keeps it current while it is open. */
+  let edit = $state<Edit | null>(null);
+  const id = $derived(shard?.id);
+  /** What plays when not editing: the edit, if clips play as edited. */
+  const applied = $derived(!ui.editing && settings.value.playEdited ? edit : null);
+
+  $effect(() => {
+    edit = id ? getEdit(id) : null;
+  });
 
   // Krak minimized or sent to the tray: the clip (and the editor) stop playing.
   $effect(() => {
     if (!appWindow.shown) video?.pause();
+  });
+
+  // One live mix per video (each clip gets its own element).
+  $effect(() => {
+    const element = video;
+    const clip = untrack(() => id);
+    if (!element || !clip) return;
+    const next = new LiveMix(element, clip);
+    mix = next;
+    return () => next.destroy();
+  });
+
+  // Watching: the edit's volumes (the editor sets its own while open).
+  $effect(() => {
+    if (!mix || ui.editing) return;
+    const gains = applied?.gains ?? { game: 1, mic: 1 };
+    const target = mix;
+    target.setGains(gains);
+    if (gains.game !== 1 || gains.mic !== 1) untrack(() => target.load());
+  });
+
+  // Watching: only the kept part plays. It starts at the edit's start and stops at its end;
+  // playing again from there starts over, seeking outside it lands on its edge.
+  $effect(() => {
+    const element = video;
+    const range = applied;
+    if (!element || !range) return;
+    const { start, end } = range;
+    const near = 0.05;
+    let frame = 0;
+    const watch = () => {
+      if (element.currentTime >= end) {
+        element.pause();
+        element.currentTime = end;
+      } else frame = requestAnimationFrame(watch);
+    };
+    const onplay = () => {
+      if (element.currentTime >= end - near || element.currentTime < start - near) element.currentTime = start;
+      cancelAnimationFrame(frame);
+      frame = requestAnimationFrame(watch);
+    };
+    const onseeked = () => {
+      if (element.currentTime < start - near) element.currentTime = start;
+      else if (element.currentTime > end + near) element.currentTime = end;
+    };
+    const begin = () => {
+      if (element.currentTime < start - near || element.currentTime > end + near) element.currentTime = start;
+    };
+    if (element.readyState >= 1) begin();
+    else element.addEventListener('loadedmetadata', begin, { once: true });
+    if (!element.paused) onplay();
+    element.addEventListener('play', onplay);
+    element.addEventListener('seeked', onseeked);
+    return () => {
+      cancelAnimationFrame(frame);
+      element.removeEventListener('loadedmetadata', begin);
+      element.removeEventListener('play', onplay);
+      element.removeEventListener('seeked', onseeked);
+    };
   });
 
   // The shard was deleted or filtered away: close.
@@ -134,7 +208,7 @@
 
     {#if ui.editing}
       <div class="tools-panel" transition:fly={{ y: 16, duration: 260 * motion }}>
-        <Editor {shard} {video} />
+        <Editor {shard} {video} {mix} onedit={(next) => (edit = next)} />
       </div>
     {/if}
   </div>

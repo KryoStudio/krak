@@ -19,6 +19,8 @@ export interface Settings {
   discordPresence: boolean;
   /** Exports carry a small "by krak" badge (off by default: no watermark unless asked). */
   watermark: boolean;
+  /** Clips play as last edited: the kept part, at the editor's volumes. */
+  playEdited: boolean;
   bufferSeconds: number;
   quality: Quality;
   /** 'auto' lets the preset decide. */
@@ -243,6 +245,8 @@ export const api = {
   revealScreenshot: (id: string) => invoke<void>('reveal_screenshot', { id }),
   getPresence: () => invoke<Presence>('get_presence'),
   getWaveforms: (id: string, buckets: number) => invoke<Waveform[]>('get_waveforms', { id, buckets }),
+  /** The game and microphone tracks decoded, for the live mix (layout in `live-mix.ts`). */
+  getAudioStems: (id: string) => invoke<ArrayBuffer>('get_audio_stems', { id }),
   /** Native "Save as" dialog; null when cancelled. */
   chooseExportPath: (suggestedName: string) => invoke<string | null>('choose_export_path', { suggestedName }),
   /** Shows a file made by an export (this session) in Explorer. */

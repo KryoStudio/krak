@@ -6,6 +6,7 @@ const defaults: Settings = {
   screenshotHotkey: 'Ctrl+F9',
   discordPresence: true,
   watermark: false,
+  playEdited: true,
   bufferSeconds: 30,
   quality: 'high',
   codec: 'auto',

@@ -8,7 +8,8 @@
 //! - [`decode`] decodes audio (AAC with the Media Foundation decoder, anything else with the
 //!   Source Reader), [`transcode`] re-encodes video (hardware decode → GPU scaling → H.264);
 //! - [`export`] puts it together, [`naming`] picks output paths, [`probe`] answers the UI,
-//!   [`waveform`] draws the timeline's audio lanes, [`watermark`] draws the badge.
+//!   [`waveform`] draws the timeline's audio lanes, [`stems`] feeds the player's live mix,
+//!   [`watermark`] draws the badge.
 //!
 //! Exports run on a dedicated thread (COM/MF initialised there), one at a time; every loop
 //! checks the cancel flag and partial outputs are deleted on cancel or failure.
@@ -25,6 +26,8 @@ pub mod pcm;
 pub mod plan;
 #[cfg(windows)]
 pub mod probe;
+#[cfg(windows)]
+pub mod stems;
 #[cfg(all(test, windows))]
 mod tests;
 #[cfg(windows)]

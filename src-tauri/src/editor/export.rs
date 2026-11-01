@@ -367,15 +367,26 @@ pub fn decode_all_audio(
     path: &Path,
     progress: &Progress,
 ) -> Result<Vec<(SourceTrack, Pcm)>, &'static str> {
+    decode_audio(path, progress, |_| true)
+}
+
+/// The audio tracks of the clip at `path` that `wanted` keeps, decoded like
+/// [`decode_all_audio`].
+pub fn decode_audio(
+    path: &Path,
+    progress: &Progress,
+    wanted: impl Fn(&SourceTrack) -> bool,
+) -> Result<Vec<(SourceTrack, Pcm)>, &'static str> {
     let source = Source::open(path)?;
     let end = if source.duration > 0.0 {
         (source.duration * TICKS_PER_SECOND as f64).round() as i64
     } else {
         0
     };
-    let count = source.audio.len().max(1) as f64;
-    let mut out = Vec::with_capacity(source.audio.len());
-    for (n, track) in source.audio.iter().enumerate() {
+    let tracks: Vec<_> = source.audio.iter().filter(|t| wanted(&t.track)).collect();
+    let count = tracks.len().max(1) as f64;
+    let mut out = Vec::with_capacity(tracks.len());
+    for (n, track) in tracks.into_iter().enumerate() {
         progress.check()?;
         let span = progress.span(n as f64 / count, (n + 1) as f64 / count);
         let pcm = match &track.decoder {

@@ -126,6 +126,8 @@ pub struct Settings {
     pub discord_presence: bool,
     /// Burn a small "by krak" badge into exports.
     pub watermark: bool,
+    /// Clips play as last edited: the kept part, at the editor's volumes (used by the page).
+    pub play_edited: bool,
     /// Oldest non-favorite clips go to the Recycle Bin beyond this many GB; `None` = no limit.
     pub storage_limit_gb: Option<f64>,
     /// The first-run wizard is done.
@@ -164,6 +166,7 @@ pub struct SettingsPatch {
     pub overlay: Option<bool>,
     pub discord_presence: Option<bool>,
     pub watermark: Option<bool>,
+    pub play_edited: Option<bool>,
     /// Outer `None` = absent, `Some(None)` = explicit `null` (no limit).
     #[serde(default, deserialize_with = "present")]
     pub storage_limit_gb: Option<Option<f64>>,
@@ -202,6 +205,7 @@ impl Settings {
             overlay: true,
             discord_presence: true,
             watermark: false,
+            play_edited: true,
             storage_limit_gb: None,
             onboarded: false,
         }
@@ -292,6 +296,9 @@ impl Settings {
         }
         if let Some(watermark) = patch.watermark {
             next.watermark = watermark;
+        }
+        if let Some(play_edited) = patch.play_edited {
+            next.play_edited = play_edited;
         }
         next
     }
@@ -447,7 +454,7 @@ mod tests {
         assert_eq!(s.accent, "glacier");
         assert!(!s.sidebar_collapsed && !s.launch_at_startup && s.close_to_tray);
         assert!(!s.microphone && s.capture_sound && s.overlay);
-        assert!(s.discord_presence && !s.watermark);
+        assert!(s.discord_presence && !s.watermark && s.play_edited);
     }
 
     #[test]
@@ -474,6 +481,7 @@ mod tests {
         assert_eq!(json["screenshotHotkey"], "Ctrl+F9");
         assert_eq!(json["discordPresence"], true);
         assert_eq!(json["watermark"], false);
+        assert_eq!(json["playEdited"], true);
         let custom = defaults().merge(patch(r#"{"quality": "custom", "resolution": "1440"}"#));
         let json = serde_json::to_value(custom).expect("serializable");
         assert_eq!(
@@ -558,9 +566,9 @@ mod tests {
         assert!(s.microphone && !s.capture_sound && !s.overlay);
         assert_eq!(s.merge(patch("{}")), s);
         let s = s.merge(patch(
-            r#"{"discordPresence": false, "watermark": true, "recordHotkey": " Ctrl+Alt+R ", "screenshotHotkey": "F10"}"#,
+            r#"{"discordPresence": false, "watermark": true, "playEdited": false, "recordHotkey": " Ctrl+Alt+R ", "screenshotHotkey": "F10"}"#,
         ));
-        assert!(!s.discord_presence && s.watermark);
+        assert!(!s.discord_presence && s.watermark && !s.play_edited);
         assert_eq!(
             (s.record_hotkey.as_str(), s.screenshot_hotkey.as_str()),
             ("Ctrl+Alt+R", "F10")

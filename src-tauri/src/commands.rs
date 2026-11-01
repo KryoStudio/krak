@@ -14,6 +14,7 @@ use crate::capture::encoders::{self, EncoderInfo};
 use crate::capture::quality::{self, ResolvedVideo, Tier};
 use crate::capture::screen;
 use crate::editor::export::{self, Destination};
+use crate::editor::stems;
 use crate::editor::waveform::{self, Waveform};
 use crate::editor::{
     EXPORT_PROGRESS, ExportProgress, ExportRequest, ExportResult, ExportSlot, INVALID_REQUEST,
@@ -462,6 +463,17 @@ pub async fn get_waveforms(app: AppHandle, id: String, buckets: f64) -> CmdResul
         waveform::waveforms(&path, buckets).map(|w| w.as_ref().clone())
     })
     .await
+}
+
+/// The game and microphone tracks of a clip (or its only track) as 16-bit PCM, for the
+/// player's live mix: one binary buffer, laid out in `editor::stems`. `unsupported` for other
+/// layouts, `too_long` past five minutes.
+#[tauri::command]
+pub async fn get_audio_stems(app: AppHandle, id: String) -> CmdResult<tauri::ipc::Response> {
+    let path = library::resolve_id(&app.state::<AppState>().clips_dir(), &id)?;
+    media_thread("kryo-stems", move || stems::stems(&path))
+        .await
+        .map(tauri::ipc::Response::new)
 }
 
 /// Stops the running export (it then fails with `cancelled` and leaves no file behind).

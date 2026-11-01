@@ -1,19 +1,32 @@
 <!-- Editing tools under the player: a multi-track timeline (video, game sound, microphone) with
-     trim handles and per-track volume, then save a copy or export for Discord.
-     Keys: Space play/pause, I/O set the start/end at the playhead, ←/→ seek (Shift: 5 s). -->
+     trim handles and per-track volume, heard live (`LiveMix`), then save a copy or export for
+     Discord. Keys: Space play/pause, I/O set the start/end at the playhead, ←/→ seek (Shift: 5 s). -->
 <script lang="ts">
-  import { onMount, untrack } from 'svelte';
+  import { onDestroy, onMount, untrack } from 'svelte';
   import Icon from './Icon.svelte';
   import Timeline, { type Lane } from './Timeline.svelte';
   import ExportDialog from './ExportDialog.svelte';
   import { api, mediaSrc, native, type Shard, type ShardInfo, type Waveform } from '$lib/api';
-  import { getEdit, saveEdit } from '$lib/edits';
+  import { getEdit, saveEdit, type Edit } from '$lib/edits';
   import { gameTint } from '$lib/games';
   import { t } from '$lib/i18n.svelte';
   import { library } from '$lib/library.svelte';
+  import type { LiveMix } from '$lib/live-mix.svelte';
   import { tooltip } from '$lib/tooltip';
 
-  let { shard, video }: { shard: Shard; video?: HTMLVideoElement } = $props();
+  let {
+    shard,
+    video,
+    mix,
+    onedit,
+  }: {
+    shard: Shard;
+    video?: HTMLVideoElement;
+    /** Plays the tracks at the volumes set here. */
+    mix?: LiveMix;
+    /** Every change of the trim or volumes, as it happens. */
+    onedit?: (edit: Edit) => void;
+  } = $props();
 
   const BUCKETS = 800;
 
@@ -123,15 +136,24 @@
     ];
   }
 
-  // Remember the trim and volumes of this clip (shortly after the last change).
+  // Remember the trim and volumes of this clip (shortly after the last change, or when the
+  // editor closes before that).
+  let unsaved: (() => void) | null = null;
   $effect(() => {
     const edit = { start, end, gains: { ...gains } };
     const id = loadedId;
     const d = duration;
     if (!id || id !== shard.id || !d) return;
-    const timer = setTimeout(() => saveEdit(id, edit, d), 300);
+    untrack(() => onedit?.(edit));
+    const save = () => {
+      saveEdit(id, edit, d);
+      unsaved = null;
+    };
+    unsaved = save;
+    const timer = setTimeout(save, 300);
     return () => clearTimeout(timer);
   });
+  onDestroy(() => unsaved?.());
 
   // Playhead follows the video smoothly; playback loops inside the kept range.
   onMount(() => {
@@ -147,9 +169,18 @@
     return () => cancelAnimationFrame(frame);
   });
 
-  // A single audio track can be previewed live (up to 100 %); separate tracks apply on export.
+  // The volumes are heard live. A clip the live mix cannot play (over five minutes) only
+  // previews a single track's volume, up to 100 %; separate tracks then apply on export.
+  const live = $derived(mix?.state === 'loading' || mix?.state === 'active');
   $effect(() => {
-    if (video && !hasMic) video.volume = Math.min(1, gains.game);
+    const target = mix;
+    untrack(() => target?.load());
+  });
+  $effect(() => {
+    mix?.setGains(gains);
+  });
+  $effect(() => {
+    if (video && !hasMic && !live) video.volume = Math.min(1, gains.game);
   });
 
   function seek(time: number) {
@@ -232,7 +263,7 @@
     />
   {/if}
 
-  {#if hasMic && (gains.game !== 1 || gains.mic !== 1)}
+  {#if !live && hasMic && (gains.game !== 1 || gains.mic !== 1)}
     <p class="note"><Icon name="info" size={13} />{t('editor.volumesOnExport')}</p>
   {/if}
 </div>

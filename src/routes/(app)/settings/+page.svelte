@@ -244,6 +244,14 @@
             {@render row(t('settings.tray'), t('settings.trayHint'), tray)}
           </div>
 
+          <h3>{t('settings.editing')}</h3>
+          <div class="card">
+            {#snippet playEdited()}
+              <Toggle label={t('settings.playEdited')} checked={s.playEdited} onchange={(v) => set({ playEdited: v })} />
+            {/snippet}
+            {@render row(t('settings.playEdited'), t('settings.playEditedHint'), playEdited)}
+          </div>
+
           <h3>Discord</h3>
           <div class="card">
             {#snippet discord()}
