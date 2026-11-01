@@ -112,6 +112,7 @@ pub fn run() {
 }
 
 fn setup(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {
+    log_to_file(app);
     let handle = app.handle().clone();
     let state = AppState::load(&handle)?;
     let settings = state.settings();
@@ -141,4 +142,32 @@ fn setup(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {
         window::show_main(&handle);
     }
     Ok(())
+}
+
+/// The installed app has no console, so what Krak prints (the capture pipeline and its encoder,
+/// steps down, failures) goes to `<local app data>/com.kryostudio.krak/logs/krak.log` instead,
+/// the previous run's kept as `krak.old.log`. Run from a terminal, it stays there.
+fn log_to_file(app: &App) {
+    use std::os::windows::io::IntoRawHandle;
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::System::Console::{GetStdHandle, STD_ERROR_HANDLE, SetStdHandle};
+
+    // SAFETY: reads this process's standard error handle.
+    if unsafe { GetStdHandle(STD_ERROR_HANDLE) }.is_ok_and(|h| !h.is_invalid()) {
+        return;
+    }
+    let Ok(dir) = app.path().app_log_dir() else {
+        return;
+    };
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.join("krak.log");
+    let _ = std::fs::rename(&path, dir.join("krak.old.log"));
+    let Ok(file) = std::fs::File::create(&path) else {
+        return;
+    };
+    // SAFETY: a file handle that stays open (never closed) as standard error for the rest of
+    // the process; `eprintln!` looks it up on every write.
+    if unsafe { SetStdHandle(STD_ERROR_HANDLE, HANDLE(file.into_raw_handle())) }.is_ok() {
+        eprintln!("krak {}", app.package_info().version);
+    }
 }
