@@ -138,7 +138,10 @@ fn setup(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {
     overlay::init(&handle);
     tray::create(&handle)?;
 
-    if !std::env::args().any(|arg| arg == MINIMIZED_ARG) {
+    if std::env::args().any(|arg| arg == MINIMIZED_ARG) {
+        // Started in the tray: the page has nothing to show until the window opens.
+        window::start_in_tray(&handle);
+    } else {
         window::show_main(&handle);
     }
     Ok(())
