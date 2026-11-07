@@ -11,6 +11,7 @@
   import { library } from '$lib/library.svelte';
   import { settings } from '$lib/settings.svelte';
   import Logo from './Logo.svelte';
+  import { portal } from '$lib/portal';
   import Toggle from './Toggle.svelte';
   import { displayTitle, showError } from '$lib/shard-actions';
   import { toast } from '$lib/ui.svelte';
@@ -166,8 +167,9 @@
   );
 </script>
 
-<div class="backdrop" transition:fade={{ duration: 180 * motion }} onpointerdown={() => stage !== 'working' && onclose()} role="presentation"></div>
-<div class="center">
+<!-- Over the whole window (the player behind is blurred, which would otherwise hold it). -->
+<div class="backdrop" use:portal={'body'} transition:fade={{ duration: 180 * motion }} onpointerdown={() => stage !== 'working' && onclose()} role="presentation"></div>
+<div class="center" use:portal={'body'}>
   <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
   <div bind:this={dialog} class="dialog" role="dialog" aria-modal="true" aria-label={t('export.title')} tabindex="-1" {onkeydown} in:scale={{ start: 0.96, duration: 260 * motion, easing: cubicOut }} out:scale={{ start: 0.98, duration: 140 * motion }}>
     <header>
@@ -179,6 +181,8 @@
     </header>
 
     {#if stage === 'choose'}
+      <!-- On a short window this part scrolls; the export button stays in view. -->
+      <div class="scroll">
       <div class="body" in:fly={{ y: 8, duration: 220 * motion }}>
         <div class="targets" role="radiogroup" aria-label={t('export.title')}>
           {#each options as option (option.id)}
@@ -231,6 +235,7 @@
           <Toggle label={t('export.stretch')} checked={stretch} onchange={pickStretch} />
         </div>
       {/if}
+      </div>
 
       <footer>
         <span class="estimate">≈ {formatSize(target === 'discord' ? Math.min(estimate, limit * 0.95e6) : estimate)}</span>
@@ -288,6 +293,7 @@
     display: flex;
     flex-direction: column;
     width: min(560px, 100%);
+    max-height: calc(100vh - 48px);
     padding: 20px 22px;
     border-radius: 18px;
     background: var(--surface);
@@ -299,6 +305,7 @@
   }
 
   header {
+    flex: none;
     display: flex;
     align-items: flex-start;
     justify-content: space-between;
@@ -521,7 +528,15 @@
     font-size: 12px;
     color: var(--text-3);
   }
+  .scroll {
+    flex: 1 1 auto;
+    min-height: 0;
+    overflow-y: auto;
+    margin: 0 -10px;
+    padding: 0 10px 2px;
+  }
   footer {
+    flex: none;
     display: flex;
     align-items: center;
     justify-content: space-between;

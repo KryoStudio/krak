@@ -290,28 +290,28 @@
     gap: 12px;
     padding: 0 12px 24px;
   }
+  /* The picture is the largest 16:9 box that fits the space left, whole: while editing, the
+     tools under it take height, and it shrinks instead of sliding under them. */
   .screen {
     flex: 1;
     min-width: 0;
     height: 100%;
     display: grid;
     place-items: center;
+    container-type: size;
   }
   video,
   .placeholder {
-    max-width: 100%;
-    max-height: 100%;
+    width: min(100cqw, 100cqh * 16 / 9);
     aspect-ratio: 16 / 9;
     border-radius: var(--radius-lg);
     background: #000;
     box-shadow: 0 30px 80px -30px rgba(0, 0, 0, 0.9);
   }
   video {
-    width: 100%;
     outline: none;
   }
   .placeholder {
-    width: 100%;
     display: grid;
     place-items: center;
     background:
