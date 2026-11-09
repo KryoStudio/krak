@@ -105,6 +105,18 @@ impl AudioTimeline {
         }
     }
 
+    /// Writes a packet whose timestamp the driver says is wrong (WASAPI's timestamp error):
+    /// it continues the track as it is, unless the track is far from `estimate` (where the
+    /// clock puts the packet), which then counts as its position.
+    pub fn write_unstamped(&mut self, estimate: i64, samples: &[i16]) {
+        if (estimate - self.end()).abs() <= TOLERANCE {
+            let frames = samples.len() / CHANNELS;
+            self.append(&samples[..frames * CHANNELS]);
+        } else {
+            self.write(estimate, samples, false);
+        }
+    }
+
     /// Appends a packet that continues the track, `drift` frames from where it belongs (module
     /// docs): past the threshold, one frame is repeated (the track is late) or dropped (ahead).
     fn continue_with(&mut self, drift: i64, samples: &[i16]) {
@@ -361,6 +373,23 @@ mod tests {
         // A discontinuity inside the tolerance re-syncs at once too.
         t.write(t.end() + 300, &frames(3, 480), true);
         assert_eq!(t.end(), end + 2400 + 480 + 300 + 480);
+    }
+
+    #[test]
+    fn a_packet_without_a_valid_timestamp_continues_the_track() {
+        let mut t = AudioTimeline::new(0, 48_000 * 60);
+        t.write(0, &frames(1, 480), false);
+        // Its guessed position is 15 ms off: appended right after, no silence, no overlap.
+        t.write_unstamped(480 + 720, &frames(2, 480));
+        assert_eq!(t.end(), 960);
+        t.write_unstamped(960 - 720, &frames(3, 480));
+        assert_eq!(t.end(), 1440);
+        let all = left(&t.snapshot().read(0, 1440));
+        assert_eq!((all[479], all[480], all[960]), (1, 2, 3));
+        // Far from where the clock puts it (after silence): placed there.
+        t.write_unstamped(10_000, &frames(4, 480));
+        assert_eq!(t.end(), 10_480);
+        assert_eq!(left(&t.snapshot().read(9_999, 2)), [0, 4]);
     }
 
     #[test]
