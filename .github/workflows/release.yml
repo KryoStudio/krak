@@ -2,9 +2,13 @@
 # signs the update files and opens a draft GitHub release with latest.json for the in-app updater.
 # Secrets needed: TAURI_SIGNING_PRIVATE_KEY (and TAURI_SIGNING_PRIVATE_KEY_PASSWORD if the key has one).
 #
-# Optional, off until configured:
+# Optional, off until configured (see docs/SIGNING.md):
 # - VirusTotal: with a VT_API_KEY secret, the installer is scanned and the release notes link the
 #   report. The notes always get the installer's SHA-256.
+# - Windows code signing by SignPath: with a SIGNPATH_ORGANIZATION_ID repository variable (and the
+#   SIGNPATH_API_TOKEN secret), krak.exe and then the installer are signed before they are
+#   published, and the updater's signature is made for the signed installer. Without it, the
+#   build goes through tauri-action exactly as before.
 name: Release
 
 on:
@@ -14,6 +18,8 @@ on:
 
 permissions:
   contents: write
+  # Lets SignPath fetch the artifacts it signs (nothing else reads them).
+  actions: read
 
 env:
   RELEASE_BODY: Download `Krak_*_x64-setup.exe` below and run it. Already installed (Krak or Kryo Shard)? The app updates itself.
@@ -37,8 +43,10 @@ jobs:
 
       - run: npm ci
 
+      # Unsigned: build, sign the update files and draft the release in one go.
       - uses: tauri-apps/tauri-action@v0
         id: tauri
+        if: vars.SIGNPATH_ORGANIZATION_ID == ''
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
@@ -50,6 +58,131 @@ jobs:
           releaseDraft: true
           prerelease: false
           includeUpdaterJson: true
+
+      # Signed with SignPath: the app first, then the installer made with it. Each signing request
+      # waits for its approval in SignPath (up to three hours).
+      - name: Build krak.exe
+        if: vars.SIGNPATH_ORGANIZATION_ID != ''
+        run: npx tauri build --no-bundle --ci
+
+      - name: Upload krak.exe for signing
+        id: unsigned-exe
+        if: vars.SIGNPATH_ORGANIZATION_ID != ''
+        uses: actions/upload-artifact@v7
+        with:
+          name: krak-exe
+          path: src-tauri/target/release/krak.exe
+          if-no-files-found: error
+
+      - name: Sign krak.exe
+        if: vars.SIGNPATH_ORGANIZATION_ID != ''
+        uses: signpath/github-action-submit-signing-request@v3
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: ${{ vars.SIGNPATH_PROJECT_SLUG || 'krak' }}
+          signing-policy-slug: ${{ vars.SIGNPATH_POLICY_SLUG || 'release-signing' }}
+          artifact-configuration-slug: ${{ vars.SIGNPATH_EXE_CONFIGURATION || 'krak-exe' }}
+          github-artifact-id: ${{ steps.unsigned-exe.outputs.artifact-id }}
+          wait-for-completion: true
+          wait-for-completion-timeout-in-seconds: 10800
+          output-artifact-directory: signed/exe
+
+      - name: Bundle the installer around the signed krak.exe
+        if: vars.SIGNPATH_ORGANIZATION_ID != ''
+        shell: bash
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          cp signed/exe/krak.exe src-tauri/target/release/krak.exe
+          npx tauri bundle --bundles nsis --ci
+          installer=$(ls src-tauri/target/release/bundle/nsis/*-setup.exe)
+          mkdir -p signing/installer
+          cp "$installer" signing/installer/krak-setup.exe
+
+      - name: Upload the installer for signing
+        id: unsigned-installer
+        if: vars.SIGNPATH_ORGANIZATION_ID != ''
+        uses: actions/upload-artifact@v7
+        with:
+          name: krak-setup
+          path: signing/installer/krak-setup.exe
+          if-no-files-found: error
+
+      - name: Sign the installer
+        if: vars.SIGNPATH_ORGANIZATION_ID != ''
+        uses: signpath/github-action-submit-signing-request@v3
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: ${{ vars.SIGNPATH_PROJECT_SLUG || 'krak' }}
+          signing-policy-slug: ${{ vars.SIGNPATH_POLICY_SLUG || 'release-signing' }}
+          artifact-configuration-slug: ${{ vars.SIGNPATH_INSTALLER_CONFIGURATION || 'krak-installer' }}
+          github-artifact-id: ${{ steps.unsigned-installer.outputs.artifact-id }}
+          wait-for-completion: true
+          wait-for-completion-timeout-in-seconds: 10800
+          output-artifact-directory: signed/installer
+
+      # The update signature made while bundling covers the unsigned installer: the updater would
+      # reject the signed one. Sign it again, then write latest.json for it.
+      - name: Sign the signed installer for the updater
+        if: vars.SIGNPATH_ORGANIZATION_ID != ''
+        shell: bash
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          installer=$(ls src-tauri/target/release/bundle/nsis/*-setup.exe)
+          cp signed/installer/krak-setup.exe "$installer"
+          rm -f "$installer.sig"
+          version=$(jq -r .version src-tauri/tauri.conf.json)
+          npx tauri signer sign --app-version "$version" "$installer"
+          url="https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG/$(basename "$installer")"
+          jq -n \
+            --arg version "$version" \
+            --arg notes "$RELEASE_BODY" \
+            --arg date "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --arg signature "$(cat "$installer.sig")" \
+            --arg url "$url" \
+            '{version: $version, notes: $notes, pub_date: $date, platforms: {
+              "windows-x86_64": {signature: $signature, url: $url},
+              "windows-x86_64-nsis": {signature: $signature, url: $url}}}' \
+            > src-tauri/target/release/bundle/latest.json
+
+      - name: Check the Authenticode signatures
+        if: vars.SIGNPATH_ORGANIZATION_ID != ''
+        shell: pwsh
+        run: |
+          $files = @('src-tauri/target/release/krak.exe') + (Get-ChildItem src-tauri/target/release/bundle/nsis/*-setup.exe).FullName
+          foreach ($file in $files) {
+            $signature = Get-AuthenticodeSignature $file
+            Write-Host "$file`: $($signature.Status) ($($signature.SignerCertificate.Subject))"
+            if ($signature.Status -ne 'Valid') { throw "$file is not validly signed" }
+          }
+
+      - name: Draft the release
+        id: signed-release
+        if: vars.SIGNPATH_ORGANIZATION_ID != ''
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          id=$(gh api -X POST "repos/$GITHUB_REPOSITORY/releases" \
+            -f tag_name="$TAG" -f target_commitish="$GITHUB_SHA" -f name="Krak $TAG" \
+            -f body="$RELEASE_BODY" -F draft=true -F prerelease=false --jq .id)
+          installer=$(ls src-tauri/target/release/bundle/nsis/*-setup.exe)
+          for file in "$installer" "$installer.sig" src-tauri/target/release/bundle/latest.json; do
+            curl --fail -sS -o /dev/null -X POST \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              -H "Content-Type: application/octet-stream" \
+              --data-binary "@$file" \
+              "https://uploads.github.com/repos/$GITHUB_REPOSITORY/releases/$id/assets?name=$(basename "$file")"
+          done
+          echo "id=$id" >> "$GITHUB_OUTPUT"
 
       # VirusTotal (optional). The key never reaches the build: it is only given to these steps.
       - name: Is VirusTotal configured?
@@ -96,7 +229,7 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          RELEASE_ID: ${{ steps.tauri.outputs.releaseId }}
+          RELEASE_ID: ${{ steps.tauri.outputs.releaseId || steps.signed-release.outputs.id }}
           VT_UPLOADED: ${{ steps.virustotal.outputs.uploaded }}
           VT_VERDICT: ${{ steps.virustotal.outputs.verdict }}
         run: |
