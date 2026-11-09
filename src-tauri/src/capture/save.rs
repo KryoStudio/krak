@@ -43,6 +43,8 @@ pub(super) struct Snapshot {
     pub mic: Option<AudioSnapshot>,
     /// AAC bitrate of the stereo tracks (Mix, Game), bit/s.
     pub audio_bitrate: u32,
+    /// The longest clip there can be (100 ns): the replay window and the audio margin.
+    pub max_span: i64,
 }
 
 struct Track {
@@ -84,6 +86,30 @@ fn tracks(
         }
         None => vec![stereo("Game", game)],
     }
+}
+
+/// The clip's packets from the first keyframe that keeps it within `max_span` (100 ns from the
+/// first decode time to the end of the last picture). The ring never gives more than its window
+/// and a GOP; this is the backstop that keeps a clip from ever spanning hours (and its audio
+/// from needing hours of PCM in memory).
+fn bounded(video: &[Arc<VideoPacket>], max_span: i64, frame: i64) -> &[Arc<VideoPacket>] {
+    let Some(end) = video.iter().map(|p| p.pts + frame).max() else {
+        return video;
+    };
+    let mut start = 0;
+    while end - video[start].dts > max_span
+        && let Some(next) = video[start + 1..].iter().position(|p| p.keyframe)
+    {
+        start += next + 1;
+    }
+    &video[start..]
+}
+
+/// Audio frames for video from `origin` to `end` (100 ns), never more than `max_span` holds
+/// (a GOP that cannot be cut keeps its video, the audio stops there).
+fn audio_frames(origin: i64, end: i64, max_span: i64) -> usize {
+    let frames = timeline::position(end) - timeline::position(origin);
+    usize::try_from(frames.min(timeline::position(max_span))).unwrap_or(0)
 }
 
 /// Lowers the calling thread's CPU, disk and memory priorities (Windows' background mode):
@@ -137,8 +163,7 @@ pub(super) fn write_clip(
     let video = VideoTrack {
         config: &snapshot.params.config,
         colour: Some(Colour::BT709),
-        samples: snapshot
-            .video
+        samples: bounded(&snapshot.video, snapshot.max_span, frame)
             .iter()
             .map(|p| VideoSample {
                 data: &p.data,
@@ -151,9 +176,7 @@ pub(super) fn write_clip(
     };
     // Audio from the first decode time to the end of the last picture (module docs).
     let origin = video.origin();
-    let frames =
-        usize::try_from(timeline::position(video.presentation_end()) - timeline::position(origin))
-            .unwrap_or(0);
+    let frames = audio_frames(origin, video.presentation_end(), snapshot.max_span);
     let tracks = tracks(
         &snapshot.game,
         snapshot.mic.as_ref(),
@@ -206,6 +229,47 @@ pub(super) fn write_clip(
 mod tests {
     use super::*;
     use crate::capture::timeline::AudioTimeline;
+
+    /// A packet presented at `pts` seconds (decoded at the same time), a keyframe or not.
+    fn at(seconds: f64, keyframe: bool) -> Arc<VideoPacket> {
+        let t = (seconds * TICKS_PER_SECOND as f64) as i64;
+        Arc::new(VideoPacket {
+            data: vec![0; 10],
+            pts: t,
+            dts: t,
+            keyframe,
+            clean_end: true,
+        })
+    }
+
+    #[test]
+    fn never_writes_a_clip_longer_than_the_buffer() {
+        const S: i64 = TICKS_PER_SECOND;
+        let frame = S / 10;
+        // A GOP from eight hours ago, then two seconds of video now (two GOPs).
+        let hours = 8.0 * 3600.0;
+        let mut video = vec![at(0.0, true), at(0.1, false)];
+        for i in 0..20 {
+            video.push(at(hours + f64::from(i) / 10.0, i % 10 == 0));
+        }
+        let kept = bounded(&video, 40 * S, frame);
+        assert_eq!(kept.len(), 20);
+        assert_eq!(kept[0].pts, (hours * S as f64) as i64);
+        // Whole GOPs only: 1.5 s allowed keeps the last one.
+        let kept = bounded(&video, 15 * S / 10, frame);
+        assert_eq!((kept.len(), kept[0].pts), (10, video[12].pts));
+        assert!(kept[0].keyframe);
+        // Within the limit: everything.
+        assert_eq!(bounded(&video[2..], 40 * S, frame).len(), 20);
+        assert!(bounded(&[], S, frame).is_empty());
+        // One GOP longer than the limit cannot be cut: its audio stops at the limit.
+        let long = [at(0.0, true), at(hours, false)];
+        assert_eq!(bounded(&long, 40 * S, frame).len(), 2);
+        let end = long[1].pts + frame;
+        assert_eq!(audio_frames(0, end, 40 * S), 40 * 48_000);
+        assert_eq!(audio_frames(S, 2 * S, 40 * S), 48_000);
+        assert_eq!(audio_frames(2 * S, S, 40 * S), 0);
+    }
 
     #[test]
     fn builds_tracks_for_the_video_range() {

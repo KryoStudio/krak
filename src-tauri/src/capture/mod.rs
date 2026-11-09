@@ -63,8 +63,10 @@ pub const EMPTY: &str = "empty";
 pub const WRITE_FAILED: &str = "write_failed";
 pub const ENCODE_FAILED: &str = "encode_failed";
 
-/// Audio kept beyond the replay window: a clip may start up to one GOP before it.
-const AUDIO_MARGIN_SECONDS: u32 = 3;
+/// Audio kept beyond the replay window, and the most a clip may exceed the window by: a clip
+/// may start up to one GOP before the window (a second, four when only one tick in four is
+/// encoded) and a GOP ending just before a short hole (`ring`).
+const AUDIO_MARGIN_SECONDS: u32 = 6;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EngineConfig {
@@ -246,6 +248,11 @@ impl Shared {
         i64::from(self.buffer_seconds.load(Ordering::Relaxed)) * TICKS_PER_SECOND
     }
 
+    /// The longest clip a save may write (100 ns): the window and the audio kept beyond it.
+    fn max_clip(&self) -> i64 {
+        self.window() + i64::from(AUDIO_MARGIN_SECONDS) * TICKS_PER_SECOND
+    }
+
     /// Audio frames each timeline keeps.
     fn audio_keep(&self) -> i64 {
         let seconds = self.buffer_seconds.load(Ordering::Relaxed) + AUDIO_MARGIN_SECONDS;
@@ -375,6 +382,7 @@ impl Engine {
             game: lock(&shared.game_audio).snapshot(),
             mic: shared.mic_audio.as_ref().map(|m| lock(m).snapshot()),
             audio_bitrate: shared.config.audio_bitrate,
+            max_span: shared.max_clip(),
         };
         let events = shared.events.clone();
         std::thread::Builder::new()
