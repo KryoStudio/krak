@@ -384,6 +384,7 @@ export const en = {
   'community.title': 'Krak community',
   'community.hint': 'Share your clips, get help and vote for the clip of the week.',
   'community.join': 'Join the Krak Discord',
+  'nav.discord': 'Discord',
   'community.inviteTitle': 'Join the Krak community',
   'community.joinShort': 'Join',
   'community.notNow': 'Not now',

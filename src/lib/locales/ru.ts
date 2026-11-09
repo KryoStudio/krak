@@ -409,6 +409,7 @@ export const ru: Translation = {
   'community.title': 'Сообщество Krak',
   'community.hint': 'Делись клипами, получай помощь и голосуй за клип недели.',
   'community.join': 'Присоединиться к Discord Krak',
+  'nav.discord': 'Discord',
   'community.inviteTitle': 'Присоединяйся к сообществу Krak',
   'community.joinShort': 'Присоединиться',
   'community.notNow': 'Не сейчас',

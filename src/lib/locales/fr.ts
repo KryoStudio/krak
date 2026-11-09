@@ -385,6 +385,7 @@ export const fr: Translation = {
   'community.title': 'Communauté Krak',
   'community.hint': 'Partage tes clips, trouve de l’aide et vote pour le clip de la semaine.',
   'community.join': 'Rejoindre le Discord Krak',
+  'nav.discord': 'Discord',
   'community.inviteTitle': 'Rejoins la communauté Krak',
   'community.joinShort': 'Rejoindre',
   'community.notNow': 'Pas maintenant',

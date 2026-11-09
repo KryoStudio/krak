@@ -10,6 +10,7 @@
   import { screens } from '$lib/screenshots.svelte';
   import { settings } from '$lib/settings.svelte';
   import { capture, formatClock } from '$lib/capture.svelte';
+  import { discordInvite, openLink } from '$lib/community';
   import { showError } from '$lib/shard-actions';
   import { tooltip } from '$lib/tooltip';
   import { filterFor, ui, type Filter } from '$lib/ui.svelte';
@@ -101,6 +102,7 @@
 {#snippet gridIcon()}<Icon name="grid" size={16} />{/snippet}
 {#snippet starIcon()}<Icon name="star" size={16} />{/snippet}
 {#snippet gearIcon()}<Icon name="settings" size={16} />{/snippet}
+{#snippet discordIcon()}<Icon name="users" size={16} />{/snippet}
 
 <aside class:collapsed>
   <div class="brand" data-tauri-drag-region>
@@ -155,6 +157,8 @@
   </nav>
 
   <div class="foot">
+    <!-- The Krak Discord, always one click away (opens in Discord or the browser). -->
+    {@render item('discord', t('nav.discord'), null, discordIcon, () => openLink(discordInvite('app-sidebar')))}
     {@render item('settings', t('nav.settings'), null, gearIcon, () => goto('/settings'))}
   </div>
 </aside>

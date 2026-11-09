@@ -385,6 +385,7 @@ export const zh: Translation = {
   'community.title': 'Krak 社区',
   'community.hint': '分享你的高光、获取帮助，并为本周最佳高光投票。',
   'community.join': '加入 Krak Discord',
+  'nav.discord': 'Discord',
   'community.inviteTitle': '加入 Krak 社区',
   'community.joinShort': '加入',
   'community.notNow': '以后再说',

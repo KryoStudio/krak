@@ -385,6 +385,7 @@ export const ja: Translation = {
   'community.title': 'Krak コミュニティ',
   'community.hint': 'クリップを共有したり、質問したり、今週のベストクリップに投票したりできます。',
   'community.join': 'Krak の Discord に参加',
+  'nav.discord': 'Discord',
   'community.inviteTitle': 'Krak コミュニティに参加しよう',
   'community.joinShort': '参加する',
   'community.notNow': '今はしない',
