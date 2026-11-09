@@ -7,6 +7,11 @@
 //! packet marked `clean_end`: every picture presented before it has been output, so the end
 //! has no hole either.
 //!
+//! The encoder hands a picture over some frames after it was captured (its lookahead and
+//! B-frames: a few hundred ms). A save therefore takes its clip in two steps (`Pending`): the
+//! start at the press, so trimming cannot drop it, then what the encoder hands over until the
+//! picture shown at the press is in.
+//!
 //! When capture stops for longer than the window (display off, the PC asleep) and resumes with
 //! the same stream parameters, nothing from before can be in a clip any more: the ring starts
 //! over at the first keyframe decoded after the hole, so no clip ever spans hours.
@@ -176,7 +181,21 @@ impl VideoRing {
         }
     }
 
-    /// The packets of a clip of the last `window` ending at `now` (cheap: shared packets).
+    /// A save pressed at `now`: the clip of the last `window` from its first keyframe, to be
+    /// completed with what the encoder hands over next (`Pending`). `None` while the ring
+    /// holds no clip.
+    pub fn pending(&self, now: i64, window: i64) -> Option<Pending> {
+        let (start, _) = self.range(now, window)?;
+        Some(Pending {
+            packets: self.packets.range(start..).cloned().collect(),
+            until: now,
+            closed: false,
+        })
+    }
+
+    /// The packets of a clip of the last `window` ending at `now` with what the ring holds
+    /// already (cheap: shared packets).
+    #[cfg(test)]
     pub fn snapshot(&self, now: i64, window: i64) -> Vec<Arc<VideoPacket>> {
         let Some((start, end)) = self.range(now, window) else {
             return Vec::new();
@@ -191,7 +210,8 @@ impl VideoRing {
         self.packets.range(start..).cloned().collect()
     }
 
-    /// Length (100 ns) of the clip `snapshot` would give, counting `frame` for the last picture.
+    /// Length (100 ns) of the clip a save pressed at `now` gives: up to the picture shown at
+    /// `now`, counting `frame` for it.
     pub fn span(&self, now: i64, window: i64, frame: i64) -> i64 {
         let Some((start, end)) = self.range(now, window) else {
             return 0;
@@ -199,7 +219,90 @@ impl VideoRing {
         let clip = self.packets.range(start..end);
         let first = clip.clone().map(|p| p.pts).min().unwrap_or(0);
         let last = clip.map(|p| p.pts).max().unwrap_or(first);
-        last - first + frame
+        last.max(now) - first + frame
+    }
+}
+
+/// A clip being saved (`VideoRing::pending`): its packets from the first keyframe, taken at the
+/// press, then what the ring gets next (`catch_up`) until the picture shown at the press is in.
+pub struct Pending {
+    packets: Vec<Arc<VideoPacket>>,
+    /// The press (100 ns): the clip ends with the picture shown then.
+    until: i64,
+    /// The ring went on without our last packet (another stream, a hole): nothing more can
+    /// come.
+    closed: bool,
+}
+
+impl Pending {
+    pub fn until(&self) -> i64 {
+        self.until
+    }
+
+    /// Latest presentation time taken so far.
+    pub fn newest(&self) -> Option<i64> {
+        self.packets.iter().map(|p| p.pts).max()
+    }
+
+    /// Length (100 ns) of the clip once complete: from its first picture to the one shown at
+    /// the press, counting `frame` for it.
+    pub fn span(&self, frame: i64) -> i64 {
+        let first = self
+            .packets
+            .iter()
+            .map(|p| p.pts)
+            .min()
+            .unwrap_or(self.until);
+        self.until + frame - first
+    }
+
+    /// Takes the packets `ring` got since, if they continue ours (same stream, no hole).
+    pub fn catch_up(&mut self, ring: &VideoRing) {
+        if self.closed {
+            return;
+        }
+        let at = self
+            .packets
+            .last()
+            .and_then(|last| ring.packets.iter().rposition(|p| Arc::ptr_eq(p, last)));
+        match at {
+            Some(at) => self.packets.extend(ring.packets.range(at + 1..).cloned()),
+            None => self.closed = true,
+        }
+    }
+
+    /// Past the first clean end at which the picture shown at the press is in (pictures last
+    /// `frame`): the clip's end.
+    fn end(&self, frame: i64) -> Option<usize> {
+        let mut newest = i64::MIN;
+        self.packets
+            .iter()
+            .position(|p| {
+                newest = newest.max(p.pts);
+                p.clean_end && newest > self.until - frame
+            })
+            .map(|i| i + 1)
+    }
+
+    /// The picture shown at the press is in, or will never come.
+    pub fn complete(&self, frame: i64) -> bool {
+        self.closed || self.end(frame).is_some()
+    }
+
+    /// The clip: up to the first clean end with the picture shown at the press, else (it did
+    /// not come in time) up to the last clean end there is.
+    pub fn finish(mut self, frame: i64) -> Vec<Arc<VideoPacket>> {
+        let end = self
+            .end(frame)
+            .or_else(|| {
+                self.packets
+                    .iter()
+                    .rposition(|p| p.clean_end)
+                    .map(|i| i + 1)
+            })
+            .unwrap_or(0);
+        self.packets.truncate(end);
+        self.packets
     }
 }
 
@@ -445,10 +548,8 @@ mod tests {
         let frames = presented(&clip);
         assert_eq!(frames, (0..=16).collect::<Vec<_>>(), "no hole");
         assert!(clip.last().is_some_and(|p| p.clean_end));
-        assert_eq!(
-            ring.span(now, 100 * S, S / 10),
-            *frames.last().unwrap() * S / 10 + S / 10
-        );
+        // A save pressed now runs to the picture shown now (frame 20, still in the encoder).
+        assert_eq!(ring.span(now, 100 * S, S / 10), now + S / 10);
 
         // A long run with a 2.5 s window: trimmed by whole GOPs (keyframe first), snapshots
         // start at the keyframe before the window and present every frame once.
@@ -475,6 +576,61 @@ mod tests {
         let before = ring.len();
         ring.push(packets[10].clone(), 25 * S / 10, usize::MAX);
         assert_eq!(ring.len(), before);
+    }
+
+    #[test]
+    fn a_save_waits_for_the_picture_shown_at_the_press() {
+        let packets = b_frame_stream(60);
+        let frame = S / 10;
+        let mut ring = VideoRing::default();
+        // At the press (frame 18.5) the encoder has handed over up to P20: frames 17..=19
+        // are still inside it (B18 B17 B19 come next).
+        for p in packets.iter().take(18) {
+            ring.push(p.clone(), 100 * S, usize::MAX);
+        }
+        let press = 18 * frame + frame / 2;
+        let mut pending = ring.pending(press, 100 * S).expect("a clip");
+        assert_eq!(pending.until(), press);
+        assert_eq!(pending.newest(), Some(20 * frame));
+        assert_eq!(pending.span(frame), press + frame);
+        assert!(!pending.complete(frame));
+        // The next ones arrive; meanwhile a short window trims the ring's start: the clip
+        // keeps it.
+        for p in &packets[18..24] {
+            ring.push(p.clone(), 5 * frame, usize::MAX);
+        }
+        assert!(ring.packets.front().is_some_and(|p| p.pts > 0));
+        pending.catch_up(&ring);
+        assert!(pending.complete(frame));
+        let clip = pending.finish(frame);
+        // Up to B19, the clean end with frame 18 (the one shown at the press): nothing after.
+        assert_eq!(presented(&clip), (0..=20).collect::<Vec<_>>());
+        assert!(clip[0].keyframe && clip.last().is_some_and(|p| p.clean_end));
+        assert!(clip.windows(2).all(|w| w[1].dts > w[0].dts));
+
+        // The encoder never hands it over (stopped, or slower than the wait): the clip ends at
+        // the last clean end there is.
+        let mut ring = VideoRing::default();
+        for p in packets.iter().take(18) {
+            ring.push(p.clone(), 100 * S, usize::MAX);
+        }
+        let pending = ring.pending(press, 100 * S).expect("a clip");
+        assert_eq!(
+            presented(&pending.finish(frame)),
+            (0..=16).collect::<Vec<_>>()
+        );
+
+        // A new stream replaces ours meanwhile: nothing more will come.
+        let mut pending = ring.pending(press, 100 * S).expect("a clip");
+        ring.clear();
+        ring.push(packets[12].clone(), 100 * S, usize::MAX);
+        pending.catch_up(&ring);
+        assert!(pending.complete(frame));
+        assert_eq!(
+            presented(&pending.finish(frame)),
+            (0..=16).collect::<Vec<_>>()
+        );
+        assert!(VideoRing::default().pending(press, S).is_none());
     }
 
     #[test]

@@ -65,8 +65,9 @@ pub const ENCODE_FAILED: &str = "encode_failed";
 
 /// Audio kept beyond the replay window, and the most a clip may exceed the window by: a clip
 /// may start up to one GOP before the window (a second, four when only one tick in four is
-/// encoded) and a GOP ending just before a short hole (`ring`).
-const AUDIO_MARGIN_SECONDS: u32 = 6;
+/// encoded) or a GOP ending just before a short hole (`ring`), and a save takes the audio up
+/// to three seconds after the press (`save::collect`).
+const AUDIO_MARGIN_SECONDS: u32 = 8;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EngineConfig {
@@ -353,41 +354,35 @@ impl Engine {
         self.shared.buffer_seconds.store(seconds, Ordering::Relaxed);
     }
 
-    /// Saves the last `bufferSeconds` (from the keyframe before) in the background: the result
-    /// arrives through [`EngineEvents::saved`] / [`EngineEvents::save_failed`]. Fails at once
-    /// with "not_ready" or "empty". Returns the clip's length in seconds: what it holds is
-    /// fixed from here on.
+    /// Saves the last `bufferSeconds` (from the keyframe before) up to the picture shown now,
+    /// in the background: the result arrives through [`EngineEvents::saved`] /
+    /// [`EngineEvents::save_failed`]. Fails at once with "not_ready" or "empty". Returns the
+    /// clip's length in seconds: what it holds is decided here (its start is taken now, its
+    /// end comes out of the encoder within a few hundred ms, see `save`).
     pub fn save(&self, request: SaveRequest) -> Result<f64, &'static str> {
         let shared = &self.shared;
         if lock(&shared.status).state != CaptureState::Ready {
             return Err(NOT_READY);
         }
         let now = clock::now();
-        let (params, video) = {
+        let (params, pending) = {
             let ring = lock(&shared.video);
-            (ring.params(), ring.snapshot(now, shared.window()))
+            (ring.params(), ring.pending(now, shared.window()))
         };
-        let params = params.ok_or(EMPTY)?;
-        if video.is_empty() {
+        let (Some(params), Some(pending)) = (params, pending) else {
             return Err(EMPTY);
-        }
-        let frame = TICKS_PER_SECOND / i64::from(params.fps.max(1));
-        let (first, last) = video.iter().fold((i64::MAX, i64::MIN), |(first, last), p| {
-            (first.min(p.pts), last.max(p.pts))
-        });
-        let seconds = (last - first + frame) as f64 / TICKS_PER_SECOND as f64;
-        let snapshot = save::Snapshot {
-            params,
-            video,
-            game: lock(&shared.game_audio).snapshot(),
-            mic: shared.mic_audio.as_ref().map(|m| lock(m).snapshot()),
-            audio_bitrate: shared.config.audio_bitrate,
-            max_span: shared.max_clip(),
         };
-        let events = shared.events.clone();
+        let frame = TICKS_PER_SECOND / i64::from(params.fps.max(1));
+        let span = pending.span(frame).min(shared.max_clip());
+        let seconds = span as f64 / TICKS_PER_SECOND as f64;
+        let shared = shared.clone();
         std::thread::Builder::new()
             .name("kryo-save".into())
             .spawn(move || {
+                let snapshot = save::collect(&shared, params, pending);
+                let events = shared.events.clone();
+                // Not the engine's buffers: it may stop meanwhile and free them.
+                drop(shared);
                 save::in_background();
                 let result = save::write_clip(&snapshot, &request);
                 drop(snapshot);
