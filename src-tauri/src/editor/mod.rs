@@ -147,6 +147,24 @@ pub struct ExportRequest {
     /// player saw it (forces a re-encode).
     #[serde(default)]
     pub stretch: bool,
+    /// Vertical 9:16 (1080×1920), a window of the picture (forces a re-encode).
+    #[serde(default)]
+    pub vertical: bool,
+    /// Where that window is across the picture: 0 left, 1 right; centred when absent.
+    #[serde(default)]
+    pub crop_x: Option<f64>,
+}
+
+impl ExportRequest {
+    /// The vertical window's position (0..1), when the export is vertical.
+    pub fn vertical_position(&self) -> Option<f64> {
+        self.vertical.then(|| {
+            self.crop_x
+                .filter(|x| x.is_finite())
+                .unwrap_or(0.5)
+                .clamp(0.0, 1.0)
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -373,6 +391,28 @@ mod contract_tests {
         .unwrap();
         assert_eq!((copy.target, copy.max_bytes), (Target::Copy, None));
         assert!(!copy.watermark && copy.path.is_none(), "optional fields");
+        assert_eq!(copy.vertical_position(), None, "not vertical by default");
+        let vertical: ExportRequest = serde_json::from_value(serde_json::json!({
+            "id": "a.mp4", "start": 0, "end": 1, "gains": { "game": 1, "mic": 1 },
+            "target": "discord", "maxBytes": 20_000_000, "vertical": true, "cropX": 0.25
+        }))
+        .unwrap();
+        assert_eq!(vertical.vertical_position(), Some(0.25));
+        let centred = ExportRequest {
+            crop_x: None,
+            ..vertical.clone()
+        };
+        assert_eq!(centred.vertical_position(), Some(0.5));
+        let wild = ExportRequest {
+            crop_x: Some(f64::NAN),
+            ..vertical.clone()
+        };
+        assert_eq!(wild.vertical_position(), Some(0.5));
+        let far = ExportRequest {
+            crop_x: Some(4.0),
+            ..vertical
+        };
+        assert_eq!(far.vertical_position(), Some(1.0));
         let file: ExportRequest = serde_json::from_value(serde_json::json!({
             "id": "a.mp4", "start": 0, "end": 1, "gains": { "game": 1, "mic": 1 },
             "target": "file", "maxBytes": null, "path": "D:\\Exports\\Ace.mp4", "watermark": true

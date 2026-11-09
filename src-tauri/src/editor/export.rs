@@ -18,6 +18,11 @@
 //! narrower than 16:9 (a stretched-resolution 4:3) over 16:9: the output is planned for the
 //! 16:9 size and the GPU's video processor scales each picture to it, filling it.
 //!
+//! A vertical export keeps a 9:16 window of the picture ([`plan::vertical_window`], where the
+//! user put it) and is planned for 1080×1920 ([`plan::VERTICAL`]): the Discord ladder, the
+//! copy's bitrate and the badge's place all follow from that size. A clip already that narrow is
+//! exported as it is.
+//!
 //! Timing: media time zero of an output is its first video decode time, which comes before the
 //! first picture when there are B-frames; audio is taken from that instant too, and the
 //! muxer's edit list hides the difference on every track (see `mp4_writer`).
@@ -75,6 +80,8 @@ pub struct Request {
     pub watermark: bool,
     /// Stretch a clip narrower than 16:9 over 16:9.
     pub stretch: bool,
+    /// Vertical 9:16: where the window is across the picture (0 left, 1 right).
+    pub vertical: Option<f64>,
     /// Fallback paths (tests).
     pub options: transcode::Options,
 }
@@ -93,8 +100,10 @@ enum Output<'a> {
 struct VideoJob {
     /// The badge.
     watermark: bool,
-    /// New pictures are needed (the badge, or stretching): no passthrough.
+    /// New pictures are needed (the badge, stretching, cropping): no passthrough.
     fresh: bool,
+    /// Vertical: the 9:16 window's position.
+    crop: Option<f64>,
     options: transcode::Options,
 }
 
@@ -301,18 +310,25 @@ pub fn export(
     progress.check()?;
     let (start, end) = range(request.start, request.end, source.duration)?;
     let gains = clamp_gains(request.gains);
+    // Vertical: a 9:16 window, planned for 1080×1920 (and never stretched first).
+    let cropped = request
+        .vertical
+        .filter(|&position| plan::vertical_window(source.size, position).is_some());
     // Stretched: everything is planned for the 16:9 size, and our video processor (which fills
     // the output) does the scaling, not the reader's (which may keep the shape).
-    let stretched = request
-        .stretch
+    let stretched = (request.stretch && cropped.is_none())
         .then(|| plan::widescreen(source.size))
         .flatten();
     if let Some(size) = stretched {
         source.size = size;
     }
+    if cropped.is_some() {
+        source.size = plan::VERTICAL;
+    }
     let job = VideoJob {
         watermark: request.watermark,
-        fresh: request.watermark || stretched.is_some(),
+        fresh: request.watermark || stretched.is_some() || cropped.is_some(),
+        crop: cropped,
         options: transcode::Options {
             gpu_scaling: request.options.gpu_scaling || stretched.is_some(),
             ..request.options
@@ -751,6 +767,7 @@ fn reencode(
         end,
         target,
         watermark: video.watermark,
+        crop: video.crop,
         options: video.options,
     };
     transcode::transcode(job, &gpu, &progress)

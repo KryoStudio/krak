@@ -209,6 +209,44 @@ pub fn widescreen((width, height): (u32, u32)) -> Option<(u32, u32)> {
     Some(((wide / 2.0).round() as u32 * 2, height))
 }
 
+/// Output size of a vertical export: the 1080×1920 TikTok, YouTube Shorts and Reels expect.
+pub const VERTICAL: (u32, u32) = (1080, 1920);
+
+/// A rectangle of a picture, in pixels (even: 4:2:0 chroma).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Window {
+    pub x: u32,
+    pub y: u32,
+    pub width: u32,
+    pub height: u32,
+}
+
+/// The 9:16 window of a `frame` that a vertical export keeps: its whole height, at `position`
+/// across what is left (0: against the left edge, 1: the right one, 0.5: centred). `None` for
+/// a picture already 9:16 or narrower: it is kept whole.
+pub fn vertical_window((width, height): (u32, u32), position: f64) -> Option<Window> {
+    let (w, h) = (width & !1, height & !1);
+    if w < 2 || h < 2 {
+        return None;
+    }
+    let crop = ((f64::from(h) * 9.0 / 16.0 / 2.0).round() as u32 * 2).max(2);
+    if f64::from(crop) >= f64::from(w) * 0.99 {
+        return None;
+    }
+    let position = if position.is_finite() {
+        position.clamp(0.0, 1.0)
+    } else {
+        0.5
+    };
+    let x = ((f64::from(w - crop) * position / 2.0).round() as u32 * 2).min(w - crop);
+    Some(Window {
+        x,
+        y: 0,
+        width: crop,
+        height: h,
+    })
+}
+
 /// Scales `source` so its short side is at most `short_side` (never up), within the H.264
 /// limits, keeping the aspect ratio with even dimensions.
 pub fn fit((width, height): (u32, u32), short_side: u32) -> (u32, u32) {
@@ -464,6 +502,66 @@ mod tests {
         ] {
             assert_eq!(widescreen(size), None, "{size:?}");
         }
+    }
+
+    #[test]
+    fn crops_a_vertical_window() {
+        // 1080p: 608 px wide (1080 × 9/16, even), centred by default.
+        let w = vertical_window((1920, 1080), 0.5).unwrap();
+        assert_eq!(
+            w,
+            Window {
+                x: 656,
+                y: 0,
+                width: 608,
+                height: 1080
+            }
+        );
+        assert_eq!(w.x * 2 + w.width, 1920, "centred");
+        // Against either edge, and anything in between (even, inside the picture).
+        assert_eq!(vertical_window((1920, 1080), 0.0).unwrap().x, 0);
+        assert_eq!(vertical_window((1920, 1080), 1.0).unwrap().x, 1920 - 608);
+        assert_eq!(vertical_window((1920, 1080), -3.0).unwrap().x, 0);
+        assert_eq!(vertical_window((1920, 1080), 7.0).unwrap().x, 1312);
+        assert_eq!(vertical_window((1920, 1080), f64::NAN).unwrap().x, 656);
+        for size in [
+            (2560, 1440),
+            (1280, 720),
+            (3440, 1440),
+            (1440, 1080),
+            (1366, 767),
+        ] {
+            for step in 0..=20 {
+                let w = vertical_window(size, f64::from(step) / 20.0).unwrap();
+                assert!(
+                    [w.x, w.width, w.height].iter().all(|v| v % 2 == 0),
+                    "{size:?}: {w:?}"
+                );
+                assert!(
+                    w.x + w.width <= size.0 && w.height <= size.1,
+                    "{size:?}: {w:?}"
+                );
+                let ratio = f64::from(w.width) / f64::from(w.height);
+                assert!((ratio - 9.0 / 16.0).abs() < 0.01, "{size:?}: {ratio}");
+            }
+        }
+        // Already vertical (or close to it): kept whole.
+        for size in [(1080, 1920), (608, 1080), (720, 1280), (0, 0), (1, 1)] {
+            assert_eq!(vertical_window(size, 0.5), None, "{size:?}");
+        }
+    }
+
+    #[test]
+    fn plans_vertical_exports_like_any_portrait_video() {
+        let mb = 1_000_000u64;
+        // Short enough: 1080×1920 for Discord too.
+        let t = discord_target(VERTICAL, 60.0, 10.0, 20 * mb, 1.0).unwrap();
+        assert_eq!((t.width, t.height, t.fps), (1080, 1920, 60));
+        // Longer: the ladder keeps it vertical.
+        let t = discord_target(VERTICAL, 60.0, 30.0, 20 * mb, 1.0).unwrap();
+        assert_eq!((t.width, t.height), (720, 1280));
+        let t = copy_target(VERTICAL, 60.0, Some(20_000_000.0));
+        assert_eq!((t.width, t.height, t.bitrate), (1080, 1920, 20_000_000));
     }
 
     #[test]

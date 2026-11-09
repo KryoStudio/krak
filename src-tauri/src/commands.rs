@@ -326,6 +326,7 @@ pub async fn export_shard(app: AppHandle, request: ExportRequest) -> CmdResult<E
         destination,
         watermark: request.watermark,
         stretch: request.stretch,
+        vertical: request.vertical_position(),
         options: editor::transcode::Options::default(),
     };
     let cancel = slot.cancel_flag();

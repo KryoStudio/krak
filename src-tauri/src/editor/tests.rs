@@ -22,7 +22,8 @@ use super::demux::{self, Movie};
 use super::export::{self, Destination, Exported, Request};
 use super::mapped::MappedFile;
 use super::pcm::Pcm;
-use super::transcode::Options;
+use super::plan::{self, Window};
+use super::transcode::{Options, crop_nv12};
 use super::watermark::{Badge, Rect};
 use super::{CANCELLED, Gains, INVALID_RANGE, Progress, TrackKind, decode, probe};
 use crate::capture::VideoSettings;
@@ -257,6 +258,7 @@ fn run(
         destination,
         watermark: false,
         stretch: false,
+        vertical: None,
         options,
     };
     let started = Instant::now();
@@ -1787,6 +1789,7 @@ fn export_once(
         destination,
         watermark,
         stretch: false,
+        vertical: None,
         options,
     };
     let started = Instant::now();
@@ -2166,6 +2169,7 @@ fn editor_stretches_narrow_clips_to_16_9() {
             destination,
             watermark: false,
             stretch,
+            vertical: None,
             options: Options::default(),
         };
         export::export(&source, &request, &progress).expect("export")
@@ -2212,5 +2216,176 @@ fn editor_stretches_narrow_clips_to_16_9() {
     let (width, _) = luma_frame(&e.path, 5);
     assert_eq!(width, 1440);
     assert!(!e.reencoded);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The window of a vertical export, cut out of a decoded NV12 frame: its luma rows, then its
+/// chroma rows (half as many), nothing else.
+#[test]
+fn crops_vertical_windows_out_of_nv12_frames() {
+    let (w, h) = (16u32, 8u32);
+    // Luma: the column; chroma: 100 + column + row.
+    let mut frame: Vec<u8> = (0..h).flat_map(|_| 0..w as u8).collect();
+    frame.extend((0..h as u8 / 2).flat_map(|row| (0..w as u8).map(move |c| 100 + c + row)));
+    // 8 px tall: a 4 px wide window, centred at x = 6.
+    let window = plan::vertical_window((w, h), 0.5).expect("window");
+    assert_eq!((window.x, window.width, window.height), (6, 4, 8));
+    let out = crop_nv12(&frame, (w, h), window);
+    assert_eq!(out.len(), 4 * 8 * 3 / 2);
+    for row in 0..8 {
+        assert_eq!(&out[row * 4..row * 4 + 4], &[6, 7, 8, 9], "luma row {row}");
+    }
+    let chroma = &out[32..];
+    assert_eq!(&chroma[..4], &[106, 107, 108, 109]);
+    assert_eq!(&chroma[12..], &[109, 110, 111, 112]);
+    // Against the right edge.
+    let right = crop_nv12(&frame, (w, h), plan::vertical_window((w, h), 1.0).unwrap());
+    assert_eq!(&right[..4], &[12, 13, 14, 15]);
+    // A window outside the frame (a frame smaller than expected): black, never a panic.
+    let outside = Window {
+        x: 14,
+        y: 0,
+        width: 4,
+        height: 8,
+    };
+    let black = crop_nv12(&frame, (w, h), outside);
+    assert!(black[..32].iter().all(|&y| y == 16) && black[32..].iter().all(|&c| c == 128));
+    assert_eq!(crop_nv12(&frame[..10], (w, h), window).len(), 48);
+}
+
+/// A clip whose left half has luma `left` and right half `right`.
+fn split_clip(path: &Path, size: (u32, u32), (left, right): (u8, u8), frames: u32) {
+    use crate::media::h264::{Frame, H264Config, H264Encoder};
+    use crate::media::mp4_writer::{self, Options as MuxOptions, VideoSample, VideoTrack};
+    let config = H264Config::new(size.0, size.1, 30, 4_000_000);
+    let mut encoder = H264Encoder::software(config).expect("encoder");
+    let (w, h) = (size.0 as usize, size.1 as usize);
+    let mut pixels: Vec<u8> = (0..w * h)
+        .map(|i| if i % w < w / 2 { left } else { right })
+        .collect();
+    pixels.extend(std::iter::repeat_n(128u8, w * h / 2));
+    let mut packets = Vec::new();
+    for k in 0..frames {
+        let pts = i64::from(k) * TICKS_PER_SECOND / 30;
+        assert!(
+            encoder
+                .encode(Frame::Nv12(&pixels), pts, &mut packets)
+                .expect("encode")
+        );
+    }
+    encoder.drain(&mut packets).expect("drain");
+    let video_config = encoder.codec_config().expect("parameter sets");
+    let video = VideoTrack {
+        config: &video_config,
+        colour: Some(Colour::BT709),
+        samples: packets
+            .iter()
+            .map(|p| VideoSample {
+                data: &p.data,
+                pts: p.pts,
+                dts: p.dts,
+                keyframe: p.keyframe,
+            })
+            .collect(),
+        last_duration: TICKS_PER_SECOND / 30,
+    };
+    mp4_writer::write_file(path, &video, &[], &MuxOptions::default(), true).expect("mux");
+}
+
+/// Vertical exports: a 1080×1920 file showing the window where it was put (dark on the left,
+/// bright on the right), to a file and for Discord, on the GPU and through the software paths,
+/// with the badge below the top band.
+#[test]
+#[ignore = "needs Media Foundation and the GPU; run with --ignored"]
+fn editor_exports_vertical_clips() {
+    let _com = ComGuard::new();
+    let _mf = MfGuard::new().expect("media foundation");
+    let dir = std::env::temp_dir().join("kryo-editor-vertical");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("dir");
+    let source = dir.join("Wide.mp4");
+    let (dark, bright) = (40u8, 210u8);
+    split_clip(&source, (1920, 1080), (dark, bright), 60);
+    let cancel = AtomicBool::new(false);
+    let report = |_| {};
+    let progress = Progress::new(&cancel, &report);
+    let export = |destination: Destination, position: f64, watermark: bool, options: Options| {
+        let request = Request {
+            start: 0.0,
+            end: 1.5,
+            gains: Gains {
+                game: 1.0,
+                mic: 1.0,
+            },
+            destination,
+            watermark,
+            stretch: true,
+            vertical: Some(position),
+            options,
+        };
+        export::export(&source, &request, &progress).expect("export")
+    };
+    let software = Options {
+        software_encoder: true,
+        software_decoding: true,
+        ..Options::default()
+    };
+    for (name, position, expected, options) in [
+        ("left", 0.0, dark, Options::default()),
+        ("right", 1.0, bright, Options::default()),
+        ("left, software", 0.0, dark, software),
+    ] {
+        for (target, destination) in [
+            (
+                "file",
+                Destination::File {
+                    path: dir.join(format!("{name} file.mp4")),
+                },
+            ),
+            (
+                "discord",
+                Destination::Discord {
+                    dir: dir.join("discord"),
+                    max_bytes: 20_000_000,
+                },
+            ),
+        ] {
+            let e = export(destination, position, false, options);
+            let (width, luma) = luma_frame(&e.path, 5);
+            let height = luma.len() / width;
+            let centre = luma[height / 2 * width + width / 2];
+            println!(
+                "{name} {target}: {width}x{height}, centre {centre} ({})",
+                e.detail
+            );
+            assert!(
+                e.reencoded && e.detail.contains("cropped"),
+                "{name} {target}"
+            );
+            assert_eq!((width, height), (1080, 1920), "{name} {target}");
+            assert!(centre.abs_diff(expected) < 10, "{name} {target}: {centre}");
+        }
+    }
+    // Centred, the window straddles both halves; with the badge, it sits below the top band.
+    let e = export(
+        Destination::File {
+            path: dir.join("Centred badge.mp4"),
+        },
+        0.5,
+        true,
+        Options::default(),
+    );
+    let (width, luma) = luma_frame(&e.path, 5);
+    let row = 1920 / 2 * width;
+    assert!(luma[row + 100].abs_diff(dark) < 10 && luma[row + 980].abs_diff(bright) < 10);
+    let badge = super::watermark::layout((1080, 1920), 2.5).expect("badge");
+    assert_eq!(badge.y, 172);
+    // The band above the badge is the picture, the badge's rows are not.
+    let above = luma[100 * width + badge.x as usize + badge.width as usize / 2];
+    let inside = luma[(badge.y + badge.height / 2) as usize * width
+        + badge.x as usize
+        + badge.width as usize / 2];
+    assert!(above.abs_diff(bright) < 10, "above the badge: {above}");
+    assert!(inside.abs_diff(bright) > 20, "the badge: {inside}");
     let _ = std::fs::remove_dir_all(&dir);
 }
