@@ -376,6 +376,9 @@ export const ja: Translation = {
   'presence.connected': 'Discord に接続済み',
   'presence.connectedAs': '{name} として接続中',
   'presence.disconnected': 'Discord が起動していません',
+  'community.title': 'Krak コミュニティ',
+  'community.hint': 'クリップを共有したり、質問したり、今週のベストクリップに投票したりできます。',
+  'community.join': 'Krak の Discord に参加',
 
   'overlay.lastSeconds': '直前の{seconds}秒',
   'export.watermark': '「by krak」を追加',

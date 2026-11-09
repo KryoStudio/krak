@@ -376,6 +376,9 @@ export const ko: Translation = {
   'presence.connected': 'Discord에 연결됨',
   'presence.connectedAs': '{name}(으)로 연결됨',
   'presence.disconnected': 'Discord가 열려 있지 않아요',
+  'community.title': 'Krak 커뮤니티',
+  'community.hint': '클립을 공유하고, 도움을 받고, 이번 주의 클립에 투표하세요.',
+  'community.join': 'Krak Discord 참여하기',
 
   'overlay.lastSeconds': '마지막 {seconds}초',
   'export.watermark': '“by krak” 추가',

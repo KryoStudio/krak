@@ -14,6 +14,7 @@
   import HotkeyInput from '$lib/components/HotkeyInput.svelte';
   import QualityPicker from '$lib/components/QualityPicker.svelte';
   import { api, native, type Microphone, type Presence, type ResolvedVideo, type Settings, type StorageInfo } from '$lib/api';
+  import { discordInvite, openLink } from '$lib/community';
   import { capture, codecName, listMicrophones, memoryFor, resolveVideo, storageInfo, videoLabel } from '$lib/capture.svelte';
   import { GB, formatSize, hasKey, t } from '$lib/i18n.svelte';
   import { languages } from '$lib/locales';
@@ -309,6 +310,12 @@
                 </div>
               </div>
             {/if}
+            {#snippet community()}
+              <button class="button" onclick={() => openLink(discordInvite('app'))}>
+                <Icon name="users" size={13} />{t('community.join')}
+              </button>
+            {/snippet}
+            {@render row(t('community.title'), t('community.hint'), community)}
           </div>
         {:else if ui.settingsSection === 'capture'}
           {#if status.audioError}

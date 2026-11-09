@@ -378,6 +378,9 @@ export const es: Translation = {
   'presence.connected': 'Conectado a Discord',
   'presence.connectedAs': 'Conectado como {name}',
   'presence.disconnected': 'Discord no está abierto',
+  'community.title': 'Comunidad Krak',
+  'community.hint': 'Comparte tus clips, pide ayuda y vota por el clip de la semana.',
+  'community.join': 'Unirse al Discord de Krak',
 
   'overlay.lastSeconds': 'Últimos {seconds} segundos',
   'export.watermark': 'Añadir “by krak”',

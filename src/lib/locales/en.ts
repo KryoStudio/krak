@@ -375,6 +375,9 @@ export const en = {
   'presence.connected': 'Connected to Discord',
   'presence.connectedAs': 'Connected as {name}',
   'presence.disconnected': 'Discord isn’t open',
+  'community.title': 'Krak community',
+  'community.hint': 'Share your clips, get help and vote for the clip of the week.',
+  'community.join': 'Join the Krak Discord',
 
   'overlay.lastSeconds': 'Last {seconds} seconds',
   'export.watermark': 'Add “by krak”',
