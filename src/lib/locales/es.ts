@@ -191,6 +191,10 @@ export const es: Translation = {
   'update.install': 'Instalar',
   'update.installing': 'Descargando… {percent} %',
   'update.failed': 'No se pudieron buscar actualizaciones.',
+  'update.offerTitle': 'Krak {version} está disponible',
+  'update.offerBody': 'Se instala en unos segundos y Krak se reinicia. Tus shards se quedan donde están.',
+  'update.now': 'Actualizar ahora',
+  'update.later': 'Más tarde',
 
   'nav.home': 'Inicio',
 

@@ -13,6 +13,8 @@
   import ConfirmDialog from '$lib/components/ConfirmDialog.svelte';
   import Toasts from '$lib/components/Toasts.svelte';
   import Onboarding from '$lib/components/Onboarding.svelte';
+  import UpdatePrompt from '$lib/components/UpdatePrompt.svelte';
+  import { appWindow } from '$lib/app-window.svelte';
   import { native, on } from '$lib/api';
   import { capture, formatClock, saveReplay } from '$lib/capture.svelte';
   import { hasKey, t } from '$lib/i18n.svelte';
@@ -41,8 +43,10 @@
 
     capture.refresh().catch(console.error);
     capture.loadEncoder();
-    // Look for an update once things have settled.
-    const updateCheck = setTimeout(() => updates.check(true), 8000);
+    // Look for an update right after the start (Windows startup too, in the tray), then now and
+    // then for a Krak that stays open for days.
+    const updateCheck = setTimeout(() => updates.check(true), 3000);
+    const updateRecheck = setInterval(() => updates.check(true), 6 * 60 * 60 * 1000);
     // Buffer fill and memory move every second; only ask while someone is looking.
     const poll = setInterval(() => {
       if (document.visibilityState === 'visible' && capture.status.state !== 'paused') capture.refresh().catch(() => {});
@@ -89,10 +93,16 @@
         });
       }),
       on('navigate', (route) => goto(route)),
+      on('update-install', () => {
+        if (!updates.available) return;
+        updates.offered = true;
+        updates.install();
+      }),
     ];
     return () => {
       clearInterval(poll);
       clearTimeout(updateCheck);
+      clearInterval(updateRecheck);
       listeners.forEach((l) => l.then((unlisten) => unlisten()));
     };
   });
@@ -142,6 +152,8 @@
 
 {#if !settings.value.onboarded}
   <Onboarding />
+{:else if updates.offered && appWindow.shown}
+  <UpdatePrompt />
 {/if}
 <ContextMenu />
 <ConfirmDialog />

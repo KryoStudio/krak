@@ -190,6 +190,10 @@ export const ko: Translation = {
   'update.install': '설치',
   'update.installing': '다운로드 중… {percent}%',
   'update.failed': '업데이트를 확인하지 못했어요.',
+  'update.offerTitle': 'Krak {version}이(가) 나왔어요',
+  'update.offerBody': '몇 초면 설치되고 Krak이 다시 시작돼요. shard는 그대로 남아 있어요.',
+  'update.now': '지금 업데이트',
+  'update.later': '나중에',
 
   'nav.home': '홈',
 

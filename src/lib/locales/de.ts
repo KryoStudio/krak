@@ -191,6 +191,10 @@ export const de: Translation = {
   'update.install': 'Installieren',
   'update.installing': 'Wird heruntergeladen… {percent} %',
   'update.failed': 'Updates konnten nicht geprüft werden.',
+  'update.offerTitle': 'Krak {version} ist verfügbar',
+  'update.offerBody': 'Die Installation dauert nur ein paar Sekunden, dann startet Krak neu. Deine Shards bleiben, wo sie sind.',
+  'update.now': 'Jetzt aktualisieren',
+  'update.later': 'Später',
 
   'nav.home': 'Start',
 

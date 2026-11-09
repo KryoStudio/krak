@@ -190,6 +190,10 @@ export const zh: Translation = {
   'update.install': '安装',
   'update.installing': '正在下载… {percent}%',
   'update.failed': '无法检查更新。',
+  'update.offerTitle': 'Krak {version} 已发布',
+  'update.offerBody': '安装只需几秒，之后 Krak 会自动重启。你的 shard 都会保留。',
+  'update.now': '立即更新',
+  'update.later': '稍后',
 
   'nav.home': '主页',
 

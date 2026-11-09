@@ -251,6 +251,8 @@ export const api = {
   chooseExportPath: (suggestedName: string) => invoke<string | null>('choose_export_path', { suggestedName }),
   /** Shows a file made by an export (this session) in Explorer. */
   revealExport: (path: string) => invoke<void>('reveal_export', { path }),
+  /** The tray icon's badge, menu entry and tooltip for an update that waits (null: none). */
+  setUpdateBadge: (version: string | null) => invoke<void>('set_update_badge', { version }),
 };
 
 type Events = {
@@ -264,6 +266,8 @@ type Events = {
   'capture-failed': string;
   'export-progress': { id: string; progress: number };
   navigate: string;
+  /** "Update Krak" was picked in the tray menu. */
+  'update-install': null;
 };
 
 export function on<E extends keyof Events>(event: E, handler: (payload: Events[E]) => void): Promise<UnlistenFn> {

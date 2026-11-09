@@ -190,6 +190,10 @@ export const ja: Translation = {
   'update.install': 'インストール',
   'update.installing': 'ダウンロード中… {percent}%',
   'update.failed': 'アップデートを確認できませんでした。',
+  'update.offerTitle': 'Krak {version} が利用可能です',
+  'update.offerBody': '数秒でインストールされ、Krak が再起動します。shard はそのまま残ります。',
+  'update.now': '今すぐ更新',
+  'update.later': 'あとで',
 
   'nav.home': 'ホーム',
 

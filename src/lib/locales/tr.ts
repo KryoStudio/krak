@@ -191,6 +191,10 @@ export const tr: Translation = {
   'update.install': 'Yükle',
   'update.installing': 'İndiriliyor… %{percent}',
   'update.failed': 'Güncellemeler denetlenemedi.',
+  'update.offerTitle': 'Krak {version} çıktı',
+  'update.offerBody': 'Kurulum birkaç saniye sürer, ardından Krak yeniden başlar. Shard’ların olduğu yerde kalır.',
+  'update.now': 'Şimdi güncelle',
+  'update.later': 'Daha sonra',
 
   'nav.home': 'Ana sayfa',
 

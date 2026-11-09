@@ -195,6 +195,10 @@ export const ru: Translation = {
   'update.install': 'Установить',
   'update.installing': 'Загрузка… {percent}%',
   'update.failed': 'Не удалось проверить обновления.',
+  'update.offerTitle': 'Вышел Krak {version}',
+  'update.offerBody': 'Установка займёт несколько секунд, затем Krak перезапустится. Твои shard останутся на месте.',
+  'update.now': 'Обновить сейчас',
+  'update.later': 'Позже',
 
   'nav.home': 'Главная',
 

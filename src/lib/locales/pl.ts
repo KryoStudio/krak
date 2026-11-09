@@ -195,6 +195,10 @@ export const pl: Translation = {
   'update.install': 'Zainstaluj',
   'update.installing': 'Pobieranie… {percent}%',
   'update.failed': 'Nie udało się sprawdzić aktualizacji.',
+  'update.offerTitle': 'Krak {version} jest już dostępny',
+  'update.offerBody': 'Instalacja zajmie kilka sekund, potem Krak uruchomi się ponownie. Twoje shardy zostaną na miejscu.',
+  'update.now': 'Zaktualizuj teraz',
+  'update.later': 'Później',
 
   'nav.home': 'Start',
 

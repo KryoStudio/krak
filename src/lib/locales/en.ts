@@ -189,6 +189,10 @@ export const en = {
   'update.install': 'Install',
   'update.installing': 'Downloading… {percent}%',
   'update.failed': 'Couldn’t check for updates.',
+  'update.offerTitle': 'Krak {version} is available',
+  'update.offerBody': 'It installs in a few seconds, then Krak restarts. Your shards stay where they are.',
+  'update.now': 'Update now',
+  'update.later': 'Later',
 
   'nav.home': 'Home',
 
