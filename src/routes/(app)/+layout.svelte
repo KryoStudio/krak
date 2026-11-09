@@ -15,6 +15,8 @@
   import Onboarding from '$lib/components/Onboarding.svelte';
   import UpdatePrompt from '$lib/components/UpdatePrompt.svelte';
   import CommunityInvite from '$lib/components/CommunityInvite.svelte';
+  import ShareDialog from '$lib/components/ShareDialog.svelte';
+  import { share } from '$lib/share.svelte';
   import { invite } from '$lib/invite.svelte';
   import { appWindow } from '$lib/app-window.svelte';
   import { native, on } from '$lib/api';
@@ -160,6 +162,11 @@
   <UpdatePrompt />
 {:else if appWindow.shown && invite.due && !ui.playing}
   <CommunityInvite />
+{/if}
+{#if share.request}
+  {#key share.request}
+    <ShareDialog request={share.request} />
+  {/key}
 {/if}
 <ContextMenu />
 <ConfirmDialog />

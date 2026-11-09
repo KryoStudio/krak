@@ -13,7 +13,7 @@
   import Select from '$lib/components/Select.svelte';
   import HotkeyInput from '$lib/components/HotkeyInput.svelte';
   import QualityPicker from '$lib/components/QualityPicker.svelte';
-  import { api, native, type Microphone, type Presence, type ResolvedVideo, type Settings, type StorageInfo } from '$lib/api';
+  import { api, native, type CommunityUser, type Microphone, type Presence, type ResolvedVideo, type Settings, type StorageInfo } from '$lib/api';
   import { discordInvite, openLink } from '$lib/community';
   import { capture, codecName, listMicrophones, memoryFor, resolveVideo, storageInfo, videoLabel } from '$lib/capture.svelte';
   import { GB, formatSize, hasKey, t } from '$lib/i18n.svelte';
@@ -22,7 +22,7 @@
   import { settings } from '$lib/settings.svelte';
   import { showError } from '$lib/shard-actions';
   import { tooltip } from '$lib/tooltip';
-  import { ui, type SettingsSection } from '$lib/ui.svelte';
+  import { toast, ui, type SettingsSection } from '$lib/ui.svelte';
   import { updates } from '$lib/updates.svelte';
 
   const s = $derived(settings.value);
@@ -80,6 +80,30 @@
   let screenshotError = $state('');
   let presence = $state<Presence | null>(null);
   const discordUser = $derived(presence?.user ?? null);
+  /** The Discord account Krak shares to the community as (read from disk, no network). */
+  let communityAccount = $state<CommunityUser | null>(null);
+  let unlinking = $state(false);
+
+  $effect(() => {
+    if (ui.settingsSection !== 'general' || !native) return;
+    api.communityAccount().then(
+      (account) => (communityAccount = account),
+      () => (communityAccount = null),
+    );
+  });
+
+  async function unlinkCommunity() {
+    unlinking = true;
+    try {
+      await api.communityUnlink();
+      communityAccount = null;
+      toast({ kind: 'info', title: t('community.unlinked') });
+    } catch {
+      showError('community_failed');
+    } finally {
+      unlinking = false;
+    }
+  }
 
   async function setScreenshotHotkey(screenshotHotkey: string) {
     screenshotError = '';
@@ -316,6 +340,16 @@
               </button>
             {/snippet}
             {@render row(t('community.title'), t('community.hint'), community)}
+            {#if communityAccount}
+              {#snippet linked()}
+                <button class="button" onclick={unlinkCommunity} disabled={unlinking}>{t('share.unlink')}</button>
+              {/snippet}
+              {@render row(
+                t('community.linkedAs', { name: communityAccount.globalName || communityAccount.username }),
+                t('community.linkedHint'),
+                linked,
+              )}
+            {/if}
           </div>
         {:else if ui.settingsSection === 'capture'}
           {#if status.audioError}

@@ -9,6 +9,7 @@
   import { api, errorCode, native, on, type ExportRequest, type Shard } from '$lib/api';
   import { CLIPS_CHANNEL, openLink } from '$lib/community';
   import { canFrame, framing } from '$lib/framing.svelte';
+  import { share } from '$lib/share.svelte';
   import { MB, formatDuration, formatSize, hasKey, t } from '$lib/i18n.svelte';
   import { library } from '$lib/library.svelte';
   import { settings } from '$lib/settings.svelte';
@@ -35,7 +36,8 @@
     onclose: () => void;
   } = $props();
 
-  type Target = ExportRequest['target'];
+  /** Where to: an export target, or the Krak community (the share sheet takes over). */
+  type Target = Exclude<ExportRequest['target'], 'share'> | 'community';
   // Discord's upload limits: 20 MiB without Nitro, 50 MB with Nitro Basic, 500 MB with Nitro.
   // Asked for in millions of bytes (20 000 000 is 95 % of 20 MiB), and the backend aims under
   // 92 to 95 % of that: room for the container and the encoder's overshoot.
@@ -106,11 +108,18 @@
 
   const options: { id: Target; icon: IconName }[] = [
     { id: 'discord', icon: 'share' },
+    { id: 'community', icon: 'users' },
     { id: 'file', icon: 'drive' },
     { id: 'copy', icon: 'copy' },
   ];
 
   async function go() {
+    if (target === 'community') {
+      // Sized for the server and uploaded by the share sheet, with these edits.
+      share.request = { shard, start, end, gains: { ...gains }, vertical, cropX: framing.x };
+      onclose();
+      return;
+    }
     let path: string | null = null;
     if (target === 'file') {
       if (!real) {
@@ -264,8 +273,10 @@
       </div>
 
       <footer>
-        <span class="estimate">≈ {formatSize(target === 'discord' ? Math.min(estimate, limit * 0.95e6) : estimate)}</span>
-        <button class="primary" onclick={go}><Icon name={options.find((o) => o.id === target)?.icon ?? 'share'} size={15} />{t('export.go')}</button>
+        <span class="estimate">{target === 'community' ? '' : `≈ ${formatSize(target === 'discord' ? Math.min(estimate, limit * 0.95e6) : estimate)}`}</span>
+        <button class="primary" onclick={go}>
+          <Icon name={options.find((o) => o.id === target)?.icon ?? 'share'} size={15} />{t(target === 'community' ? 'export.continue' : 'export.go')}
+        </button>
       </footer>
     {:else if stage === 'working'}
       <div class="status" in:fade={{ duration: 160 * motion }}>
