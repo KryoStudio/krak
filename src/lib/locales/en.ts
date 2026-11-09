@@ -384,6 +384,10 @@ export const en = {
   'community.title': 'Krak community',
   'community.hint': 'Share your clips, get help and vote for the clip of the week.',
   'community.join': 'Join the Krak Discord',
+  'community.inviteTitle': 'Join the Krak community',
+  'community.joinShort': 'Join',
+  'community.notNow': 'Not now',
+  'community.never': 'Don’t ask again',
 
   'overlay.lastSeconds': 'Last {seconds} seconds',
   'export.watermark': 'Add “by krak”',

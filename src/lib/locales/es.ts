@@ -387,6 +387,10 @@ export const es: Translation = {
   'community.title': 'Comunidad Krak',
   'community.hint': 'Comparte tus clips, pide ayuda y vota por el clip de la semana.',
   'community.join': 'Unirse al Discord de Krak',
+  'community.inviteTitle': 'Únete a la comunidad Krak',
+  'community.joinShort': 'Unirme',
+  'community.notNow': 'Ahora no',
+  'community.never': 'No volver a preguntar',
 
   'overlay.lastSeconds': 'Últimos {seconds} segundos',
   'export.watermark': 'Añadir “by krak”',

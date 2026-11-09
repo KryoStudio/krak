@@ -14,6 +14,8 @@
   import Toasts from '$lib/components/Toasts.svelte';
   import Onboarding from '$lib/components/Onboarding.svelte';
   import UpdatePrompt from '$lib/components/UpdatePrompt.svelte';
+  import CommunityInvite from '$lib/components/CommunityInvite.svelte';
+  import { invite } from '$lib/invite.svelte';
   import { appWindow } from '$lib/app-window.svelte';
   import { native, on } from '$lib/api';
   import { capture, formatClock, saveReplay } from '$lib/capture.svelte';
@@ -39,7 +41,8 @@
   onMount(() => {
     library.load().catch(console.error);
     screens.load().catch(console.error);
-    if (!native) return;
+    const stopInvite = invite.start();
+    if (!native) return stopInvite;
 
     capture.refresh().catch(console.error);
     capture.loadEncoder();
@@ -100,6 +103,7 @@
       }),
     ];
     return () => {
+      stopInvite();
       clearInterval(poll);
       clearTimeout(updateCheck);
       clearInterval(updateRecheck);
@@ -152,8 +156,10 @@
 
 {#if !settings.value.onboarded}
   <Onboarding />
-{:else if updates.offered && appWindow.shown}
+{:else if appWindow.shown && updates.offered}
   <UpdatePrompt />
+{:else if appWindow.shown && invite.due && !ui.playing}
+  <CommunityInvite />
 {/if}
 <ContextMenu />
 <ConfirmDialog />

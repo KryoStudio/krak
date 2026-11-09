@@ -385,6 +385,10 @@ export const ko: Translation = {
   'community.title': 'Krak 커뮤니티',
   'community.hint': '클립을 공유하고, 도움을 받고, 이번 주의 클립에 투표하세요.',
   'community.join': 'Krak Discord 참여하기',
+  'community.inviteTitle': 'Krak 커뮤니티에 참여하세요',
+  'community.joinShort': '참여하기',
+  'community.notNow': '다음에',
+  'community.never': '다시 묻지 않기',
 
   'overlay.lastSeconds': '마지막 {seconds}초',
   'export.watermark': '“by krak” 추가',

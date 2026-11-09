@@ -54,6 +54,10 @@ export interface Settings {
   storageLimitGb: number | null;
   /** First-run wizard done. */
   onboarded: boolean;
+  /** The one-time invitation to the Krak Discord: not shown yet, put off, answered. */
+  communityInvite: 'pending' | 'later' | 'joined' | 'never';
+  /** When it was put off ("Not now"), in ms since 1970. */
+  communityInviteAt: number | null;
 }
 
 /** What the engine would record with given settings. */

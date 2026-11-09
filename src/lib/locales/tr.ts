@@ -389,6 +389,10 @@ export const tr: Translation = {
   'community.title': 'Krak topluluğu',
   'community.hint': 'Kliplerini paylaş, yardım al ve haftanın klibine oy ver.',
   'community.join': 'Krak Discord’una katıl',
+  'community.inviteTitle': 'Krak topluluğuna katıl',
+  'community.joinShort': 'Katıl',
+  'community.notNow': 'Şimdi değil',
+  'community.never': 'Bir daha sorma',
 
   'overlay.lastSeconds': 'Son {seconds} saniye',
   'export.watermark': '“by krak” ekle',

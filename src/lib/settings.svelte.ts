@@ -28,6 +28,8 @@ const defaults: Settings = {
   overlay: true,
   storageLimitGb: null,
   onboarded: false,
+  communityInvite: 'pending',
+  communityInviteAt: null,
 };
 
 // Browser preview only: in the app, settings live in the backend.

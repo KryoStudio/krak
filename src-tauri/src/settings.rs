@@ -80,6 +80,21 @@ pub enum ScreenFit {
     Original,
 }
 
+/// Where the one-time invitation to the Krak Discord stands (shown and answered by the page).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CommunityInvite {
+    /// Not shown yet.
+    #[default]
+    Pending,
+    /// "Not now": asked once more, a week after `community_invite_at`.
+    Later,
+    /// Opened the invite.
+    Joined,
+    /// "Don't ask again", or "Not now" the second time.
+    Never,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Settings {
@@ -132,6 +147,10 @@ pub struct Settings {
     pub storage_limit_gb: Option<f64>,
     /// The first-run wizard is done.
     pub onboarded: bool,
+    /// The invitation to the Krak Discord.
+    pub community_invite: CommunityInvite,
+    /// When it was put off ("Not now"), in milliseconds since 1970.
+    pub community_invite_at: Option<f64>,
 }
 
 /// `Partial<Settings>` sent by the frontend. Numbers are accepted as floats and clamped.
@@ -171,6 +190,10 @@ pub struct SettingsPatch {
     #[serde(default, deserialize_with = "present")]
     pub storage_limit_gb: Option<Option<f64>>,
     pub onboarded: Option<bool>,
+    pub community_invite: Option<CommunityInvite>,
+    /// Outer `None` = absent, `Some(None)` = explicit `null`.
+    #[serde(default, deserialize_with = "present")]
+    pub community_invite_at: Option<Option<f64>>,
 }
 
 /// Distinguishes an explicit `null` from a missing field.
@@ -208,6 +231,8 @@ impl Settings {
             play_edited: true,
             storage_limit_gb: None,
             onboarded: false,
+            community_invite: CommunityInvite::Pending,
+            community_invite_at: None,
         }
     }
 
@@ -299,6 +324,12 @@ impl Settings {
         }
         if let Some(play_edited) = patch.play_edited {
             next.play_edited = play_edited;
+        }
+        if let Some(invite) = patch.community_invite {
+            next.community_invite = invite;
+        }
+        if let Some(at) = patch.community_invite_at {
+            next.community_invite_at = at.filter(|t| t.is_finite() && *t >= 0.0);
         }
         next
     }
@@ -672,6 +703,32 @@ mod tests {
             ("Shift+F9", "Ctrl+F9")
         );
         assert_eq!(s.clips_dir, defaults().clips_dir);
+    }
+
+    #[test]
+    fn remembers_the_community_invite() {
+        // Files from before it: not shown yet.
+        let old = parse(r#"{"onboarded": true}"#, defaults()).expect("object");
+        assert_eq!(
+            (old.community_invite, old.community_invite_at),
+            (CommunityInvite::Pending, None)
+        );
+        let later = defaults().merge(patch(
+            r#"{"communityInvite": "later", "communityInviteAt": 1794000000000}"#,
+        ));
+        assert_eq!(later.community_invite, CommunityInvite::Later);
+        assert_eq!(later.community_invite_at, Some(1_794_000_000_000.0));
+        let json = serde_json::to_value(&later).unwrap();
+        assert_eq!(json["communityInvite"], "later");
+        assert_eq!(parse(&json.to_string(), defaults()), Some(later.clone()));
+        // A bad time is dropped, an unknown state ignored.
+        let bad = later.merge(patch(r#"{"communityInviteAt": -5}"#));
+        assert_eq!(bad.community_invite_at, None);
+        let unknown = parse(r#"{"communityInvite": "maybe"}"#, defaults()).expect("object");
+        assert_eq!(unknown.community_invite, CommunityInvite::Pending);
+        let never = later.merge(patch(r#"{"communityInvite": "never"}"#));
+        assert_eq!(never.community_invite, CommunityInvite::Never);
+        assert_eq!(never.community_invite_at, later.community_invite_at);
     }
 
     #[test]
