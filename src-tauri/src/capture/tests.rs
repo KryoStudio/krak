@@ -314,24 +314,57 @@ fn engine_end_to_end_120fps() {
     run("Premium 120", video(Quality::Premium, 120), false, false);
 }
 
-/// The run-time step down, forced at 5 s (inside the saved window), in place (H.264 Best ->
-/// Fast, HEVC Best -> Fastest) and through a new session (the fallback: the lighter encoder
-/// opens and the old one flushes on other threads). The clip across the switch must be one
-/// stream with every frame: one tick apart in place, at most a few late ticks otherwise.
+/// The run-time step down, forced at 5 s (inside the saved window). A stream without lookahead
+/// steps down in place (Fast -> Fastest): one tick apart all along. A lookahead change (H.264
+/// Best -> Fast, HEVC Best -> Fastest) takes a new session opened on another thread while the
+/// old one keeps encoding, then flushes on another thread: a few late ticks while the flush
+/// shares the encoder (`measure_lookahead_switch`, worst gap: H.264 50 ms against 67 in place,
+/// HEVC 67-133 ms against 150-167 in place). The forced new session (the fallback when the
+/// driver refuses in place) behaves the same. Every case must stay one stream with every frame
+/// decoding.
+/// How a lookahead change looks in the clip, in place or through a new session
+/// (`KRYO_IN_PLACE=1`), for H.264 and HEVC: prints the gaps, asserts nothing.
+#[test]
+#[ignore = "records the screen (silently) with NVENC; run with --ignored"]
+fn measure_lookahead_switch() {
+    use std::sync::atomic::Ordering;
+    let _com = ComGuard::new();
+    let _mf = MfGuard::new().expect("media foundation");
+    let in_place = std::env::var("KRYO_IN_PLACE").is_ok_and(|v| v == "1");
+    video::tests::FORCE_IN_PLACE.store(in_place, Ordering::Relaxed);
+    for (label, quality) in [("H.264", Quality::High), ("HEVC", Quality::Premium)] {
+        video::tests::SCALE_DOWN_AT.store(300, Ordering::Relaxed);
+        let path = run(label, video(quality, 60), false, false);
+        video::tests::SCALE_DOWN_AT.store(0, Ordering::Relaxed);
+        let clip = smoothness(&path, false, 60);
+        println!("LOOKAHEAD SWITCH {label} in place {in_place}: {clip:?}");
+    }
+    video::tests::FORCE_IN_PLACE.store(false, Ordering::Relaxed);
+}
+
 #[test]
 #[ignore = "records the screen (silently) with NVENC; run with --ignored"]
 fn engine_scales_down_without_losing_frames() {
     use std::sync::atomic::Ordering;
-    for (label, quality, new_session) in [
-        ("Scale down H.264", Quality::High, false),
-        ("Scale down HEVC", Quality::Premium, false),
-        ("Scale down H.264 new session", Quality::High, true),
+    for (label, quality, start, new_session, in_place) in [
+        ("Scale down in place", Quality::High, 3u8, false, true),
+        ("Scale down H.264", Quality::High, 0, false, false),
+        ("Scale down HEVC", Quality::Premium, 0, false, false),
+        (
+            "Scale down H.264 new session",
+            Quality::High,
+            0,
+            true,
+            false,
+        ),
     ] {
+        video::tests::START_TIER.store(start, Ordering::Relaxed);
         video::tests::SCALE_DOWN_AT.store(300, Ordering::Relaxed);
         video::tests::FORCE_NEW_SESSION.store(new_session, Ordering::Relaxed);
         let path = run(label, video(quality, 60), false, false);
         video::tests::SCALE_DOWN_AT.store(0, Ordering::Relaxed);
         video::tests::FORCE_NEW_SESSION.store(false, Ordering::Relaxed);
+        video::tests::START_TIER.store(0, Ordering::Relaxed);
         let movie = crate::editor::demux::open(&path).expect("demux");
         let v = movie.video().expect("video");
         let keyframes: Vec<f64> = (0..v.samples.len())
@@ -349,14 +382,14 @@ fn engine_scales_down_without_losing_frames() {
             "{label}: worst gap {:.1} ms, {irregular} irregular",
             worst as f64 / 1e4
         );
-        if new_session {
-            assert!(worst <= 4 * frame + 2_000 && irregular <= 3, "{label}");
-        } else {
+        if in_place {
             assert!(
                 worst <= frame + 2_000,
                 "{label}: a {:.1} ms gap",
                 worst as f64 / 1e4
             );
+        } else {
+            assert!(worst <= 9 * frame + 2_000 && irregular <= 8, "{label}");
         }
     }
 }
@@ -447,6 +480,9 @@ fn gpu_load_helper() {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(0);
+    if std::env::var("KRYO_LOAD_ENCODE").is_ok_and(|v| v == "1") {
+        super::load::encode_alongside();
+    }
     super::load::run(frame_ms, high, vram);
 }
 
@@ -502,10 +538,28 @@ fn engine_under_gpu_load() {
         .env("KRYO_GPU_LOAD", &load_ms)
         .env("KRYO_LOAD_HIGH", env("KRYO_LOAD_HIGH", "0"))
         .env("KRYO_LOAD_VRAM_MB", env("KRYO_LOAD_VRAM_MB", "0"))
+        .env("KRYO_LOAD_ENCODE", env("KRYO_LOAD_ENCODE", "0"))
+        .env("KRYO_LOAD_SATURATE", env("KRYO_LOAD_SATURATE", "0"))
+        .envs(std::env::var("KRYO_LOAD_ITERATIONS").map(|v| ("KRYO_LOAD_ITERATIONS", v)))
         .spawn()
         .expect("load process");
+    // KRYO_LOAD_STOP_AFTER: the "game" quits after that many seconds of recording (the
+    // engine must come back up).
+    let stop_after: Option<u64> = std::env::var("KRYO_LOAD_STOP_AFTER")
+        .ok()
+        .and_then(|v| v.parse().ok());
     // Calibration and a few loaded frames before recording.
     std::thread::sleep(Duration::from_secs(4));
+    let helper_pid = helper.id();
+    if let Some(after) = stop_after {
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_secs(after));
+            println!("---- the game quits ----");
+            let _ = std::process::Command::new("taskkill")
+                .args(["/F", "/PID", &helper_pid.to_string()])
+                .output();
+        });
+    }
     let quality = match env("KRYO_LOAD_QUALITY", "premium").as_str() {
         "standard" => Quality::Standard,
         "high" => Quality::High,
@@ -513,13 +567,25 @@ fn engine_under_gpu_load() {
     };
     let fps: u32 = env("KRYO_LOAD_FPS", "120").parse().expect("fps");
     let seconds: u64 = env("KRYO_LOAD_SECONDS", "20").parse().expect("seconds");
+    // KRYO_LOAD_TIER: the lightest tier to start at (0 Best .. 4 Fastest).
+    video::tests::START_TIER.store(
+        env("KRYO_LOAD_TIER", "0").parse().expect("tier"),
+        std::sync::atomic::Ordering::Relaxed,
+    );
     let result = std::panic::catch_unwind(|| record_under_load(quality, fps, seconds));
     let _ = helper.kill();
     let _ = helper.wait();
     let (status, clip) = result.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
     println!(
         "UNDER LOAD ({load_ms} ms/frame): status {:?} {:?} {} fps; clip {:.1} fps over {:.1} s ({} frames), {} irregular gaps, worst {:.1} ms",
-        status.codec, status.encoder, status.fps, clip.fps, clip.seconds, clip.frames, clip.irregular, clip.worst_ms
+        status.codec,
+        status.encoder,
+        status.fps,
+        clip.fps,
+        clip.seconds,
+        clip.frames,
+        clip.irregular,
+        clip.worst_ms
     );
 }
 
