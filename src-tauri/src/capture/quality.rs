@@ -45,11 +45,13 @@
 //! Every preset starts at Best; a tier is kept while `fps x pixels / 1080p` times a 1.25
 //! margin stays under its capacity, else the next one is tried. So on the reference GPU,
 //! H.264 keeps Best up to 1080p144 and 1440p60, premium HEVC keeps Best at 1080p60 and uses
-//! Strong at 1080p120/144. On a slower GPU the engine still steps down at run time when the
-//! encoder falls behind ([`lighter`], `capture::video`): the running session is reconfigured
-//! to the next tier that is faster with the stream's shape and lookahead, without a new
-//! keyframe. The tools do not touch the 3D engine (lookahead and AQ ran on the VideoEncode
-//! engine only).
+//! Strong at 1080p120/144. At run time the engine adapts (`capture::video`): it steps down when
+//! the encoder falls behind ([`lighter`]) or when a game keeps the GPU's 3D engine busy
+//! ([`without_3d_tools`]), and back up when that passes ([`heavier`]), reconfiguring the
+//! running session without a new keyframe. Lookahead, temporal AQ and 2-pass are not free for
+//! a game: they run CUDA work on the 3D engine (measured under a game-like load: the capture's
+//! own 3D share fell from 33 % at Strong to 19 % at Fastest, and a game with headroom at 120 fps
+//! lost 17-26 fps at Strong or Balanced, none at Fast or Fastest; see `capture::contention`).
 //!
 //! Bitrates are given at 1080p60 and scale with the pixel rate: linearly with the pixels, and
 //! with the frame rate to the power 0.75 (consecutive frames resemble each other more at high
@@ -191,6 +193,16 @@ impl Tier {
             Self::Balanced => Some(Self::Fast),
             Self::Fast => Some(Self::Fastest),
             Self::Fastest => None,
+        }
+    }
+
+    pub fn heavier(self) -> Option<Self> {
+        match self {
+            Self::Best => None,
+            Self::Strong => Some(Self::Best),
+            Self::Balanced => Some(Self::Strong),
+            Self::Fast => Some(Self::Balanced),
+            Self::Fastest => Some(Self::Fast),
         }
     }
 
@@ -446,14 +458,15 @@ pub fn plan(
     }
 }
 
-/// The plan to continue a recording with when its NVENC encoder falls behind: the next tier
-/// that is faster than the current one, with the preset and multipass of that tier but the
-/// stream's B-frames, shape, lookahead and temporal AQ. That keeps the parameter sets (the
-/// replay buffer holds one stream) and lets the driver reconfigure the running session in
-/// 0.2 ms (changing the lookahead makes it encode the queued pictures first: 45-70 ms
-/// measured); keeping the lookahead cost 3-8 % of the speed gained. On the reference GPU some
-/// "lighter" presets are not faster (H.264 P6/P5 without 2-pass vs P7 with it): skipped.
-pub fn lighter(current: &Plan, caps: &Capabilities) -> Option<Plan> {
+/// Whether NVENC settings run CUDA work on the GPU's 3D engine, the one a game draws with:
+/// lookahead, temporal AQ and 2-pass (`capture::contention` has the measurements).
+pub fn uses_3d_engine(settings: &NvencSettings) -> bool {
+    settings.lookahead > 0 || settings.temporal_aq || settings.multipass != Multipass::Off
+}
+
+/// `tier`'s tools on the stream `current` records: same B-frames, shape and input format, so
+/// the parameter sets stay and the replay buffer keeps one stream.
+fn on_stream(current: &Plan, tier: Tier, caps: &Capabilities) -> Option<Plan> {
     let EncoderPlan::Nvenc(now) = current.encoder else {
         return None;
     };
@@ -461,29 +474,90 @@ pub fn lighter(current: &Plan, caps: &Capabilities) -> Option<Plan> {
     let max_bitrate = match now.rate {
         RateControl::Vbr { max, .. } | RateControl::Cq { max, .. } => max,
     };
+    let settings = NvencSettings {
+        b_frames: now.b_frames,
+        b_ref: now.b_ref,
+        shape: now.shape,
+        input_ten_bit: now.input_ten_bit,
+        ..nvenc_settings(current.resolved, max_bitrate, tier, &support)
+    };
+    Some(Plan {
+        encoder: EncoderPlan::Nvenc(settings),
+        tier,
+        ..*current
+    })
+}
+
+/// The plan to continue a recording with when its NVENC encoder falls behind: the next tier
+/// that is faster with the stream's shape, with that tier's own tools on the stream's B-frames
+/// and shape, so the driver reconfigures the running session (0.2 ms) and the replay keeps one
+/// stream. A lookahead change makes the driver encode the queued pictures first (45-70 ms
+/// measured), so a stream with a lookahead goes straight to a tier without one (one flush, not
+/// two). Earlier versions kept the stream's lookahead and temporal AQ down to P2: cheap for the
+/// encoder, but CUDA work on the 3D engine that a game in front needs (module docs of
+/// `capture::contention`).
+pub fn lighter(current: &Plan, caps: &Capabilities) -> Option<Plan> {
+    let EncoderPlan::Nvenc(now) = current.encoder else {
+        return None;
+    };
     let capacity = |tier: Tier| tier.capacity(now.codec, now.shape.min_cu);
     let mut tier = current.tier;
     while let Some(next) = tier.lighter() {
         tier = next;
+        let plan = on_stream(current, tier, caps)?;
+        let EncoderPlan::Nvenc(settings) = plan.encoder else {
+            return None;
+        };
+        if settings.lookahead != 0 && settings.lookahead != now.lookahead {
+            continue;
+        }
         if capacity(tier) <= capacity(current.tier) {
             continue;
         }
-        let settings = NvencSettings {
-            b_frames: now.b_frames,
-            b_ref: now.b_ref,
-            shape: now.shape,
-            lookahead: now.lookahead,
-            temporal_aq: now.temporal_aq,
-            input_ten_bit: now.input_ten_bit,
-            ..nvenc_settings(current.resolved, max_bitrate, tier, &support)
-        };
-        return Some(Plan {
-            encoder: EncoderPlan::Nvenc(settings),
-            tier,
-            ..*current
-        });
+        return Some(plan);
     }
     None
+}
+
+/// When a game keeps the 3D engine busy: the first tier from `current` on whose tools leave
+/// that engine alone ([`uses_3d_engine`]), `None` if `current`'s already do.
+pub fn without_3d_tools(current: &Plan, caps: &Capabilities) -> Option<Plan> {
+    let EncoderPlan::Nvenc(now) = current.encoder else {
+        return None;
+    };
+    if !uses_3d_engine(&now) {
+        return None;
+    }
+    let mut tier = current.tier;
+    while let Some(next) = tier.lighter() {
+        tier = next;
+        let plan = on_stream(current, tier, caps)?;
+        if matches!(plan.encoder, EncoderPlan::Nvenc(s) if !uses_3d_engine(&s)) {
+            return Some(plan);
+        }
+    }
+    None
+}
+
+/// Back up once the encoder keeps up again: the next stronger tier, never past `ceiling` (the
+/// tier the preset started at, or the lightest of that and the first tier without 3D-engine
+/// tools while a game needs the GPU). A step that would change the lookahead goes straight to
+/// `ceiling` (one flush).
+pub fn heavier(current: &Plan, ceiling: Tier, caps: &Capabilities) -> Option<Plan> {
+    let EncoderPlan::Nvenc(now) = current.encoder else {
+        return None;
+    };
+    if current.tier <= ceiling {
+        return None;
+    }
+    let next = current.tier.heavier()?.max(ceiling);
+    let plan = on_stream(current, next, caps)?;
+    match plan.encoder {
+        EncoderPlan::Nvenc(s) if s.lookahead != now.lookahead && next != ceiling => {
+            on_stream(current, ceiling, caps)
+        }
+        _ => Some(plan),
+    }
 }
 
 /// The NVENC tools of `tier`, limited to what the GPU supports.
@@ -846,7 +920,9 @@ mod tests {
                     (a.rate, a.gop, a.input_ten_bit),
                     (b.rate, b.gop, b.input_ten_bit)
                 );
-                assert_eq!((a.lookahead, a.temporal_aq), (b.lookahead, b.temporal_aq));
+                // A lookahead change flushes the encoder: at most once, straight to none.
+                assert!(b.lookahead == a.lookahead || b.lookahead == 0);
+                assert!(!b.temporal_aq || a.temporal_aq);
                 assert_eq!(next.resolved, first.resolved);
                 assert!(b.preset <= a.preset);
                 tiers.push(next.tier);
@@ -874,13 +950,14 @@ mod tests {
         );
         assert_eq!(
             (s.lookahead, s.temporal_aq),
-            (16, true),
-            "the stream's lookahead"
+            (0, false),
+            "P2 without the 3D-engine tools"
         );
-        // From Strong (120 fps), 16x16.
+        // From Strong (120 fps), 16x16: Balanced would change the lookahead to 8, then Fast to
+        // none (two flushes): straight to Fast.
         assert_eq!(
             ladder(Quality::Premium, 120),
-            [Tier::Strong, Tier::Balanced, Tier::Fast, Tier::Fastest]
+            [Tier::Strong, Tier::Fast, Tier::Fastest]
         );
         // Not NVENC: nothing to step down to.
         let mf = plan(
@@ -891,6 +968,63 @@ mod tests {
             Tier::Best,
         );
         assert_eq!(lighter(&mf, &amd()), None);
+    }
+
+    /// A game keeping the 3D engine busy: straight to the first tier without lookahead,
+    /// temporal AQ or 2-pass, on the same stream; nothing to do once there.
+    #[test]
+    fn leaves_the_3d_engine_to_a_game() {
+        for (quality, fps) in [
+            (Quality::High, 60),
+            (Quality::Premium, 60),
+            (Quality::Premium, 120),
+        ] {
+            let mut s = video(quality);
+            s.fps = fps;
+            let first = resolve(s, (1920, 1080), f64::from(fps));
+            assert!(uses_3d_engine(&nvenc(&first)), "{quality:?} {fps}");
+            let light = without_3d_tools(&first, &turing()).expect("a lighter tier");
+            let (a, b) = (nvenc(&first), nvenc(&light));
+            assert!(!uses_3d_engine(&b));
+            assert_eq!(light.tier, Tier::Fast, "{quality:?} {fps}");
+            assert_eq!(
+                (a.b_frames, a.b_ref, a.shape, a.rate, a.gop),
+                (b.b_frames, b.b_ref, b.shape, b.rate, b.gop)
+            );
+            assert_eq!(without_3d_tools(&light, &turing()), None);
+        }
+    }
+
+    /// Back up after a step down: one tier at a time while the lookahead stays, straight to the
+    /// ceiling when it would change, never past the ceiling, same stream all along.
+    #[test]
+    fn steps_back_up_to_the_ceiling() {
+        let mut s = video(Quality::Premium);
+        s.fps = 120;
+        let first = resolve(s, (1920, 1080), 120.0);
+        assert_eq!(first.tier, Tier::Strong);
+        let mut down = first;
+        while let Some(next) = lighter(&down, &turing()) {
+            down = next;
+        }
+        assert_eq!(down.tier, Tier::Fastest);
+        let fast = heavier(&down, first.tier, &turing()).expect("up");
+        assert_eq!(fast.tier, Tier::Fast);
+        let back = heavier(&fast, first.tier, &turing()).expect("up");
+        assert_eq!(
+            back.tier,
+            Tier::Strong,
+            "lookahead back: straight to the ceiling"
+        );
+        let (a, b) = (nvenc(&first), nvenc(&back));
+        assert_eq!(a, b, "the tools the stream started with");
+        assert_eq!(heavier(&back, first.tier, &turing()), None);
+        // While a game needs the GPU, the ceiling is the first tier without 3D-engine tools.
+        assert_eq!(heavier(&fast, Tier::Fast, &turing()), None);
+        assert_eq!(
+            heavier(&down, Tier::Fast, &turing()).map(|p| p.tier),
+            Some(Tier::Fast)
+        );
     }
 
     #[test]

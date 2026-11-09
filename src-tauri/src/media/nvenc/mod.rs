@@ -529,7 +529,9 @@ impl NvencEncoder {
             now.b_ref,
             now.gop,
         );
-        if self.finished || !same_structure {
+        // A longer lookahead holds more pictures than the input pool was made for (a session
+        // opened lighter, stepping back up): only a new session can.
+        if self.finished || !same_structure || settings.pool_size() > self.slots.len() {
             return Err(MediaError::new(NVENC_FAILED));
         }
         let mut applied = ffi::Applied::default();
