@@ -6,6 +6,10 @@
 //! so cutting before a keyframe never leaves a reference behind. A clip ends at the last
 //! packet marked `clean_end`: every picture presented before it has been output, so the end
 //! has no hole either.
+//!
+//! When capture stops for longer than the window (display off, the PC asleep) and resumes with
+//! the same stream parameters, nothing from before can be in a clip any more: the ring starts
+//! over at the first keyframe decoded after the hole, so no clip ever spans hours.
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -26,6 +30,12 @@ pub struct VideoRing {
     packets: VecDeque<Arc<VideoPacket>>,
     bytes: usize,
     params: Option<Arc<StreamParams>>,
+    /// Latest presentation time held (100 ns).
+    newest: Option<i64>,
+    /// Emptied by a hole longer than the window: the ring restarts at a keyframe decoded after
+    /// it. Within one stream, the decode times of the packets just after the hole still come
+    /// from before it (the encoder's reorder delay), a keyframe's too.
+    after_hole: bool,
 }
 
 impl VideoRing {
@@ -45,6 +55,8 @@ impl VideoRing {
     pub fn clear(&mut self) {
         self.packets.clear();
         self.bytes = 0;
+        self.newest = None;
+        self.after_hole = false;
     }
 
     pub fn bytes(&self) -> usize {
@@ -57,10 +69,22 @@ impl VideoRing {
 
     /// Appends a packet (the ring only ever starts at a keyframe), then drops the oldest GOPs
     /// that are no longer needed: a GOP can go once the next keyframe is at or before
-    /// `newest - window`, or while the ring holds more than `max_bytes`.
+    /// `newest - window`, or while the ring holds more than `max_bytes`. A packet presented
+    /// more than `window` after everything held follows a hole in the capture: what is held
+    /// goes (module docs).
     pub fn push(&mut self, packet: Arc<VideoPacket>, window: i64, max_bytes: usize) {
-        if self.packets.is_empty() && !packet.keyframe {
-            return;
+        if let Some(newest) = self.newest
+            && packet.pts - newest > window
+        {
+            self.clear();
+            self.after_hole = true;
+        }
+        if self.packets.is_empty() {
+            let straddles = self.after_hole && packet.pts - packet.dts > window;
+            if !packet.keyframe || straddles {
+                return;
+            }
+            self.after_hole = false;
         }
         if let Some(last) = self.packets.back()
             && packet.dts <= last.dts
@@ -68,6 +92,7 @@ impl VideoRing {
             return; // decode order never goes back
         }
         self.bytes += packet.data.len();
+        self.newest = Some(self.newest.map_or(packet.pts, |n| n.max(packet.pts)));
         self.packets.push_back(packet);
         self.trim(window, max_bytes);
     }
@@ -209,6 +234,54 @@ mod tests {
         assert!(tail[0].keyframe);
         assert!(VideoRing::default().since_last_keyframe().is_empty());
         assert_eq!(VideoRing::default().span(S, S, 1), 0);
+    }
+
+    fn packet_at(pts: i64, dts: i64, keyframe: bool) -> Arc<VideoPacket> {
+        Arc::new(VideoPacket {
+            data: vec![0; 100],
+            pts,
+            dts,
+            keyframe,
+            clean_end: true,
+        })
+    }
+
+    #[test]
+    fn a_hole_longer_than_the_window_starts_the_ring_over() {
+        const H: i64 = 3600 * S;
+        let window = 10 * S;
+        let push = |ring: &mut VideoRing, packet| ring.push(packet, window, usize::MAX);
+        let mut ring = filled(20, window, usize::MAX);
+        let before = 19 * S + 9 * S / 10;
+        // The same stream an hour later (display off, sleep). With B-frames the first packets
+        // after the hole still have decode times from before it, a keyframe among them too:
+        // none can start a clip.
+        push(&mut ring, packet_at(H + 20 * S, before + 1, false));
+        assert_eq!(ring.len(), 0, "everything before the hole is gone");
+        push(&mut ring, packet_at(H + 20 * S + S / 10, before + 2, true));
+        assert_eq!(ring.len(), 0, "a keyframe decoded before the hole");
+        push(
+            &mut ring,
+            packet_at(H + 20 * S + 2 * S / 10, H + 20 * S, false),
+        );
+        assert_eq!(ring.len(), 0, "not a keyframe");
+        for i in 0..20 {
+            push(&mut ring, packet(H / (S / 10) + 210 + i));
+        }
+        assert_eq!(ring.packets.front().map(|p| p.pts), Some(H + 21 * S));
+        assert_eq!(ring.len(), 20);
+        let now = H + 22 * S + 9 * S / 10;
+        let clip = ring.snapshot(now, window);
+        assert_eq!(clip.first().map(|p| p.pts), Some(H + 21 * S));
+        assert_eq!(ring.span(now, window, S / 10), 2 * S);
+
+        // A hole shorter than the window keeps what is before it (still in the window).
+        let mut ring = filled(5, window, usize::MAX);
+        for i in 0..10 {
+            push(&mut ring, packet(100 + i));
+        }
+        assert_eq!(ring.len(), 60);
+        assert_eq!(ring.packets.front().map(|p| p.pts), Some(0));
     }
 
     #[test]
