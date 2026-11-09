@@ -34,7 +34,10 @@
   } = $props();
 
   type Target = ExportRequest['target'];
-  const limits = [10, 50, 500] as const;
+  // Discord's upload limits: 20 MiB without Nitro, 50 MB with Nitro Basic, 500 MB with Nitro.
+  // Asked for in millions of bytes (20 000 000 is 95 % of 20 MiB), and the backend aims under
+  // 92 to 95 % of that: room for the container and the encoder's overshoot.
+  const limits = [20, 50, 500] as const;
   type Limit = (typeof limits)[number];
 
   let target = $state<Target>('discord');
@@ -76,9 +79,14 @@
   function readLimit(): Limit {
     try {
       const saved = Number(localStorage.getItem('krak.discord-limit') ?? localStorage.getItem('kryo-shard.discord-limit'));
-      return limits.find((l) => l === saved) ?? 10;
+      // The no-Nitro limit was 10 MB until Discord raised it to 20.
+      if (saved === 10) {
+        localStorage.setItem('krak.discord-limit', '20');
+        return 20;
+      }
+      return limits.find((l) => l === saved) ?? 20;
     } catch {
-      return 10;
+      return 20;
     }
   }
 

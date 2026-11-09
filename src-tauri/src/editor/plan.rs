@@ -501,6 +501,23 @@ mod tests {
     }
 
     #[test]
+    fn no_nitro_limit_stays_under_20_mib() {
+        // The UI asks for 20 000 000 bytes without Nitro (Discord allows 20 MiB): even a
+        // passthrough at the very top of what is kept leaves the container some room.
+        let max_bytes = 20 * 1_000_000u64;
+        let mib20 = 20.0 * 1024.0 * 1024.0;
+        assert!(max_bytes as f64 * DISCORD_PASSTHROUGH < mib20 * 0.91);
+        assert!(max_bytes as f64 * DISCORD_BUDGET < mib20 * 0.88);
+        // 30 s: 4.91 Mbit/s total, 4.78 for video: 720p60 (it was 540p30 under 10 MB).
+        let t = discord_target((1920, 1080), 60.0, 30.0, max_bytes, 1.0).unwrap();
+        assert_eq!((t.width, t.height, t.fps), (1280, 720, 60));
+        assert_eq!(t.bitrate, 4_778_666);
+        // 10 s: 1080p60.
+        let t = discord_target((1920, 1080), 60.0, 10.0, max_bytes, 1.0).unwrap();
+        assert_eq!((t.width, t.height, t.fps), (1920, 1080, 60));
+    }
+
+    #[test]
     fn too_long_below_the_minimum_bitrate() {
         let mb = 1_000_000u64;
         // 10 MB over 5 minutes: 245 kbit/s total, 117 for video.
