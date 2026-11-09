@@ -36,7 +36,8 @@ use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_MODE_ROTATION_ROTATE270, DXGI_RATIONAL, DXGI_SAMPLE_DESC,
 };
 use windows::Win32::Graphics::Dxgi::{
-    CreateDXGIFactory1, DXGI_ADAPTER_FLAG_SOFTWARE, DXGI_ERROR_NOT_FOUND, IDXGIAdapter1,
+    CreateDXGIFactory1, DXGI_ADAPTER_FLAG_SOFTWARE, DXGI_ERROR_NOT_FOUND,
+    DXGI_MEMORY_SEGMENT_GROUP_LOCAL, DXGI_QUERY_VIDEO_MEMORY_INFO, IDXGIAdapter1, IDXGIAdapter3,
     IDXGIDevice, IDXGIFactory1, IDXGIOutput1,
 };
 use windows::Win32::Media::MediaFoundation::{IMFDXGIDeviceManager, MFCreateDXGIDeviceManager};
@@ -293,6 +294,28 @@ pub fn display_rotation(rotation: DXGI_MODE_ROTATION) -> D3D11_VIDEO_PROCESSOR_R
         DXGI_MODE_ROTATION_ROTATE180 => D3D11_VIDEO_PROCESSOR_ROTATION_180,
         DXGI_MODE_ROTATION_ROTATE270 => D3D11_VIDEO_PROCESSOR_ROTATION_270,
         _ => D3D11_VIDEO_PROCESSOR_ROTATION_IDENTITY,
+    }
+}
+
+/// This process's use of the adapter's own video memory and the budget Windows gives it, in
+/// bytes. Over budget, Windows moves our textures out to system memory and every frame waits
+/// (a game filling the card does that to a background app).
+pub fn video_memory(gpu: &Gpu) -> Option<(u64, u64)> {
+    // SAFETY: plain queries on our device's adapter.
+    unsafe {
+        let adapter = gpu
+            .device
+            .cast::<IDXGIDevice>()
+            .ok()?
+            .GetAdapter()
+            .ok()?
+            .cast::<IDXGIAdapter3>()
+            .ok()?;
+        let mut info = DXGI_QUERY_VIDEO_MEMORY_INFO::default();
+        adapter
+            .QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &mut info)
+            .ok()?;
+        Some((info.CurrentUsage, info.Budget))
     }
 }
 

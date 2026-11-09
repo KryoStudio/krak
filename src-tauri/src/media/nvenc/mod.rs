@@ -311,6 +311,11 @@ pub struct EncodeStats {
     pub blocked_frames: u64,
     /// Longest wait for one frame.
     pub worst_block: Duration,
+    /// Every call, however short, by kind: handing a texture to the encoder (it waits for the
+    /// copy into it to be done on the GPU), submitting a picture, locking an output.
+    pub map_time: Duration,
+    pub submit_time: Duration,
+    pub lock_time: Duration,
 }
 
 struct Slot {
@@ -576,6 +581,8 @@ impl NvencEncoder {
                 &mut format,
             )
         };
+        let mapped_at = Instant::now();
+        self.stats.map_time += mapped_at - started;
         self.checked(status, "map")?;
         self.slots[slot].mapped = mapped;
         let bitstream = self.bitstream()?;
@@ -595,6 +602,7 @@ impl NvencEncoder {
                 flags,
             )
         };
+        self.stats.submit_time += mapped_at.elapsed();
         self.count_wait(started.elapsed());
         match status {
             ffi::SUCCESS | ffi::ERR_NEED_MORE_INPUT => {}
@@ -691,6 +699,7 @@ impl NvencEncoder {
         let started = Instant::now();
         // SAFETY: the oldest output buffer submitted to this session, locked once.
         let status = unsafe { ffi::kryo_nv_lock(self.session.0, bitstream, 0, &mut packet) };
+        self.stats.lock_time += started.elapsed();
         self.count_wait(started.elapsed());
         self.checked(status, "lock")?;
         let bytes = if packet.data.is_null() {

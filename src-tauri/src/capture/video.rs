@@ -38,7 +38,8 @@ use std::time::{Duration, Instant};
 
 use windows::Win32::Foundation::{CloseHandle, E_ACCESSDENIED, HANDLE};
 use windows::Win32::Graphics::Direct3D11::{
-    D3D11_BIND_RENDER_TARGET, D3D11_VIDEO_PROCESSOR_ROTATION, ID3D11Texture2D,
+    D3D11_ASYNC_GETDATA_DONOTFLUSH, D3D11_BIND_RENDER_TARGET, D3D11_QUERY_DESC,
+    D3D11_QUERY_EVENT, D3D11_VIDEO_PROCESSOR_ROTATION, ID3D11Query, ID3D11Texture2D,
 };
 use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_NV12, DXGI_FORMAT_P010, DXGI_MODE_ROTATION_ROTATE90,
@@ -78,6 +79,48 @@ const DUPLICATION_RETRY: i64 = TICKS_PER_SECOND / 2;
 const DUPLICATION_GIVE_UP: i64 = 3 * TICKS_PER_SECOND;
 /// Encoding fewer ticks never goes below this rate.
 const MIN_PACED_FPS: i64 = 30;
+/// How often the pipeline writes its health to the log.
+const HEALTH_LOG: i64 = 10 * TICKS_PER_SECOND;
+
+/// Time spent in one part of the tick.
+#[derive(Debug, Default, Clone, Copy)]
+struct Stage {
+    total: i64,
+    worst: i64,
+}
+
+impl Stage {
+    fn add(&mut self, ticks: i64) {
+        self.total += ticks;
+        self.worst = self.worst.max(ticks);
+    }
+
+    /// "average/worst" per tick, in ms.
+    fn show(self, ticks: u64) -> String {
+        format!(
+            "{:.2}/{:.1}",
+            self.total as f64 / 1e4 / ticks.max(1) as f64,
+            self.worst as f64 / 1e4
+        )
+    }
+}
+
+/// What the last [`HEALTH_LOG`] looked like, so a clip that stutters in a game can be explained
+/// from krak.log: rates, late ticks, whether the GPU ran our work on time, and where each tick
+/// spent its time.
+#[derive(Debug, Default)]
+struct Timings {
+    since: i64,
+    ticks: u64,
+    late: u64,
+    /// Ticks that started with the previous tick's copies and conversion not done on the GPU.
+    gpu_behind: u64,
+    gpu_worst_backlog: usize,
+    desktop: Stage,
+    convert: Stage,
+    encode: Stage,
+    encoder: EncodeStats,
+}
 
 /// Frame-rate health of a pipeline, logged when it ends.
 #[derive(Debug, Default, Clone, Copy)]
@@ -290,6 +333,8 @@ struct Pipeline {
     rotation: D3D11_VIDEO_PROCESSOR_ROTATION,
     ten_bit_input: bool,
     health: Health,
+    timings: Timings,
+    fence: Option<GpuFence>,
     caps: Capabilities,
     gpu: Gpu,
     display: Display,
@@ -352,6 +397,7 @@ impl Pipeline {
                 ),
                 _ => None,
             };
+        let fence = GpuFence::new(&gpu);
         Ok(Self {
             display,
             gpu,
@@ -378,6 +424,8 @@ impl Pipeline {
             ),
             params_sent: false,
             health: Health::default(),
+            timings: Timings::default(),
+            fence,
             caps,
         })
     }
@@ -427,9 +475,16 @@ impl Pipeline {
             let pts = due(tick);
             tick += pace;
 
+            if let Some(fence) = &mut self.fence {
+                let backlog = fence.backlog(&self.gpu);
+                self.timings.gpu_behind += u64::from(backlog >= 2);
+                self.timings.gpu_worst_backlog = self.timings.gpu_worst_backlog.max(backlog);
+            }
             if let Some(exit) = self.poll_desktop(shared, now) {
                 return Ok(exit);
             }
+            let polled = clock::now();
+            self.timings.desktop.add(polled - now);
             if stats.ticks == 1 {
                 // Our desktop copy holds an image now: screenshots can read it.
                 shared.set_screen(Some(Source::new(
@@ -443,7 +498,13 @@ impl Pipeline {
                 VideoEncoder::Nvenc(encoder) => {
                     self.converter
                         .convert(&self.gpu, &self.desktop, &self.target)?;
+                    let converted = clock::now();
+                    self.timings.convert.add(converted - polled);
                     encoder.encode(&self.target, pts, &mut packets)?;
+                    self.timings.encode.add(clock::now() - converted);
+                    if let Some(fence) = &mut self.fence {
+                        fence.signal(&self.gpu);
+                    }
                     let slow = self.health.tick(now, late, encoder.stats());
                     #[cfg(test)]
                     let slow = slow || tests::force_scale_down(stats.ticks);
@@ -480,7 +541,44 @@ impl Pipeline {
             self.publish(shared, &mut packets);
             self.advance_step_down(shared);
             stats.worst = stats.worst.max(clock::now() - now);
+            self.timings.ticks += 1;
+            self.timings.late += late;
+            if self.timings.since == 0 {
+                self.timings.since = now;
+                self.timings.encoder = self.encoder.stats();
+            } else if now - self.timings.since >= HEALTH_LOG {
+                self.log_health(now);
+            }
         }
+    }
+
+    /// Writes the last [`HEALTH_LOG`]'s health (see [`Timings`]) and starts a new one.
+    fn log_health(&mut self, now: i64) {
+        let t = std::mem::take(&mut self.timings);
+        let stats = self.encoder.stats();
+        let seconds = (now - t.since) as f64 / TICKS_PER_SECOND as f64;
+        let ms = |d: Duration, from: Duration| d.saturating_sub(from).as_secs_f64() * 1000.0;
+        let memory = d3d::video_memory(&self.gpu)
+            .map(|(usage, budget)| format!("; video memory {} of {} MB", usage >> 20, budget >> 20))
+            .unwrap_or_default();
+        eprintln!(
+            "krak: health over {seconds:.0} s: {:.1} fps encoded ({} configured, tier {:?}, one tick in {}), {} late ticks, GPU behind on {} ticks (worst backlog {}); ms per tick avg/worst: desktop {}, convert {}, encode {} (map {:.0} ms, submit {:.0} ms, lock {:.0} ms in total){memory}",
+            stats.frames_in.saturating_sub(t.encoder.frames_in) as f64 / seconds.max(0.001),
+            self.plan.resolved.fps,
+            self.plan.tier,
+            self.pace,
+            t.late,
+            t.gpu_behind,
+            t.gpu_worst_backlog,
+            t.desktop.show(t.ticks),
+            t.convert.show(t.ticks),
+            t.encode.show(t.ticks),
+            ms(stats.map_time, t.encoder.map_time),
+            ms(stats.submit_time, t.encoder.submit_time),
+            ms(stats.lock_time, t.encoder.lock_time),
+        );
+        self.timings.since = now;
+        self.timings.encoder = stats;
     }
 
     /// Steps down to the next lighter tier (`quality::lighter`): in place when the driver
@@ -987,6 +1085,73 @@ fn log_pipeline(
         f64::from(video.bitrate) / 1e6,
         plan.tier
     );
+}
+
+/// Event queries put after each tick's GPU work (copies, conversion): whether the GPU runs it on
+/// time or lets it queue behind a game's work, which no encoder setting can fix.
+struct GpuFence {
+    queries: Vec<ID3D11Query>,
+    /// Queries issued and not seen done yet, oldest first.
+    pending: std::collections::VecDeque<usize>,
+    next: usize,
+}
+
+impl GpuFence {
+    const DEPTH: usize = 8;
+
+    fn new(gpu: &Gpu) -> Option<Self> {
+        let desc = D3D11_QUERY_DESC {
+            Query: D3D11_QUERY_EVENT,
+            MiscFlags: 0,
+        };
+        let mut queries = Vec::with_capacity(Self::DEPTH);
+        for _ in 0..Self::DEPTH {
+            let mut query = None;
+            // SAFETY: plain query creation on our device.
+            unsafe { gpu.device.CreateQuery(&desc, Some(&mut query)) }.ok()?;
+            queries.push(query?);
+        }
+        Some(Self {
+            queries,
+            pending: std::collections::VecDeque::with_capacity(Self::DEPTH),
+            next: 0,
+        })
+    }
+
+    /// Marks the end of this tick's GPU work.
+    fn signal(&mut self, gpu: &Gpu) {
+        if self.pending.len() == self.queries.len() {
+            // Eight ticks behind: reuse the oldest (it simply restarts).
+            self.pending.pop_front();
+        }
+        let index = self.next;
+        self.next = (self.next + 1) % self.queries.len();
+        // SAFETY: an event query of this device, on its (multithread-protected) context.
+        unsafe { gpu.context.End(&self.queries[index]) };
+        self.pending.push_back(index);
+    }
+
+    /// How many ticks of our GPU work are not done yet (0 or 1: on time). Never waits.
+    fn backlog(&mut self, gpu: &Gpu) -> usize {
+        while let Some(&index) = self.pending.front() {
+            let mut done = 0u32;
+            // SAFETY: the out value is the BOOL an event query returns; no flush, no wait.
+            let status = unsafe {
+                gpu.context.GetData(
+                    &self.queries[index],
+                    Some(std::ptr::from_mut(&mut done).cast()),
+                    4,
+                    D3D11_ASYNC_GETDATA_DONOTFLUSH.0 as u32,
+                )
+            };
+            if status.is_ok() && done != 0 {
+                self.pending.pop_front();
+            } else {
+                break;
+            }
+        }
+        self.pending.len()
+    }
 }
 
 /// High-resolution waitable timer (Windows 10 1803+; plain timer before that).
