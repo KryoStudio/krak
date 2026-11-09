@@ -6,8 +6,10 @@
 //!   adapter's Media Foundation H.264 encoder, else the software one, into a ring of whole GOPs;
 //! - audio: WASAPI loopback of the default output (and the chosen or default microphone when
 //!   enabled) into continuous PCM timelines on the same clock;
-//! - one short-lived thread per save, which mixes and encodes the audio and writes the MP4, at
-//!   background priority (CPU, disk and memory) so a game never waits for it;
+//! - one short-lived thread per save, which waits for the end of the clip to come out of the
+//!   encoder and the audio threads (a few hundred ms, `save`), then mixes and encodes the audio
+//!   and writes the MP4 at background priority (CPU, disk and memory) so a game never waits
+//!   for it;
 //! - during a continuous recording, one more thread that gets every video packet the ring gets
 //!   and encodes the audio as it comes into a growing MP4 (`record`).
 //!
