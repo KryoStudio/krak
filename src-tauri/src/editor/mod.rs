@@ -125,6 +125,8 @@ pub enum Target {
     Copy,
     Discord,
     File,
+    /// Like Discord (under `maxBytes`), for the Krak community's bot: not put on the clipboard.
+    Share,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -136,7 +138,7 @@ pub struct ExportRequest {
     pub end: f64,
     pub gains: Gains,
     pub target: Target,
-    /// Discord only: the upload limit in bytes.
+    /// Discord and share only: the upload limit in bytes.
     pub max_bytes: Option<f64>,
     /// File only: where to write (from `choose_export_path`, which asked before overwriting).
     pub path: Option<String>,
@@ -390,6 +392,12 @@ mod contract_tests {
         }))
         .unwrap();
         assert_eq!((copy.target, copy.max_bytes), (Target::Copy, None));
+        let share: ExportRequest = serde_json::from_value(serde_json::json!({
+            "id": "a.mp4", "start": 0, "end": 1, "gains": { "game": 1, "mic": 1 },
+            "target": "share", "maxBytes": 20_971_520
+        }))
+        .unwrap();
+        assert_eq!(share.target, Target::Share);
         assert!(!copy.watermark && copy.path.is_none(), "optional fields");
         assert_eq!(copy.vertical_position(), None, "not vertical by default");
         let vertical: ExportRequest = serde_json::from_value(serde_json::json!({

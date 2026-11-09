@@ -284,9 +284,9 @@ pub async fn probe_shard(app: AppHandle, id: String) -> CmdResult<ShardInfo> {
 }
 
 /// Exports a trimmed, re-mixed clip: a copy next to the original (`copy`), a file where the
-/// user chose (`file`, from `choose_export_path`), or a file under `maxBytes` put on the
-/// clipboard (`discord`); with `watermark`, the "by krak" badge burnt in. Progress comes as
-/// `export-progress` events.
+/// user chose (`file`, from `choose_export_path`), a file under `maxBytes` put on the
+/// clipboard (`discord`), or one for the Krak community to upload (`share`); with `watermark`,
+/// the "by krak" badge burnt in. Progress comes as `export-progress` events.
 #[tauri::command]
 pub async fn export_shard(app: AppHandle, request: ExportRequest) -> CmdResult<ExportResult> {
     // Held until the result is ready (clipboard included).
@@ -303,7 +303,7 @@ pub async fn export_shard(app: AppHandle, request: ExportRequest) -> CmdResult<E
         Target::File => Destination::File {
             path: naming::export_file(request.path.as_deref().ok_or(INVALID_REQUEST)?)?,
         },
-        Target::Discord => {
+        Target::Discord | Target::Share => {
             let max_bytes = request
                 .max_bytes
                 .filter(|m| m.is_finite() && *m >= 1.0)
@@ -396,6 +396,8 @@ pub async fn export_shard(app: AppHandle, request: ExportRequest) -> CmdResult<E
                 .map_err(String::from)?;
             None
         }
+        // `community_upload` takes it from there.
+        Target::Share => None,
     };
     lock(&state.exports).files.insert(exported.path.clone());
     drop(slot);
