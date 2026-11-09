@@ -619,26 +619,36 @@ pub async fn community_upload(
         .filter(|g| !g.is_empty());
     let (token_file, stored) = linked(&app)?;
 
-    let read = file.clone();
-    let bytes = tauri::async_runtime::spawn_blocking(move || fs::read(read))
-        .await
-        .map_err(|_| CommunityError::new(FAILED))?
-        .map_err(|_| CommunityError::new(BAD_FILE))?;
-    let total = bytes.len() as u64;
+    // Read as it is sent, a chunk at a time: a big file is never held in memory whole.
+    let reader = fs::File::open(&file).map_err(|_| CommunityError::new(BAD_FILE))?;
+    let total = reader
+        .metadata()
+        .map_err(|_| CommunityError::new(BAD_FILE))?
+        .len();
     let cancel = app.state::<Community>().cancel.clone();
     cancel.store(false, Ordering::SeqCst);
     let emitter = app.clone();
-    let mut sent = 0u64;
-    let chunks: Vec<Vec<u8>> = bytes.chunks(UPLOAD_CHUNK).map(<[u8]>::to_vec).collect();
-    drop(bytes);
-    let stream = futures_util::stream::iter(chunks.into_iter().map(move |chunk| {
-        if cancel.load(Ordering::SeqCst) {
-            return Err(io::Error::other(CANCELLED));
+    let chunks = std::iter::from_fn({
+        let mut reader = reader;
+        let mut sent = 0u64;
+        move || {
+            if cancel.load(Ordering::SeqCst) {
+                return Some(Err(io::Error::other(CANCELLED)));
+            }
+            let mut chunk = vec![0u8; UPLOAD_CHUNK];
+            match io::Read::read(&mut reader, &mut chunk) {
+                Ok(0) => None,
+                Ok(n) => {
+                    chunk.truncate(n);
+                    sent += n as u64;
+                    let _ = emitter.emit(UPLOAD_PROGRESS, UploadProgress { sent, total });
+                    Some(Ok(chunk))
+                }
+                Err(err) => Some(Err(err)),
+            }
         }
-        sent += chunk.len() as u64;
-        let _ = emitter.emit(UPLOAD_PROGRESS, UploadProgress { sent, total });
-        Ok::<_, io::Error>(chunk)
-    }));
+    });
+    let stream = futures_util::stream::iter(chunks);
     let name = file
         .file_name()
         .and_then(|n| n.to_str())
