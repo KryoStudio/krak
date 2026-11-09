@@ -7,11 +7,12 @@
 //! free name; a file goes exactly where the user chose (through `<path>.part`, renamed once the
 //! source is closed, so even the clip itself can be replaced).
 //!
-//! Discord: always H.264 (every Discord client plays it), one mixed AAC track at 128 kbit/s.
-//! An H.264 passthrough is kept if it fits under 95 % of the limit; otherwise (and for HEVC/AV1
-//! sources) the video is re-encoded for the budget (see [`plan::discord_target`]), and once more
-//! at 85 % (or less, by the measured overshoot: [`plan::retry_factor`]) if that still does not
-//! fit.
+//! Discord: always H.264 (every Discord client plays it), one mixed AAC track at 128 kbit/s
+//! (96 when the budget is tight: [`plan::discord_audio_bitrate`]). An H.264 passthrough is kept
+//! if it fits under 95 % of the limit; otherwise (and for HEVC/AV1 sources) the video is
+//! re-encoded for the budget (see [`plan::discord_target`]), never much above what the source
+//! itself carries, and once more at 85 % (or less, by the measured overshoot:
+//! [`plan::retry_factor`]) if that still does not fit.
 //!
 //! The "by krak" badge ([`super::watermark`]) needs new pictures: with it, every target
 //! re-encodes (copies and files at the source's size and bitrate). So does stretching a clip
@@ -287,6 +288,16 @@ impl Source {
         })
     }
 
+    /// What the source's average video bitrate is worth in H.264, when known: HEVC and AV1
+    /// need about [`H264_PER_HEVC`] times more for the same picture.
+    fn h264_bitrate(&self) -> Option<f64> {
+        let efficient = self
+            .passthrough()
+            .is_some_and(|(_, config, _)| config.codec() != VideoCodec::H264);
+        self.bitrate
+            .map(|b| if efficient { b * H264_PER_HEVC } else { b })
+    }
+
     /// The video track when its samples can be copied as they are (H.264, HEVC or AV1 with
     /// the parameter sets our muxer writes), with them.
     fn passthrough(&self) -> Option<(&Track, CodecConfig, &MappedFile)> {
@@ -554,7 +565,7 @@ fn copy(
             video.cut.origin,
             video.cut.video_end,
             gains,
-            false,
+            None,
             progress.span(0.0, 0.6),
         )?;
         let (path, size) = write_output(
@@ -577,12 +588,7 @@ fn copy(
         });
     }
     // HEVC/AV1 that only the badge forces to re-encode: H.264 needs more for the same picture.
-    let efficient = source
-        .passthrough()
-        .is_some_and(|(_, config, _)| config.codec() != VideoCodec::H264);
-    let bitrate = source
-        .bitrate
-        .map(|b| if efficient { b * H264_PER_HEVC } else { b });
+    let bitrate = source.h264_bitrate();
     let target = plan::copy_target(source.size, source.fps, bitrate);
     let encoded = reencode(source, start, end, target, job, progress.span(0.0, 0.75))?;
     let tracks = audio(
@@ -591,7 +597,7 @@ fn copy(
         start - encoded.lead_in(),
         end,
         gains,
-        false,
+        None,
         progress.span(0.75, 0.9),
     )?;
     let track = encoded_track(&encoded);
@@ -633,6 +639,8 @@ fn discord(
     );
     let fits = |size: u64| size as f64 <= max_bytes as f64 * plan::DISCORD_PASSTHROUGH;
     let plan = plan::audio_plan(&source_tracks(source), true);
+    let seconds = (end - start) as f64 / TICKS_PER_SECOND as f64;
+    let audio_rate = plan::discord_audio_bitrate(max_bytes, seconds);
 
     // Discord always gets H.264: other codecs are re-encoded (and everything with the badge or
     // stretched).
@@ -642,8 +650,8 @@ fn discord(
     if let Some((video, config, file)) = h264 {
         let video = passthrough_video(video, config, file, start, end)?;
         let video_bytes: u64 = video.samples.iter().map(|s| s.data.len() as u64).sum();
-        let seconds = (video.cut.video_end - video.cut.origin) as f64 / TICKS_PER_SECOND as f64;
-        let audio_bytes = f64::from(plan::DISCORD_AUDIO_BITRATE) / 8.0 * seconds;
+        let kept = (video.cut.video_end - video.cut.origin) as f64 / TICKS_PER_SECOND as f64;
+        let audio_bytes = f64::from(audio_rate) / 8.0 * kept;
         // Clearly too big: skip straight to the re-encode.
         if fits(((video_bytes as f64 + audio_bytes) * 0.98) as u64) {
             let tracks = audio(
@@ -652,7 +660,7 @@ fn discord(
                 video.cut.origin,
                 video.cut.video_end,
                 gains,
-                true,
+                Some(audio_rate),
                 progress.span(0.0, 0.5),
             )?;
             let track = video.track();
@@ -677,12 +685,15 @@ fn discord(
         }
     }
 
-    let seconds = (end - start) as f64 / TICKS_PER_SECOND as f64;
+    // Never much more than the source carries: a big limit makes a file as good as the source,
+    // not one many times its size (and as long to upload).
+    let ceiling = source.h264_bitrate().map(|b| b * plan::REENCODE_HEADROOM);
     // Decoded once the video says where its media time starts (its reorder lead-in).
     let mut tracks: Option<(i64, Vec<EncodedAudio>)> = None;
     let mut factor = 1.0;
     for attempt in 0..2 {
-        let target = plan::discord_target(source.size, source.fps, seconds, max_bytes, factor)?;
+        let target =
+            plan::discord_target(source.size, source.fps, seconds, max_bytes, factor, ceiling)?;
         progress.rewind(0.0);
         let encoded = reencode(source, start, end, target, job, progress.span(0.0, 0.85))?;
         let lead_in = encoded.lead_in();
@@ -693,7 +704,7 @@ fn discord(
                 start - lead_in,
                 end,
                 gains,
-                true,
+                Some(audio_rate),
                 progress.span(0.85, 0.95),
             )?;
             tracks = Some((lead_in, decoded));
@@ -807,14 +818,15 @@ struct EncodedAudio {
     stream: AacStream,
 }
 
-/// Decodes what `plan` needs over `from..to`, mixes the output tracks and encodes them.
+/// Decodes what `plan` needs over `from..to`, mixes the output tracks and encodes them (for
+/// Discord, `discord` is the bitrate of its one stereo track).
 fn audio(
     source: &Source,
     plan: &[OutputTrack],
     from: i64,
     to: i64,
     gains: (f32, f32),
-    discord: bool,
+    discord: Option<u32>,
     progress: Span,
 ) -> Result<Vec<EncodedAudio>, &'static str> {
     if plan.is_empty() {
@@ -861,7 +873,10 @@ fn audio(
                     decoded[*i].as_ref().map(|pcm| (pcm, gain))
                 })
                 .collect();
-            (track, pcm::mix(&inputs, frames, track.mono && !discord))
+            (
+                track,
+                pcm::mix(&inputs, frames, track.mono && discord.is_none()),
+            )
         })
         .collect();
     drop(decoded);
@@ -916,9 +931,9 @@ fn audio(
         .collect()
 }
 
-fn bitrate(channels: u16, discord: bool) -> u32 {
-    if discord {
-        plan::DISCORD_AUDIO_BITRATE
+fn bitrate(channels: u16, discord: Option<u32>) -> u32 {
+    if let Some(rate) = discord {
+        rate
     } else if channels == 1 {
         MONO_BITRATE
     } else {
