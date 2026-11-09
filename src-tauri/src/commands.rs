@@ -25,7 +25,7 @@ use crate::media::{ComGuard, MfGuard, d3d};
 use crate::settings::{Settings, SettingsPatch};
 use crate::state::{AppState, lock};
 use crate::storage::{self, StorageInfo};
-use crate::{clipboard, editor, i18n, names, presence, replay, shell, update, window};
+use crate::{clipboard, editor, i18n, names, presence, replay, shell, tray, update, window};
 
 type CmdResult<T> = Result<T, String>;
 
@@ -541,6 +541,21 @@ pub async fn reveal_export(app: AppHandle, path: String) -> CmdResult<()> {
         .map_err(|_| "reveal_failed".to_string())
 }
 
+/// The tray shows that an update waits (`version`), or no longer does (`null`).
+#[tauri::command]
+pub async fn set_update_badge(app: AppHandle, version: Option<String>) -> CmdResult<()> {
+    let version = version.filter(|v| valid_version(v));
+    tray::set_update(&app, version).map_err(|_| INTERNAL.to_string())
+}
+
+/// A release version as the updater reports it ("0.7.0", "1.0.0-beta.2").
+fn valid_version(version: &str) -> bool {
+    (1..=32).contains(&version.len())
+        && version
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '+'))
+}
+
 /// Whether the Discord status is on, and whether Discord is there to show it.
 #[tauri::command]
 pub async fn get_presence(app: AppHandle) -> CmdResult<presence::PresenceInfo> {
@@ -608,5 +623,22 @@ mod tests {
         fs::write(&outside, b"x").unwrap();
         assert_eq!(shard_id_of(&clips, &outside), None);
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn accepts_release_versions_only() {
+        for ok in ["0.7.0", "1.0.0-beta.2", "2.0.0+build.5"] {
+            assert!(valid_version(ok), "{ok}");
+        }
+        for bad in [
+            "",
+            "0.7.0 ",
+            "../x",
+            "a
+b",
+            &"9".repeat(33),
+        ] {
+            assert!(!valid_version(bad), "{bad}");
+        }
     }
 }

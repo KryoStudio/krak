@@ -87,6 +87,7 @@ pub fn run() {
             commands::choose_export_path,
             commands::reveal_export,
             commands::get_presence,
+            commands::set_update_badge,
             commands::get_encoder_info,
             commands::resolve_video,
             commands::list_microphones,
