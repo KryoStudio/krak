@@ -7,6 +7,7 @@
   import { prefersReducedMotion } from 'svelte/motion';
   import Icon, { type IconName } from './Icon.svelte';
   import { api, errorCode, native, on, type ExportRequest, type Shard } from '$lib/api';
+  import { CLIPS_CHANNEL, openLink } from '$lib/community';
   import { MB, formatDuration, formatSize, hasKey, t } from '$lib/i18n.svelte';
   import { library } from '$lib/library.svelte';
   import { settings } from '$lib/settings.svelte';
@@ -273,8 +274,16 @@
               <Icon name="folder" size={14} />{t('export.reveal')}
             </button>
           {/if}
+          {#if target === 'discord'}
+            <button class="secondary" onclick={() => openLink(CLIPS_CHANNEL)}>
+              <Icon name="message" size={14} />{t('export.postClips')}
+            </button>
+          {/if}
           <button class="primary" onclick={onclose}>{t('export.done')}</button>
         </div>
+        {#if target === 'discord'}
+          <span class="clips-hint">{t('export.postClipsHint')}</span>
+        {/if}
       </div>
     {/if}
   </div>
@@ -643,6 +652,10 @@
     display: flex;
     gap: 8px;
     margin-top: 6px;
+  }
+  .clips-hint {
+    font-size: 12px;
+    color: var(--text-3);
   }
 
   @keyframes pop {

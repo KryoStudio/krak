@@ -376,6 +376,8 @@ export const zh: Translation = {
   'presence.connected': '已连接到 Discord',
   'presence.connectedAs': '已以 {name} 的身份连接',
   'presence.disconnected': 'Discord 未打开',
+  'export.postClips': '发布到 #clips',
+  'export.postClipsHint': '新帖子 → Ctrl+V → 选择你的游戏',
   'community.title': 'Krak 社区',
   'community.hint': '分享你的高光、获取帮助，并为本周最佳高光投票。',
   'community.join': '加入 Krak Discord',

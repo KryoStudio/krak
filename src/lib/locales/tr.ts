@@ -380,6 +380,8 @@ export const tr: Translation = {
   'presence.connected': 'Discord’a bağlı',
   'presence.connectedAs': '{name} olarak bağlı',
   'presence.disconnected': 'Discord açık değil',
+  'export.postClips': '#clips kanalında paylaş',
+  'export.postClipsHint': 'Yeni gönderi → Ctrl+V → oyununu seç',
   'community.title': 'Krak topluluğu',
   'community.hint': 'Kliplerini paylaş, yardım al ve haftanın klibine oy ver.',
   'community.join': 'Krak Discord’una katıl',

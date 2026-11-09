@@ -378,6 +378,8 @@ export const it: Translation = {
   'presence.connected': 'Connesso a Discord',
   'presence.connectedAs': 'Connesso come {name}',
   'presence.disconnected': 'Discord non è aperto',
+  'export.postClips': 'Pubblica in #clips',
+  'export.postClipsHint': 'Nuovo post → Ctrl+V → scegli il tuo gioco',
   'community.title': 'Community di Krak',
   'community.hint': 'Condividi le tue clip, chiedi aiuto e vota la clip della settimana.',
   'community.join': 'Unisciti al Discord di Krak',

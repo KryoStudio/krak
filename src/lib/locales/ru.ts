@@ -400,6 +400,8 @@ export const ru: Translation = {
   'presence.connected': 'Подключено к Discord',
   'presence.connectedAs': 'Подключено как {name}',
   'presence.disconnected': 'Discord не запущен',
+  'export.postClips': 'Опубликовать в #clips',
+  'export.postClipsHint': 'Новый пост → Ctrl+V → выбери свою игру',
   'community.title': 'Сообщество Krak',
   'community.hint': 'Делись клипами, получай помощь и голосуй за клип недели.',
   'community.join': 'Присоединиться к Discord Krak',
