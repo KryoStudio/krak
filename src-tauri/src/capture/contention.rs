@@ -70,8 +70,20 @@ pub fn watch(
     let spawned = std::thread::Builder::new()
         .name("kryo-gpu-contention".into())
         .spawn(move || {
+            // Tests: KRYO_CONTENTION=off (no monitor) or nvml (no Windows counters).
+            #[cfg(test)]
+            let mode = std::env::var("KRYO_CONTENTION").unwrap_or_default();
+            #[cfg(not(test))]
+            let mode = String::new();
+            if mode == "off" {
+                return;
+            }
             let nvml = Nvml::open(&name);
-            let mut counters = Counters::open(luid);
+            let mut counters = if mode == "nvml" {
+                None
+            } else {
+                Counters::open(luid)
+            };
             if nvml.is_none() && counters.is_none() {
                 return;
             }

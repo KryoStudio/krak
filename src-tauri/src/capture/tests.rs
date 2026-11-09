@@ -486,6 +486,96 @@ fn gpu_load_helper() {
     super::load::run(frame_ms, high, vram);
 }
 
+/// Captures a window whose picture changes on every refresh of the display (the load window
+/// with almost no work) at the display's rate, and counts the frames of the saved clip that
+/// repeat the one before (the window's area unchanged): each one is a refresh the capture
+/// missed, seen as a stutter in motion. Prints the count; asserts it stays rare.
+#[test]
+#[ignore = "records the screen (silently) for 35 s with a changing window on it; run with --ignored"]
+fn engine_captures_every_display_frame() {
+    let _com = ComGuard::new();
+    let _mf = MfGuard::new().expect("media foundation");
+    let mut helper = std::process::Command::new(std::env::current_exe().expect("test binary"))
+        .args([
+            "--ignored",
+            "--exact",
+            "capture::tests::gpu_load_helper",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env("KRYO_GPU_LOAD", "1")
+        .env("KRYO_LOAD_ITERATIONS", "4")
+        .spawn()
+        .expect("load process");
+    std::thread::sleep(Duration::from_secs(3));
+    let display = crate::media::d3d::primary_display().expect("display");
+    let fps = super::quality::capped_fps(240, crate::media::d3d::refresh_rate(&display));
+    let quality = match std::env::var("KRYO_LOAD_QUALITY").as_deref() {
+        Ok("premium") => Quality::Premium,
+        _ => Quality::High,
+    };
+    let recorder = Arc::new(Recorder::default());
+    let engine = Engine::start(
+        EngineConfig {
+            screen_fit: crate::settings::ScreenFit::Screen,
+            video: video(quality, fps),
+            audio_bitrate: 192_000,
+            buffer_seconds: 30,
+            microphone: false,
+            microphone_device: None,
+        },
+        recorder.clone(),
+    );
+    std::thread::sleep(Duration::from_secs(34));
+    let status = engine.status();
+    engine
+        .save(SaveRequest {
+            clips_dir: out_dir(),
+            game: None,
+            desktop_label: "Every frame".into(),
+            stamp: Stamp::now(),
+        })
+        .expect("save accepted");
+    let path = recorder
+        .wait(Duration::from_secs(60), |seen| seen.saved.clone())
+        .expect("saved");
+    drop(engine);
+    let _ = helper.kill();
+    let _ = helper.wait();
+    // The window is at the top left, 1280x720 on the display: compare a grid of its luma.
+    let mut previous: Option<Vec<u8>> = None;
+    let (mut frames, mut repeats) = (0usize, Vec::new());
+    testing::decode_frames(&path, status.ten_bit, |time, luma, pitch, _| {
+        let grid: Vec<u8> = (8..700)
+            .step_by(12)
+            .flat_map(|y| (8..1260).step_by(12).map(move |x| (y, x)))
+            .map(|(y, x)| luma[y * pitch + x])
+            .collect();
+        if let Some(before) = &previous {
+            let diff: u64 = grid
+                .iter()
+                .zip(before)
+                .map(|(a, b)| u64::from(a.abs_diff(*b)))
+                .sum();
+            if diff * 2 < grid.len() as u64 {
+                repeats.push(time as f64 / 1e7);
+            }
+        }
+        previous = Some(grid);
+        frames += 1;
+    });
+    println!(
+        "EVERY FRAME at {fps} fps on a {:.2} Hz display: {frames} frames, {} repeated: {:?}",
+        crate::media::d3d::refresh_rate(&display),
+        repeats.len(),
+        repeats
+            .iter()
+            .map(|t| format!("{t:.2}"))
+            .collect::<Vec<_>>()
+    );
+    println!("clip: {}", path.display());
+}
+
 /// How smooth a clip is: its frames' spacing, in ticks of the rate it says it has.
 #[derive(Debug)]
 struct Smoothness {
