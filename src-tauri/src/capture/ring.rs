@@ -14,7 +14,11 @@
 use std::collections::VecDeque;
 use std::sync::Arc;
 
+use crate::media::TICKS_PER_SECOND;
 use crate::media::codec::{CodecConfig, VideoPacket};
+
+/// Pictures this far apart (100 ns) have a hole between them: the capture stopped.
+const HOLE: i64 = TICKS_PER_SECOND;
 
 /// What a saved clip needs besides the packets.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -117,16 +121,38 @@ impl VideoRing {
     /// last keyframe presented at or before `now - window` (else the oldest packet, always a
     /// keyframe) to the last clean end presented at or before `now`.
     fn range(&self, now: i64, window: i64) -> Option<(usize, usize)> {
-        let cutoff = now - window;
+        let start = self.start(now - window);
+        let end = (start..self.packets.len())
+            .rev()
+            .find(|&i| self.packets[i].clean_end && self.packets[i].pts <= now)?;
+        Some((start, end + 1))
+    }
+
+    /// Where a clip whose window begins at `cutoff` starts: the last keyframe presented at or
+    /// before it (else the oldest packet, always a keyframe). Unless that GOP ends before the
+    /// cutoff with a hole after it (capture stopped for a while: a pipeline rebuild, a short
+    /// sleep): none of it is in the window, so the clip starts after the hole instead of
+    /// showing one picture frozen through it.
+    fn start(&self, cutoff: i64) -> usize {
         let start = self
             .packets
             .iter()
             .rposition(|p| p.keyframe && p.pts <= cutoff)
             .unwrap_or(0);
-        let end = (start..self.packets.len())
-            .rev()
-            .find(|&i| self.packets[i].clean_end && self.packets[i].pts <= now)?;
-        Some((start, end + 1))
+        let Some(next) = (start + 1..self.packets.len()).find(|&i| self.packets[i].keyframe) else {
+            return start;
+        };
+        let gop_end = self
+            .packets
+            .range(start..next)
+            .map(|p| p.pts)
+            .max()
+            .unwrap_or(i64::MAX);
+        if gop_end < cutoff && self.packets[next].pts - gop_end > HOLE {
+            next
+        } else {
+            start
+        }
     }
 
     /// The packets of a clip of the last `window` ending at `now` (cheap: shared packets).
@@ -282,6 +308,29 @@ mod tests {
         }
         assert_eq!(ring.len(), 60);
         assert_eq!(ring.packets.front().map(|p| p.pts), Some(0));
+    }
+
+    #[test]
+    fn a_clip_does_not_start_with_a_gop_from_before_a_hole() {
+        // 0..5 s, a 5 s hole (a pipeline rebuild), then 10..16 s; window 10 s.
+        let window = 10 * S;
+        let mut ring = filled(5, window, usize::MAX);
+        for i in 100..160 {
+            ring.push(packet(i), window, usize::MAX);
+        }
+        // The window begins at 5.9 s: the GOP of 4 s ends before it, the clip starts after
+        // the hole (not 4 s earlier with a frozen picture).
+        let now = 15 * S + 9 * S / 10;
+        let clip = ring.snapshot(now, window);
+        assert_eq!(clip.first().map(|p| p.pts), Some(10 * S));
+        assert_eq!(ring.span(now, window, S / 10), 6 * S);
+        // The window begins at 4.5 s, inside that GOP: it stays.
+        let now = 14 * S + 5 * S / 10;
+        assert_eq!(ring.snapshot(now, window)[0].pts, 4 * S);
+        // Without a hole, a GOP whose last picture is just before the cutoff stays too.
+        let ring = filled(20, window, usize::MAX);
+        let now = 19 * S + 95 * S / 100;
+        assert_eq!(ring.snapshot(now, window)[0].pts, 9 * S);
     }
 
     #[test]
