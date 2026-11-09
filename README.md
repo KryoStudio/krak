@@ -63,7 +63,7 @@ npm run tauri build   # build the installer
 
 `tauri build` also signs the in-app update files, so it needs the update signing key: set `TAURI_SIGNING_PRIVATE_KEY` to the key (or its path) first. Forks generate their own pair with `npx tauri signer generate` and put the public key in `src-tauri/tauri.conf.json`.
 
-Releases are built by GitHub Actions: push a tag such as `v0.2.0` (matching the version in `tauri.conf.json`) and a draft release is created with the installer and the signed update manifest.
+Releases are built by GitHub Actions: push a tag such as `v0.2.0` (matching the version in `tauri.conf.json`) and a draft release is created with the installer and the signed update manifest. Windows code signing (SignPath) and VirusTotal scans of the installer are optional: [`docs/SIGNING.md`](docs/SIGNING.md) explains how to turn them on, and what to do when Defender flags a release.
 
 ### How capture works
 
