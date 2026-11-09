@@ -89,6 +89,8 @@ impl VideoRing {
                 return;
             }
             self.after_hole = false;
+        } else if packet.keyframe {
+            self.drop_unfinished();
         }
         if let Some(last) = self.packets.back()
             && packet.dts <= last.dts
@@ -99,6 +101,25 @@ impl VideoRing {
         self.newest = Some(self.newest.map_or(packet.pts, |n| n.max(packet.pts)));
         self.packets.push_back(packet);
         self.trim(window, max_bytes);
+    }
+
+    /// Drops what follows the last clean end, before a keyframe. GOPs are closed, so in one
+    /// stream the packet before a keyframe is a clean end and nothing goes. What does is the
+    /// end of an encoder dropped mid-group (the pipeline rebuilt with the same parameters):
+    /// pictures never all output, which would show as holes and repeats before the new stream.
+    fn drop_unfinished(&mut self) {
+        let keep = self
+            .packets
+            .iter()
+            .rposition(|p| p.clean_end)
+            .map_or(0, |i| i + 1);
+        if keep == self.packets.len() {
+            return;
+        }
+        for packet in self.packets.drain(keep..) {
+            self.bytes -= packet.data.len();
+        }
+        self.newest = self.packets.iter().map(|p| p.pts).max();
     }
 
     fn trim(&mut self, window: i64, max_bytes: usize) {
@@ -454,5 +475,34 @@ mod tests {
         let before = ring.len();
         ring.push(packets[10].clone(), 25 * S / 10, usize::MAX);
         assert_eq!(ring.len(), before);
+    }
+
+    #[test]
+    fn a_new_stream_drops_what_the_old_encoder_left_unfinished() {
+        // The old encoder stops right after P20 (B18 B17 B19 never come out): the pipeline is
+        // rebuilt with the same parameters and a new stream starts 2 s later, at frame 40.
+        let old = b_frame_stream(60);
+        let mut ring = VideoRing::default();
+        for p in old.iter().take(18) {
+            ring.push(p.clone(), 100 * S, usize::MAX);
+        }
+        assert_eq!(ring.len(), 18);
+        let shift = 40 * S / 10;
+        for p in b_frame_stream(24) {
+            let moved = VideoPacket {
+                data: p.data.clone(),
+                pts: p.pts + shift,
+                dts: p.dts + shift,
+                ..*p
+            };
+            ring.push(Arc::new(moved), 100 * S, usize::MAX);
+        }
+        let clip = ring.snapshot(10 * S, 100 * S);
+        let frames = presented(&clip);
+        // Frames 0..=16 of the old stream, then the whole new one: no lone P20.
+        let expected: Vec<i64> = (0..=16).chain(40..64).collect();
+        assert_eq!(frames, expected);
+        assert_eq!(ring.bytes(), clip.len() * 100);
+        assert!(clip.windows(2).all(|w| w[1].dts > w[0].dts));
     }
 }
