@@ -38,8 +38,8 @@ use std::time::{Duration, Instant};
 
 use windows::Win32::Foundation::{CloseHandle, E_ACCESSDENIED, HANDLE};
 use windows::Win32::Graphics::Direct3D11::{
-    D3D11_ASYNC_GETDATA_DONOTFLUSH, D3D11_BIND_RENDER_TARGET, D3D11_QUERY_DESC,
-    D3D11_QUERY_EVENT, D3D11_VIDEO_PROCESSOR_ROTATION, ID3D11Query, ID3D11Texture2D,
+    D3D11_ASYNC_GETDATA_DONOTFLUSH, D3D11_BIND_RENDER_TARGET, D3D11_QUERY_DESC, D3D11_QUERY_EVENT,
+    D3D11_VIDEO_PROCESSOR_ROTATION, ID3D11Query, ID3D11Texture2D,
 };
 use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_NV12, DXGI_FORMAT_P010, DXGI_MODE_ROTATION_ROTATE90,
@@ -155,6 +155,20 @@ pub(super) fn run(shared: &Arc<Shared>) {
         let _ = SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
         let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
     }
+    // How busy the 3D engine of the captured display's GPU is (`contention`).
+    if let Ok(display) = d3d::primary_display()
+        // SAFETY: plain descriptor read.
+        && let Ok(desc) = unsafe { display.adapter.GetDesc1() }
+    {
+        let watched = Arc::clone(shared);
+        let end = desc.Description.iter().position(|&c| c == 0).unwrap_or(128);
+        super::contention::watch(
+            Arc::clone(&shared.contention),
+            desc.AdapterLuid,
+            String::from_utf16_lossy(&desc.Description[..end]),
+            move || watched.stopping(),
+        );
+    }
     let mut failures = 0u32;
     while !shared.stopping() {
         let result = Pipeline::new(shared).and_then(|mut pipeline| {
@@ -252,6 +266,17 @@ impl VideoEncoder {
     }
 }
 
+/// What a [`SCALE_DOWN_WINDOW`] of ticks says about the encoder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Verdict {
+    /// More than 3 % of the ticks late while the encoder made us wait over 20 % of the time.
+    Slow,
+    /// No late tick and the encoder waits under 10 % of the time: room for more.
+    Calm,
+    /// Anything in between.
+    Steady,
+}
+
 /// Whether the encoder keeps up, over the last [`SCALE_DOWN_WINDOW`].
 #[derive(Default)]
 struct Health {
@@ -262,9 +287,8 @@ struct Health {
 }
 
 impl Health {
-    /// Counts a tick; returns true when the last window says "too slow": more than 3 % of
-    /// the ticks late while the encoder made us wait more than 20 % of the time.
-    fn tick(&mut self, now: i64, late: u64, stats: EncodeStats) -> bool {
+    /// Counts a tick; at the end of each window, says how it went.
+    fn tick(&mut self, now: i64, late: u64, stats: EncodeStats) -> Option<Verdict> {
         if self.since == 0 {
             self.since = now;
             self.blocked = stats.blocked;
@@ -272,21 +296,149 @@ impl Health {
         self.ticks += 1;
         self.late += late;
         if now - self.since < SCALE_DOWN_WINDOW {
-            return false;
+            return None;
         }
         let window = Duration::from_nanos(u64::try_from((now - self.since) * 100).unwrap_or(0));
         let blocked = stats.blocked.saturating_sub(self.blocked);
-        let slow = self.late * 100 > self.ticks * 3 && blocked * 5 > window;
+        let verdict = if self.late * 100 > self.ticks * 3 && blocked * 5 > window {
+            Verdict::Slow
+        } else if self.late == 0 && blocked * 10 < window {
+            Verdict::Calm
+        } else {
+            Verdict::Steady
+        };
         *self = Self {
             since: now,
             blocked: stats.blocked,
             ..Self::default()
         };
-        slow
+        Some(verdict)
     }
 }
 
-/// A run-time step down to a lighter NVENC tier (module docs).
+/// The GPU counts as saturated from this utilization (%, every process: a GPU-bound game reads
+/// 97-99 % in the driver's tools).
+const GPU_SATURATED: u8 = 90;
+/// Tools that use the 3D engine come back only if the utilization stays under this with their
+/// estimated cost added ([`tool_cost`]).
+const GPU_ROOM: f64 = 80.0;
+/// Windows in a row the engine must be saturated before the tools go (4 s).
+const SATURATED_WINDOWS: u32 = 2;
+/// Windows in a row with room before they come back (10 s).
+const ROOM_WINDOWS: u32 = 5;
+/// Calm windows before a step back up (10 s), doubled each time one does not hold, up to 5 min.
+const PATIENCE: u32 = 5;
+const MAX_PATIENCE: u32 = 150;
+/// A step down this soon after a step up means it did not hold.
+const HOLD: i64 = 30 * TICKS_PER_SECOND;
+
+/// Estimated cost of lookahead, temporal AQ and 2-pass in points of 3D-engine utilization:
+/// measured on the reference GPU under a game-like load, the capture's own share was 33 % at
+/// Strong and 19 % at Fastest at 1080p120; it scales with the pixel rate.
+fn tool_cost(plan: &Plan) -> f64 {
+    let r = plan.resolved;
+    14.0 * f64::from(r.fps) * f64::from(r.width) * f64::from(r.height) / (120.0 * 1920.0 * 1080.0)
+}
+
+/// What [`Adapt::decide`] asks the pipeline to do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Decision {
+    Stay,
+    /// The encoder falls behind: a lighter tier, else fewer ticks.
+    StepDown,
+    /// A game saturates the GPU: tools that leave the 3D engine alone.
+    LeaveTheEngine,
+    /// Calm after encoding fewer ticks: twice as many.
+    SpeedUp,
+    /// Calm: one tier stronger, never past this one.
+    StepUp(Tier),
+}
+
+/// Run-time tier and pace decisions (module docs).
+struct Adapt {
+    /// The tier the preset starts at: steps up never go past it.
+    ceiling: Tier,
+    calm: u32,
+    patience: u32,
+    last_up: i64,
+    saturated: u32,
+    room: u32,
+    /// Said once that nothing lighter is left.
+    exhausted: bool,
+    /// A new session failed to open: only reconfigure in place from now on.
+    no_new_session: bool,
+}
+
+impl Adapt {
+    /// One health window's decision. `total`: the GPU's utilization by everyone (`None` when
+    /// unknown); `tool_cost`: what the 3D-engine tools would add to it; `uses_tools`: whether
+    /// the current tier has them; `pace`: ticks per encoded frame.
+    fn decide(
+        &mut self,
+        now: i64,
+        verdict: Verdict,
+        total: Option<u8>,
+        tool_cost: f64,
+        uses_tools: bool,
+        pace: i64,
+    ) -> Decision {
+        let saturated = total.is_some_and(|t| t >= GPU_SATURATED);
+        let room = total.is_none_or(|t| f64::from(t) + tool_cost < GPU_ROOM);
+        self.saturated = if saturated { self.saturated + 1 } else { 0 };
+        self.room = if room { self.room + 1 } else { 0 };
+        match verdict {
+            Verdict::Slow => {
+                self.calm = 0;
+                if now - self.last_up < HOLD {
+                    self.patience = (self.patience * 2).min(MAX_PATIENCE);
+                    eprintln!(
+                        "krak: the step up did not hold, the next one waits {} s",
+                        self.patience * 2
+                    );
+                }
+                return Decision::StepDown;
+            }
+            Verdict::Calm => self.calm += 1,
+            Verdict::Steady => self.calm = 0,
+        }
+        if self.saturated >= SATURATED_WINDOWS && uses_tools {
+            self.calm = 0;
+            return Decision::LeaveTheEngine;
+        }
+        if self.calm < self.patience {
+            return Decision::Stay;
+        }
+        self.calm = 0;
+        if now - self.last_up > 10 * HOLD {
+            // Long stable since the last step up: patience back to normal.
+            self.patience = PATIENCE;
+        }
+        self.last_up = now;
+        if pace > 1 {
+            return Decision::SpeedUp;
+        }
+        Decision::StepUp(if self.room >= ROOM_WINDOWS {
+            self.ceiling
+        } else {
+            self.ceiling.max(Tier::Fast)
+        })
+    }
+
+    fn new(ceiling: Tier) -> Self {
+        Self {
+            ceiling,
+            calm: 0,
+            patience: PATIENCE,
+            last_up: i64::MIN / 2,
+            saturated: 0,
+            room: 0,
+            exhausted: false,
+            no_new_session: false,
+        }
+    }
+}
+
+/// A run-time switch to another NVENC tier (module docs).
 enum StepDown {
     Idle,
     /// The lighter encoder opens on another thread; the current one keeps encoding.
@@ -303,8 +455,6 @@ enum StepDown {
         config: CodecConfig,
         held: Vec<VideoPacket>,
     },
-    /// Nothing lighter (or it could not be opened): keep going as is.
-    Done,
 }
 
 /// Fields drop in order: the encoder (which shuts its session/MFT down) first, the device last.
@@ -333,6 +483,7 @@ struct Pipeline {
     rotation: D3D11_VIDEO_PROCESSOR_ROTATION,
     ten_bit_input: bool,
     health: Health,
+    adapt: Adapt,
     timings: Timings,
     fence: Option<GpuFence>,
     caps: Capabilities,
@@ -359,7 +510,12 @@ impl Pipeline {
         };
         let caps = capabilities(&gpu);
         let tier = tier_from(shared.tier.load(std::sync::atomic::Ordering::Relaxed));
+        #[cfg(test)]
+        let tier = tier.max(tier_from(
+            tests::START_TIER.load(std::sync::atomic::Ordering::Relaxed),
+        ));
         let plan = quality::plan(&shared.config.video, frame, refresh, &caps, tier);
+        let ceiling = quality::plan(&shared.config.video, frame, refresh, &caps, Tier::Best).tier;
         let rotation = d3d::display_rotation(display.rotation);
         let (encoder, plan, mut converter, target) = open_encoder(
             &gpu,
@@ -424,6 +580,7 @@ impl Pipeline {
             ),
             params_sent: false,
             health: Health::default(),
+            adapt: Adapt::new(ceiling),
             timings: Timings::default(),
             fence,
             caps,
@@ -505,10 +662,16 @@ impl Pipeline {
                     if let Some(fence) = &mut self.fence {
                         fence.signal(&self.gpu);
                     }
-                    let slow = self.health.tick(now, late, encoder.stats());
+                    let verdict = self.health.tick(now, late, encoder.stats());
                     #[cfg(test)]
-                    let slow = slow || tests::force_scale_down(stats.ticks);
-                    if slow && let Some(exit) = self.begin_step_down(shared) {
+                    let verdict = if tests::force_scale_down(stats.ticks) {
+                        Some(Verdict::Slow)
+                    } else {
+                        verdict
+                    };
+                    if let Some(verdict) = verdict
+                        && let Some(exit) = self.adapt(shared, now, verdict)
+                    {
                         return Ok(exit);
                     }
                     #[cfg(test)]
@@ -547,13 +710,13 @@ impl Pipeline {
                 self.timings.since = now;
                 self.timings.encoder = self.encoder.stats();
             } else if now - self.timings.since >= HEALTH_LOG {
-                self.log_health(now);
+                self.log_health(now, shared);
             }
         }
     }
 
     /// Writes the last [`HEALTH_LOG`]'s health (see [`Timings`]) and starts a new one.
-    fn log_health(&mut self, now: i64) {
+    fn log_health(&mut self, now: i64, shared: &Shared) {
         let t = std::mem::take(&mut self.timings);
         let stats = self.encoder.stats();
         let seconds = (now - t.since) as f64 / TICKS_PER_SECOND as f64;
@@ -561,8 +724,12 @@ impl Pipeline {
         let memory = d3d::video_memory(&self.gpu)
             .map(|(usage, budget)| format!("; video memory {} of {} MB", usage >> 20, budget >> 20))
             .unwrap_or_default();
+        let engine = match (shared.contention.total(), shared.contention.ours()) {
+            (Some(total), Some(ours)) => format!("; 3D engine {total} % busy ({ours} % ours)"),
+            _ => String::new(),
+        };
         eprintln!(
-            "krak: health over {seconds:.0} s: {:.1} fps encoded ({} configured, tier {:?}, one tick in {}), {} late ticks, GPU behind on {} ticks (worst backlog {}); ms per tick avg/worst: desktop {}, convert {}, encode {} (map {:.0} ms, submit {:.0} ms, lock {:.0} ms in total){memory}",
+            "krak: health over {seconds:.0} s: {:.1} fps encoded ({} configured, tier {:?}, one tick in {}), {} late ticks, GPU behind on {} ticks (worst backlog {}); ms per tick avg/worst: desktop {}, convert {}, encode {} (map {:.0} ms, submit {:.0} ms, lock {:.0} ms in total){memory}{engine}",
             stats.frames_in.saturating_sub(t.encoder.frames_in) as f64 / seconds.max(0.001),
             self.plan.resolved.fps,
             self.plan.tier,
@@ -581,26 +748,84 @@ impl Pipeline {
         self.timings.encoder = stats;
     }
 
-    /// Steps down to the next lighter tier (`quality::lighter`): in place when the driver
-    /// allows it, else starts opening a new session on another thread. Past the lightest one,
-    /// encodes fewer ticks (`slow_down`).
-    fn begin_step_down(&mut self, shared: &Shared) -> Option<Exit> {
+    /// Decides, at the end of each health window, whether to change tier or pace:
+    /// - the encoder falls behind: the next lighter tier (`quality::lighter`), past the
+    ///   lightest one fewer ticks (`slow_down`);
+    /// - the 3D engine stays saturated (a game needs all of it, `contention`): tools that leave
+    ///   it alone (`quality::without_3d_tools`);
+    /// - calm for a while: one step back up (`speed_up`, then `quality::heavier`), up to the
+    ///   preset's tier, or to the first tier without 3D-engine tools while the GPU has no room
+    ///   for them. A step up that does not hold makes the next one wait twice as long.
+    fn adapt(&mut self, shared: &Shared, now: i64, verdict: Verdict) -> Option<Exit> {
         if !matches!(self.step_down, StepDown::Idle) {
             return None;
         }
-        let Some(plan) = quality::lighter(&self.plan, &self.caps) else {
-            self.slow_down(shared);
-            return None;
-        };
+        let total = shared.contention.total();
+        let uses_tools =
+            matches!(self.plan.encoder, EncoderPlan::Nvenc(s) if quality::uses_3d_engine(&s));
+        let decision = self.adapt.decide(
+            now,
+            verdict,
+            total,
+            tool_cost(&self.plan),
+            uses_tools,
+            self.pace,
+        );
+        match decision {
+            Decision::Stay => None,
+            Decision::StepDown => self.step_down(shared),
+            Decision::LeaveTheEngine => {
+                let plan = quality::without_3d_tools(&self.plan, &self.caps)?;
+                let why = format!(
+                    "the GPU is saturated ({} %): leaving it to the game",
+                    total.unwrap_or(0)
+                );
+                self.switch_to(shared, plan, &why)
+            }
+            Decision::SpeedUp => {
+                self.speed_up(shared);
+                None
+            }
+            Decision::StepUp(ceiling) => {
+                let plan = quality::heavier(&self.plan, ceiling, &self.caps)?;
+                self.switch_to(shared, plan, "the encoder keeps up again")
+            }
+        }
+    }
+
+    /// The encoder falls behind: the next lighter tier, else fewer ticks.
+    fn step_down(&mut self, shared: &Shared) -> Option<Exit> {
+        match quality::lighter(&self.plan, &self.caps) {
+            Some(plan) => self.switch_to(shared, plan, "the encoder cannot keep up"),
+            None => {
+                self.slow_down(shared);
+                None
+            }
+        }
+    }
+
+    /// Switches to `plan`'s tools: in place when the driver allows it (0.2 ms), else a new
+    /// session opens on another thread while the current one keeps encoding
+    /// (`advance_step_down`). A lookahead change always takes a new session when it can: in
+    /// place, the driver encodes its queued pictures first and the tick thread waits for it
+    /// (89 ms measured from lookahead 16: a 5-frame hole in the clip at 60 fps).
+    fn switch_to(&mut self, shared: &Shared, plan: Plan, why: &str) -> Option<Exit> {
         let (EncoderPlan::Nvenc(settings), VideoEncoder::Nvenc(encoder)) =
             (plan.encoder, &mut self.encoder)
         else {
-            self.step_down = StepDown::Done;
             return None;
         };
         let started = Instant::now();
         let before = encoder.config().clone();
-        let reconfigured = encoder.reconfigure(settings);
+        let lookahead_changes = encoder.settings().lookahead != settings.lookahead;
+        #[cfg(test)]
+        let lookahead_changes =
+            lookahead_changes && !tests::FORCE_IN_PLACE.load(std::sync::atomic::Ordering::Relaxed);
+        let reconfigured = if lookahead_changes && !self.adapt.no_new_session {
+            Err(MediaError::new(CAPTURE_FAILED))
+        } else {
+            encoder.reconfigure(settings)
+        };
         #[cfg(test)]
         let reconfigured = if tests::FORCE_NEW_SESSION.load(std::sync::atomic::Ordering::Relaxed) {
             Err(MediaError::new(CAPTURE_FAILED))
@@ -610,13 +835,14 @@ impl Pipeline {
         match reconfigured {
             Ok(config) if config == before => {
                 eprintln!(
-                    "krak: the encoder cannot keep up at {:?}, switched to {:?} in place ({:.1} ms)",
+                    "krak: {why}: {:?} -> {:?} in place ({:.1} ms)",
                     self.plan.tier,
                     plan.tier,
                     started.elapsed().as_secs_f64() * 1000.0
                 );
                 self.plan = plan;
                 self.health = Health::default();
+                self.adapt.exhausted = false;
                 shared
                     .tier
                     .store(plan.tier as u8, std::sync::atomic::Ordering::Relaxed);
@@ -634,8 +860,19 @@ impl Pipeline {
                     .store(plan.tier as u8, std::sync::atomic::Ordering::Relaxed);
                 return Some(Exit::Rebuild);
             }
+            Err(err) if self.adapt.no_new_session => {
+                eprintln!(
+                    "krak: {why}: {:?} -> {:?} refused in place ({err}), staying",
+                    self.plan.tier, plan.tier
+                );
+                return None;
+            }
+            Err(_) if lookahead_changes => eprintln!(
+                "krak: {why}: {:?} -> {:?}, opening a new session (the lookahead changes)",
+                self.plan.tier, plan.tier
+            ),
             Err(err) => eprintln!(
-                "krak: the encoder cannot keep up at {:?}, opening {:?} ({err} in place)",
+                "krak: {why}: {:?} -> {:?}, opening a new session ({err} in place)",
                 self.plan.tier, plan.tier
             ),
         }
@@ -643,14 +880,16 @@ impl Pipeline {
         let opening = std::thread::Builder::new()
             .name("kryo-nvenc-open".into())
             .spawn(move || NvencEncoder::new(&gpu, settings));
-        self.step_down = match opening {
-            Ok(thread) => StepDown::Opening {
-                plan,
-                started: Instant::now(),
-                thread,
-            },
-            Err(_) => StepDown::Done,
-        };
+        match opening {
+            Ok(thread) => {
+                self.step_down = StepDown::Opening {
+                    plan,
+                    started: Instant::now(),
+                    thread,
+                };
+            }
+            Err(_) => self.adapt.no_new_session = true,
+        }
         None
     }
 
@@ -664,12 +903,13 @@ impl Pipeline {
     fn slow_down(&mut self, shared: &Shared) {
         let fps = i64::from(self.plan.resolved.fps);
         if fps / (self.pace * 2) < MIN_PACED_FPS {
-            eprintln!(
-                "krak: the encoder cannot keep up at {:?} and {} fps, and nothing lighter would continue the stream faster",
-                self.plan.tier,
-                self.encoded_fps()
-            );
-            self.step_down = StepDown::Done;
+            if !std::mem::replace(&mut self.adapt.exhausted, true) {
+                eprintln!(
+                    "krak: the encoder cannot keep up at {:?} and {} fps, and nothing lighter would continue the stream faster",
+                    self.plan.tier,
+                    self.encoded_fps()
+                );
+            }
             return;
         }
         self.pace *= 2;
@@ -686,7 +926,24 @@ impl Pipeline {
         );
     }
 
-    /// Swaps in the lighter encoder once it is open, and hands the ring the old encoder's last
+    /// Calm again after `slow_down`: encode twice as many ticks.
+    fn speed_up(&mut self, shared: &Shared) {
+        self.pace = (self.pace / 2).max(1);
+        self.health = Health::default();
+        self.adapt.exhausted = false;
+        let encoded = self.encoded_fps();
+        shared.pace.store(
+            u32::try_from(self.pace).unwrap_or(1),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        shared.update(|s| s.fps = encoded);
+        eprintln!(
+            "krak: the encoder keeps up again: encoding one tick in {} ({encoded} fps)",
+            self.pace
+        );
+    }
+
+    /// Swaps in the new encoder once it is open, and hands the ring the old encoder's last
     /// packets, then the held ones, once it has flushed. Called after every tick's publish.
     fn advance_step_down(&mut self, shared: &Shared) {
         match &self.step_down {
@@ -694,7 +951,7 @@ impl Pipeline {
             StepDown::Flushing { thread, .. } if thread.is_finished() => {}
             _ => return,
         }
-        match std::mem::replace(&mut self.step_down, StepDown::Done) {
+        match std::mem::replace(&mut self.step_down, StepDown::Idle) {
             StepDown::Opening {
                 plan,
                 started,
@@ -707,9 +964,10 @@ impl Pipeline {
                     Ok(encoder) => encoder,
                     Err(err) => {
                         eprintln!(
-                            "krak: the lighter encoder failed to open ({err}), staying at {:?}",
+                            "krak: the new encoder failed to open ({err}), staying at {:?}",
                             self.plan.tier
                         );
+                        self.adapt.no_new_session = true;
                         return;
                     }
                 };
@@ -733,6 +991,9 @@ impl Pipeline {
                 );
                 self.plan = plan;
                 self.health = Health::default();
+                self.adapt.exhausted = false;
+                // The new encoder counts from zero.
+                self.timings.encoder = EncodeStats::default();
                 shared
                     .tier
                     .store(plan.tier as u8, std::sync::atomic::Ordering::Relaxed);
@@ -1220,6 +1481,12 @@ pub(super) mod tests {
     /// whatever its tier.
     pub static SLOW_DOWN_AT: AtomicU64 = AtomicU64::new(0);
 
+    /// Makes lookahead changes reconfigure in place too (the measurement against a new session).
+    pub static FORCE_IN_PLACE: AtomicBool = AtomicBool::new(false);
+
+    /// The lightest tier the next pipelines may start at (`Tier as u8`, 0 = Best: no limit).
+    pub static START_TIER: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
     fn once_at(at: &AtomicU64, tick: u64) -> bool {
         let value = at.load(Ordering::Relaxed);
         value != 0
@@ -1254,7 +1521,8 @@ pub(super) mod tests {
             for i in 1..=130u64 {
                 total += blocked_per_tick;
                 let late = u64::from(late_every != 0 && i % late_every == 0);
-                slow |= health.tick(i as i64 * 16 * ms + 1, late, stats(total));
+                slow |=
+                    health.tick(i as i64 * 16 * ms + 1, late, stats(total)) == Some(Verdict::Slow);
             }
             slow
         };
@@ -1271,9 +1539,132 @@ pub(super) mod tests {
         let mut slow = false;
         for i in 1..=130u64 {
             let blocked = if i < 10 { i * 10 } else { 100 };
-            slow |= health.tick(i as i64 * 16 * ms + 1, u64::from(i < 3), stats(blocked));
+            slow |= health.tick(i as i64 * 16 * ms + 1, u64::from(i < 3), stats(blocked))
+                == Some(Verdict::Slow);
         }
         assert!(!slow);
+    }
+
+    /// Calm only without a late tick and with the encoder waiting under 10 % of the time.
+    #[test]
+    fn calls_a_window_calm_only_with_room_to_spare() {
+        let ms = TICKS_PER_SECOND / 1000;
+        let last = |late_every: u64, blocked_per_tick: u64| {
+            let mut health = Health::default();
+            let mut verdict = None;
+            let mut total = 0;
+            for i in 1..=130u64 {
+                total += blocked_per_tick;
+                let late = u64::from(late_every != 0 && i % late_every == 0);
+                verdict = health
+                    .tick(i as i64 * 16 * ms + 1, late, stats(total))
+                    .or(verdict);
+            }
+            verdict
+        };
+        assert_eq!(last(0, 0), Some(Verdict::Calm));
+        assert_eq!(last(0, 1), Some(Verdict::Calm), "1 ms in 16 is room");
+        assert_eq!(last(0, 3), Some(Verdict::Steady), "3 ms in 16 is not");
+        assert_eq!(last(60, 0), Some(Verdict::Steady), "a late tick");
+        assert_eq!(last(10, 5), Some(Verdict::Slow));
+    }
+
+    /// The adaptation's decisions, one 2 s window at a time.
+    #[test]
+    fn adapts_down_and_back_up() {
+        let window = SCALE_DOWN_WINDOW;
+        let mut a = Adapt::new(Tier::Strong);
+        let mut t = 0;
+        let mut next = |a: &mut Adapt, verdict, total, uses_tools, pace| {
+            t += window;
+            a.decide(t, verdict, total, 14.0, uses_tools, pace)
+        };
+        // The encoder falls behind: down at once.
+        assert_eq!(
+            next(&mut a, Verdict::Slow, Some(40), true, 1),
+            Decision::StepDown
+        );
+        // Calm for 10 s (5 windows) with room: back up to the preset's tier.
+        for _ in 0..4 {
+            assert_eq!(
+                next(&mut a, Verdict::Calm, Some(40), false, 1),
+                Decision::Stay
+            );
+        }
+        assert_eq!(
+            next(&mut a, Verdict::Calm, Some(40), false, 1),
+            Decision::StepUp(Tier::Strong)
+        );
+        // Slow again right after: the next step up waits twice as long.
+        assert_eq!(
+            next(&mut a, Verdict::Slow, Some(40), true, 1),
+            Decision::StepDown
+        );
+        for _ in 0..9 {
+            assert_eq!(
+                next(&mut a, Verdict::Calm, Some(40), false, 1),
+                Decision::Stay
+            );
+        }
+        assert_eq!(
+            next(&mut a, Verdict::Calm, Some(40), false, 1),
+            Decision::StepUp(Tier::Strong)
+        );
+        // A steady window restarts the count.
+        let mut a = Adapt::new(Tier::Strong);
+        for _ in 0..4 {
+            next(&mut a, Verdict::Calm, Some(40), false, 1);
+        }
+        assert_eq!(
+            next(&mut a, Verdict::Steady, Some(40), false, 1),
+            Decision::Stay
+        );
+        assert_eq!(
+            next(&mut a, Verdict::Calm, Some(40), false, 1),
+            Decision::Stay
+        );
+        // Fewer ticks first: back to every tick before any tier.
+        let mut a = Adapt::new(Tier::Strong);
+        for _ in 0..4 {
+            next(&mut a, Verdict::Calm, Some(40), false, 2);
+        }
+        assert_eq!(
+            next(&mut a, Verdict::Calm, Some(40), false, 2),
+            Decision::SpeedUp
+        );
+    }
+
+    /// A game saturating the GPU: the 3D-engine tools go after two windows, and come back only
+    /// once the GPU has room for them (else steps up stop at Fast).
+    #[test]
+    fn leaves_a_saturated_gpu_to_the_game() {
+        let window = SCALE_DOWN_WINDOW;
+        let mut a = Adapt::new(Tier::Strong);
+        let mut t = 0;
+        let mut next = |a: &mut Adapt, total, uses_tools| {
+            t += window;
+            a.decide(t, Verdict::Calm, total, 14.0, uses_tools, 1)
+        };
+        assert_eq!(next(&mut a, Some(97), true), Decision::Stay);
+        assert_eq!(next(&mut a, Some(98), true), Decision::LeaveTheEngine);
+        // Tool-free now; the game keeps the GPU busy: steps up stop at Fast.
+        for _ in 0..4 {
+            assert_eq!(next(&mut a, Some(95), false), Decision::Stay);
+        }
+        assert_eq!(next(&mut a, Some(95), false), Decision::StepUp(Tier::Fast));
+        // The game quits: 10 s with room, then the tools come back.
+        for _ in 0..4 {
+            next(&mut a, Some(20), false);
+        }
+        assert_eq!(
+            next(&mut a, Some(20), false),
+            Decision::StepUp(Tier::Strong)
+        );
+        // Unknown utilization (no NVML): never blamed on a game.
+        let mut a = Adapt::new(Tier::Strong);
+        for _ in 0..4 {
+            assert_eq!(next(&mut a, None, true), Decision::Stay);
+        }
     }
 
     #[test]

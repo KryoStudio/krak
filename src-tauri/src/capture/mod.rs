@@ -16,9 +16,12 @@
 
 pub mod audio;
 mod clock;
+mod contention;
 mod duplication;
 pub mod encoders;
 pub mod game;
+#[cfg(test)]
+mod load;
 pub mod naming;
 mod pcm;
 pub mod quality;
@@ -28,8 +31,6 @@ mod save;
 pub mod screen;
 pub mod screenshot;
 pub mod sound;
-#[cfg(test)]
-mod load;
 #[cfg(test)]
 mod tests;
 mod timeline;
@@ -181,6 +182,8 @@ struct Shared {
     tier: AtomicU8,
     /// Ticks per encoded frame: 1, then 2 or 4 when even the lightest tier falls behind.
     pace: AtomicU32,
+    /// How busy the GPU's 3D engine is (`contention`), sampled on its own thread.
+    contention: Arc<contention::Contention>,
     max_video_bytes: usize,
     stop: AtomicBool,
     video: Mutex<VideoRing>,
@@ -209,6 +212,7 @@ impl Shared {
             buffer_seconds: AtomicU32::new(buffer_seconds),
             tier: AtomicU8::new(0),
             pace: AtomicU32::new(1),
+            contention: Arc::new(contention::Contention::new()),
             max_video_bytes: video_memory_cap(),
             stop: AtomicBool::new(false),
             video: Mutex::default(),
