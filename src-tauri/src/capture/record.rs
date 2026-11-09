@@ -376,7 +376,7 @@ impl Recorder {
             }
             // Another stream cannot share the file, nor should hours of nothing.
             let new_stream = *part.params != *params;
-            let gap = packet.dts.saturating_sub(part.last_dts) > MAX_GAP;
+            let gap = after_hole(part.last_dts, part.newest_pts, &packet);
             if new_stream || gap || (self.split && packet.keyframe) {
                 if new_stream || gap {
                     eprintln!(
@@ -388,8 +388,8 @@ impl Recorder {
             }
         }
         if self.part.is_none() {
-            if !packet.keyframe {
-                return Ok(()); // a part starts with a keyframe
+            if !opens_part(&packet) {
+                return Ok(());
             }
             self.part = Some(self.open(params, &packet)?);
             self.split = false;
@@ -597,6 +597,21 @@ impl Recorder {
             }
         }
     }
+}
+
+/// Whether `packet` comes after a hole in the video (the PC slept) in a part decoded up to
+/// `last_dts` and presented up to `newest_pts`. With B-frames, the first packets of one stream
+/// after a hole are presented after it but still decoded before it (the reorder delay): the
+/// presentation time shows the hole first, before such a packet could put hours inside a file
+/// (or a composition offset past what MP4 can hold).
+fn after_hole(last_dts: i64, newest_pts: i64, packet: &VideoPacket) -> bool {
+    packet.dts.saturating_sub(last_dts) > MAX_GAP || packet.pts.saturating_sub(newest_pts) > MAX_GAP
+}
+
+/// Whether a part can start with `packet`: a keyframe, and not one of those presented after a
+/// hole but decoded before it (`after_hole`).
+fn opens_part(packet: &VideoPacket) -> bool {
+    packet.keyframe && packet.pts.saturating_sub(packet.dts) <= MAX_GAP
 }
 
 /// Renames a finished part to its clip name (the next free one if it got taken).
@@ -849,6 +864,37 @@ mod tests {
                 bytes: 1024
             }
         );
+    }
+
+    #[test]
+    fn a_hole_in_one_stream_ends_the_part_before_it() {
+        const S: i64 = TICKS_PER_SECOND;
+        let packet = |pts: i64, dts: i64, keyframe: bool| VideoPacket {
+            data: Vec::new(),
+            pts,
+            dts,
+            keyframe,
+            clean_end: true,
+        };
+        let (last_dts, newest_pts) = (100 * S, 100 * S + S / 10);
+        assert!(!after_hole(
+            last_dts,
+            newest_pts,
+            &packet(100 * S + 2 * S / 10, 100 * S + 1, false)
+        ));
+        // Two hours asleep: the first picture after it is decoded before it (3 B-frames).
+        let woke = 100 * S + 7200 * S;
+        let straddling = packet(woke, 100 * S + S / 20, false);
+        assert!(after_hole(last_dts, newest_pts, &straddling));
+        assert!(after_hole(
+            last_dts,
+            newest_pts,
+            &packet(woke, woke - S / 20, false)
+        ));
+        // A keyframe decoded before the hole cannot open the next part; the next one can.
+        assert!(!opens_part(&packet(woke + S / 60, 100 * S + S / 10, true)));
+        assert!(opens_part(&packet(woke + S, woke + S - S / 20, true)));
+        assert!(!opens_part(&packet(woke + S, woke + S, false)));
     }
 
     #[test]
