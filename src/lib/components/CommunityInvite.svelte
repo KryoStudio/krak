@@ -17,9 +17,10 @@
     <span>{t('community.hint')}</span>
     <div class="actions">
       <button class="never" onclick={() => invite.never()}>{t('community.never')}</button>
-      <span class="spacer"></span>
-      <button class="later" onclick={() => invite.notNow()}>{t('community.notNow')}</button>
-      <button class="join" onclick={() => invite.join()}>{t('community.joinShort')}<Icon name="external" size={12} /></button>
+      <div class="answers">
+        <button class="later" onclick={() => invite.notNow()}>{t('community.notNow')}</button>
+        <button class="join" onclick={() => invite.join()}>{t('community.joinShort')}<Icon name="external" size={12} /></button>
+      </div>
     </div>
   </div>
   <button class="close" onclick={() => invite.notNow()} aria-label={t('community.notNow')}><Icon name="x" size={14} /></button>
@@ -34,7 +35,7 @@
     display: flex;
     align-items: flex-start;
     gap: 12px;
-    width: 380px;
+    width: min(380px, calc(100vw - 40px));
     padding: 14px 10px 14px 14px;
     border-radius: var(--radius-lg);
     background: color-mix(in srgb, var(--surface-2) 96%, transparent);
@@ -67,14 +68,22 @@
     line-height: 1.45;
     color: var(--text-2);
   }
+  /* One row when it fits ("Don't ask again" on the left). Otherwise the answers keep the first
+     row and "Don't ask again" goes under them (wrap-reverse): the buttons never run past the card,
+     whatever the language. */
   .actions {
     display: flex;
+    flex-wrap: wrap-reverse;
     align-items: center;
     gap: 6px;
     margin-top: 10px;
   }
-  .spacer {
-    flex: 1;
+  .answers {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: flex-end;
+    gap: 6px;
+    margin-left: auto;
   }
   .actions button {
     display: inline-flex;

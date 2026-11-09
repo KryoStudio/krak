@@ -45,7 +45,7 @@
     display: flex;
     align-items: flex-start;
     gap: 12px;
-    width: 360px;
+    width: min(360px, calc(100vw - 40px));
     padding: 14px 10px 14px 14px;
     border-radius: var(--radius-lg);
     background: color-mix(in srgb, var(--surface-2) 96%, transparent);
@@ -79,6 +79,7 @@
   }
   .actions {
     display: flex;
+    flex-wrap: wrap;
     justify-content: flex-end;
     gap: 6px;
     margin-top: 10px;
