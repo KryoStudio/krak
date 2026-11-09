@@ -41,7 +41,9 @@ pub struct AacConfig {
     pub sample_rate: u32,
     /// 1 or 2.
     pub channels: u16,
-    /// 96 000, 128 000, 160 000 or 192 000 bits/s (what the Microsoft encoder accepts).
+    /// Bit/s. Microsoft's encoder documents 96 000, 128 000, 160 000 and 192 000; Windows 11's
+    /// also takes 256 000 and 320 000 (measured, it refuses 384 000). An encoder that refuses
+    /// more than 192 000 encodes at 192 000 instead.
     pub bitrate: u32,
 }
 
@@ -92,6 +94,8 @@ mod imp {
     const FAILED: &str = "encode_failed";
     /// PCM fed per ProcessInput call (frames).
     const CHUNK_FRAMES: usize = 48_000;
+    /// The highest bitrate every version of the encoder documents.
+    const SAFE_BITRATE: u32 = 192_000;
 
     /// `delay`: priming samples to compensate (`ENCODER_DELAY`, or 0 to measure it).
     pub fn encode(
@@ -109,14 +113,10 @@ mod imp {
         let total_frames = pcm.len() / channels;
         let wanted = total_frames.div_ceil(FRAME_SAMPLES);
 
-        // SAFETY: COM calls on a freshly created MFT owned by this function (the caller has
-        // initialized COM and Media Foundation on this thread).
-        let transform: IMFTransform =
-            unsafe { CoCreateInstance(&AACMFTEncoder, None, CLSCTX_INPROC_SERVER) }
-                .code("no_aac_encoder")?;
-        configure(&transform, config).code(FAILED)?;
+        let transform = open(config)?;
         let alloc = OutputAlloc::query(&transform).code(FAILED)?;
-        // SAFETY: see above.
+        // SAFETY: COM calls on an MFT owned by this function (the caller has initialized COM
+        // and Media Foundation on this thread).
         unsafe {
             transform
                 .ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0)
@@ -233,13 +233,9 @@ mod imp {
             }
             audio_specific_config(config.sample_rate, config.channels)
                 .ok_or(MediaError::new(FAILED))?;
-            // SAFETY: COM calls on a freshly created MFT owned by the encoder.
-            let transform: IMFTransform =
-                unsafe { CoCreateInstance(&AACMFTEncoder, None, CLSCTX_INPROC_SERVER) }
-                    .code("no_aac_encoder")?;
-            configure(&transform, config).code(FAILED)?;
+            let transform = open(config)?;
             let alloc = OutputAlloc::query(&transform).code(FAILED)?;
-            // SAFETY: see above.
+            // SAFETY: COM calls on an MFT owned by the encoder.
             unsafe {
                 transform
                     .ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0)
@@ -382,6 +378,43 @@ mod imp {
         Ok(any)
     }
 
+    /// A new encoder set up for `config`, or for [`SAFE_BITRATE`] when it refuses a higher one
+    /// (older versions only take what they document): the quality setting must never make a
+    /// save or a recording fail. The caller has initialized COM and Media Foundation on this
+    /// thread.
+    fn open(config: AacConfig) -> MediaResult<IMFTransform> {
+        let create = || {
+            // SAFETY: creates an MFT owned by the caller.
+            unsafe {
+                CoCreateInstance::<_, IMFTransform>(&AACMFTEncoder, None, CLSCTX_INPROC_SERVER)
+            }
+            .code("no_aac_encoder")
+        };
+        let transform = create()?;
+        match configure(&transform, config) {
+            Ok(()) => Ok(transform),
+            Err(err) if config.bitrate > SAFE_BITRATE => {
+                eprintln!(
+                    "krak: the AAC encoder refuses {} kbit/s ({err}), using {}",
+                    config.bitrate / 1000,
+                    SAFE_BITRATE / 1000
+                );
+                // A refused type can leave the transform half set up: start from a new one.
+                let transform = create()?;
+                let safe = AacConfig {
+                    bitrate: SAFE_BITRATE,
+                    ..config
+                };
+                configure(&transform, safe).code(FAILED)?;
+                Ok(transform)
+            }
+            Err(err) => Err(MediaError {
+                code: FAILED,
+                hresult: err.code().0,
+            }),
+        }
+    }
+
     fn configure(transform: &IMFTransform, config: AacConfig) -> windows::core::Result<()> {
         let channels = u32::from(config.channels);
         // SAFETY: attribute setters on media types we own.
@@ -510,28 +543,28 @@ mod tests {
             (left, right, stream.frames.len(), decoded.len() / 2)
         }
 
-        /// Which bitrates the Windows AAC encoder takes (it documents 96..192 kbit/s).
+        /// Which bitrates the Windows AAC encoder takes (it documents 96..192 kbit/s), and that
+        /// every one the settings offer, or more, still encodes (at 192 kbit/s when refused).
         #[test]
         #[ignore = "needs the Media Foundation AAC encoder; run with --ignored"]
         fn probes_accepted_bitrates() {
             let _com = ComGuard::new();
             let _mf = MfGuard::new().expect("mf");
             let pcm = burst();
-            for kbps in [96, 128, 160, 192, 256, 320] {
+            let offered = crate::settings::AUDIO_BITRATES.iter().copied();
+            for kbps in [96].into_iter().chain(offered).chain([384, 1000]) {
                 let config = AacConfig {
                     sample_rate: 48_000,
                     channels: 2,
                     bitrate: kbps * 1000,
                 };
-                match encode(&pcm, config) {
-                    Ok(stream) => {
-                        let bytes: usize = stream.frames.iter().map(Vec::len).sum();
-                        println!(
-                            "{kbps} kbit/s: ok, {:.0} kbit/s measured",
-                            bytes as f64 * 8.0 / 2.0 / 1000.0
-                        );
-                    }
-                    Err(err) => println!("{kbps} kbit/s: refused ({err})"),
+                let stream = encode(&pcm, config).expect("every bitrate encodes");
+                let bytes: usize = stream.frames.iter().map(Vec::len).sum();
+                let measured = bytes as f64 * 8.0 / 2.0 / 1000.0;
+                println!("{kbps} kbit/s: {measured:.0} kbit/s measured");
+                assert!(measured < f64::from(kbps) * 1.05);
+                if kbps > 320 {
+                    assert!(measured < 200.0, "refused, encoded at 192 kbit/s");
                 }
             }
         }
