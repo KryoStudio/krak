@@ -481,6 +481,14 @@ struct Pipeline {
     frame: (u32, u32),
     /// Converter settings, to make another one for a new input size.
     rotation: D3D11_VIDEO_PROCESSOR_ROTATION,
+    /// The display's refresh rate (Hz), for `PhaseLock`.
+    refresh: f64,
+    /// `desktop` holds no image yet (new copy).
+    blank: bool,
+    /// `target` holds a converted picture.
+    converted: bool,
+    /// Screenshots read `desktop`.
+    screen_published: bool,
     ten_bit_input: bool,
     health: Health,
     adapt: Adapt,
@@ -563,6 +571,10 @@ impl Pipeline {
             input,
             frame,
             rotation,
+            refresh,
+            blank: true,
+            converted: false,
+            screen_published: false,
             ten_bit_input,
             desktop,
             converter,
@@ -610,8 +622,9 @@ impl Pipeline {
     fn run_ticks(&mut self, shared: &Shared, stats: &mut Stats) -> MediaResult<Exit> {
         let timer = Timer::new()?;
         let fps = i64::from(self.plan.resolved.fps);
-        let start = clock::now();
-        let due = |tick: i64| start + tick * TICKS_PER_SECOND / fps;
+        let mut start = clock::now();
+        let due = |start: i64, tick: i64| start + tick * TICKS_PER_SECOND / fps;
+        let mut phase = PhaseLock::new(self.refresh, fps);
         let half_frame = Duration::from_micros(u64::try_from(500_000 / fps).unwrap_or(0));
         let mut tick = 0i64;
         let mut packets = Vec::new();
@@ -619,7 +632,7 @@ impl Pipeline {
             if shared.stopping() {
                 return Ok(Exit::Stopped);
             }
-            timer.wait_until(due(tick));
+            timer.wait_until(due(start, tick));
             let now = clock::now();
             // Late (busy encoder, starved thread): skip to the latest tick that is due, on the
             // pace (every tick, or every second or fourth one).
@@ -629,7 +642,7 @@ impl Pipeline {
             stats.late += late;
             stats.ticks += 1;
             tick = current;
-            let pts = due(tick);
+            let pts = due(start, tick);
             tick += pace;
 
             if let Some(fence) = &mut self.fence {
@@ -642,7 +655,18 @@ impl Pipeline {
             }
             let polled = clock::now();
             self.timings.desktop.add(polled - now);
-            if stats.ticks == 1 {
+            if let Some(presented) = self.dup.as_mut().and_then(Duplication::take_presented) {
+                start += phase.correct(now, presented);
+            }
+            if self.blank {
+                // No desktop image yet in a new copy (pipeline start, display mode change):
+                // encode nothing rather than black; after a mode change the stream holds its
+                // last picture for that tick.
+                if !self.converted {
+                    self.publish(shared, &mut packets);
+                    continue;
+                }
+            } else if !self.screen_published {
                 // Our desktop copy holds an image now: screenshots can read it.
                 shared.set_screen(Some(Source::new(
                     &self.gpu,
@@ -650,11 +674,15 @@ impl Pipeline {
                     self.input,
                     self.display.rotation,
                 )));
+                self.screen_published = true;
             }
             match &mut self.encoder {
                 VideoEncoder::Nvenc(encoder) => {
-                    self.converter
-                        .convert(&self.gpu, &self.desktop, &self.target)?;
+                    if !self.blank {
+                        self.converter
+                            .convert(&self.gpu, &self.desktop, &self.target)?;
+                        self.converted = true;
+                    }
                     let converted = clock::now();
                     self.timings.convert.add(converted - polled);
                     encoder.encode(&self.target, pts, &mut packets)?;
@@ -687,8 +715,11 @@ impl Pipeline {
                         self.publish(shared, &mut packets);
                         continue;
                     }
-                    self.converter
-                        .convert(&self.gpu, &self.desktop, &self.target)?;
+                    if !self.blank {
+                        self.converter
+                            .convert(&self.gpu, &self.desktop, &self.target)?;
+                        self.converted = true;
+                    }
                     let frame = match &self.readback {
                         Some(readback) => {
                             readback.read(&self.gpu, &self.target, &mut self.cpu_frame)?;
@@ -1046,7 +1077,8 @@ impl Pipeline {
     fn poll_desktop(&mut self, shared: &Shared, now: i64) -> Option<Exit> {
         if let Some(dup) = &mut self.dup {
             match dup.acquire(&self.gpu, &self.desktop) {
-                Acquire::Updated | Acquire::Unchanged => {}
+                Acquire::Updated => self.blank = false,
+                Acquire::Unchanged => {}
                 // Another size: a new duplication says which, right away.
                 Acquire::Resized => {
                     self.dup = None;
@@ -1117,12 +1149,10 @@ impl Pipeline {
         self.desktop = desktop;
         self.input = input;
         self.dup = Some(dup);
-        shared.set_screen(Some(Source::new(
-            &self.gpu,
-            &self.desktop,
-            self.input,
-            self.display.rotation,
-        )));
+        // The new copy is black until the new duplication's first image: keep the last
+        // picture until then (`run_ticks`), and screenshots on the old copy.
+        self.blank = true;
+        self.screen_published = false;
         eprintln!(
             "krak: display mode {}x{}, kept in the {}x{} frame ({scaling:?}): the stream goes on",
             shown.0, shown.1, self.frame.0, self.frame.1
@@ -1415,6 +1445,62 @@ impl GpuFence {
     }
 }
 
+/// Keeps the ticks half a refresh away from the display's updates. The ticks run on the engine
+/// clock at the configured rate and the display on its own (119.98 Hz for "120"), so their
+/// phase drifts: while a tick falls close to the moment the display updates, timer and DWM
+/// jitter make it take the previous image one time and the next one the time after, a repeated
+/// frame then a skipped one, for seconds at a time (measured: 84 to 448 repeated frames in 30 s
+/// of a window changing every refresh). Each desktop update says when it was shown; the tick
+/// grid is nudged (at most 2 % of a refresh per tick, invisible in the timestamps) until it
+/// sits mid-way between updates, which also makes its average rate the display's. Only when
+/// the rate divides the refresh rate, and only while updates fall on the refresh grid (not a
+/// game presenting without vsync, or a variable refresh rate).
+struct PhaseLock {
+    /// One refresh, in engine ticks; 0 = not locking.
+    refresh: f64,
+    last: Option<i64>,
+    /// The last 16 updates: on the refresh grid or not (one bit each).
+    aligned: u16,
+}
+
+impl PhaseLock {
+    fn new(refresh_hz: f64, fps: i64) -> Self {
+        let ratio = refresh_hz / fps.max(1) as f64;
+        let divides = refresh_hz.is_finite()
+            && refresh_hz >= 1.0
+            && ratio >= 0.99
+            && (ratio - ratio.round()).abs() < 0.01;
+        Self {
+            refresh: if divides {
+                TICKS_PER_SECOND as f64 / refresh_hz
+            } else {
+                0.0
+            },
+            last: None,
+            aligned: 0,
+        }
+    }
+
+    /// The change to the tick grid's start, given that the image taken at `now` was shown at
+    /// `presented`.
+    fn correct(&mut self, now: i64, presented: i64) -> i64 {
+        let r = self.refresh;
+        if r <= 0.0 {
+            return 0;
+        }
+        if let Some(last) = self.last.replace(presented) {
+            let d = ((presented - last) as f64).rem_euclid(r);
+            self.aligned = (self.aligned << 1) | u16::from(d.min(r - d) < r / 10.0);
+        }
+        if self.aligned.count_ones() < 12 {
+            return 0;
+        }
+        // > 0: the tick comes late in the refresh, close to the next update.
+        let error = ((now - presented) as f64).rem_euclid(r) - r / 2.0;
+        -(error / 16.0).clamp(-r / 50.0, r / 50.0).round() as i64
+    }
+}
+
 /// High-resolution waitable timer (Windows 10 1803+; plain timer before that).
 struct Timer(HANDLE);
 
@@ -1664,6 +1750,48 @@ pub(super) mod tests {
         let mut a = Adapt::new(Tier::Strong);
         for _ in 0..4 {
             assert_eq!(next(&mut a, None, true), Decision::Stay);
+        }
+    }
+
+    /// 120 ticks per second against a 119.98 Hz display, starting with the ticks right on the
+    /// updates: the grid moves to mid-way within a second and stays there for a minute, never
+    /// moving more than 2 % of a refresh per tick. Updates off the refresh grid (a game
+    /// presenting without vsync) and rates that do not divide the refresh rate leave it alone.
+    #[test]
+    fn locks_the_ticks_between_the_display_updates() {
+        let fps = 120;
+        let refresh_hz = 119.98;
+        let r = TICKS_PER_SECOND as f64 / refresh_hz;
+        let mut lock = PhaseLock::new(refresh_hz, fps);
+        let mut start = 0i64;
+        let mut worst_late = 0.0f64;
+        for tick in 0..(60 * fps) {
+            let now = start + tick * TICKS_PER_SECOND / fps;
+            // The last update shown at or before `now`.
+            let presented = ((now as f64 / r).floor() * r) as i64;
+            let shift = lock.correct(now, presented);
+            assert!(shift.abs() as f64 <= r / 50.0 + 1.0);
+            start += shift;
+            if tick > fps {
+                let phase = ((now - presented) as f64).rem_euclid(r);
+                worst_late = worst_late.max((phase - r / 2.0).abs());
+            }
+        }
+        assert!(worst_late < r / 8.0, "phase error {worst_late} of {r}");
+
+        // Updates at random times: no correction.
+        let mut lock = PhaseLock::new(refresh_hz, fps);
+        let mut x = 12345u64;
+        for tick in 0..1000i64 {
+            x = x.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let now = tick * TICKS_PER_SECOND / fps;
+            let presented = now - (x >> 40) as i64 % 80_000;
+            assert_eq!(lock.correct(now, presented), 0);
+        }
+        // 60 fps on 144 Hz: not a divisor.
+        let mut lock = PhaseLock::new(144.0, 60);
+        for tick in 0..100i64 {
+            assert_eq!(lock.correct(tick * 166_666, tick * 166_666 - 3_000), 0);
         }
     }
 

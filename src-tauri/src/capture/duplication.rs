@@ -35,6 +35,8 @@ pub struct Duplication {
     in_system_memory: bool,
     /// The first frame after creation always carries the full image.
     fresh: bool,
+    /// When the last desktop update we took was shown (engine time), until taken.
+    presented: Option<i64>,
 }
 
 impl Duplication {
@@ -66,7 +68,14 @@ impl Duplication {
             },
             in_system_memory: desc.DesktopImageInSystemMemory.as_bool(),
             fresh: true,
+            presented: None,
         })
+    }
+
+    /// When the desktop update the last `acquire` took was shown on the display (engine time),
+    /// once.
+    pub fn take_presented(&mut self) -> Option<i64> {
+        self.presented.take()
     }
 
     /// Size of the duplicated (unrotated) desktop image.
@@ -91,6 +100,9 @@ impl Duplication {
             Err(err) => return Acquire::Lost(err.code()),
         }
         let changed = info.LastPresentTime != 0 || std::mem::take(&mut self.fresh);
+        if info.LastPresentTime != 0 {
+            self.presented = Some(super::clock::from_qpc(info.LastPresentTime));
+        }
         let result = if changed {
             self.copy(gpu, resource.as_ref(), target)
         } else {
