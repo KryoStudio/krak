@@ -7,6 +7,11 @@
 //! larger gaps are filled with silence (loopback delivers nothing at all while the PC is
 //! silent) and overlaps are dropped. Storage is a list of shared fixed-size chunks so snapshots
 //! are cheap.
+//!
+//! The device's clock is not the QPC: 100 ppm apart (common) is 0.36 s an hour, so a track of
+//! continuous sound slowly runs ahead of or behind its timestamps. The smoothed difference is
+//! taken back one frame per packet (a frame repeated or dropped, inaudible) once it passes
+//! 2 ms, long before the tolerance would make it a 20 ms jump.
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -19,6 +24,11 @@ pub const CHANNELS: usize = 2;
 const CHUNK_FRAMES: usize = 24_000;
 /// Drift tolerated before re-syncing on the reported position (20 ms).
 pub const TOLERANCE: i64 = 960;
+/// Smoothed drift (frames) past which packets are nudged back one frame each (2 ms).
+const SLEW_THRESHOLD: f64 = 96.0;
+/// Weight of each packet's drift in the smoothed one: about 32 packets (a third of a second),
+/// so timestamp jitter does not move it.
+const SLEW_SMOOTHING: f64 = 1.0 / 32.0;
 
 /// Frame position of an engine clock time (100 ns).
 pub fn position(time: i64) -> i64 {
@@ -32,6 +42,9 @@ pub struct AudioTimeline {
     current: Vec<i16>,
     /// Gaps larger than this restart the track instead of filling it (e.g. after sleep).
     max_gap: i64,
+    /// Smoothed difference between where continuous packets belong and where they land
+    /// (frames, positive: the track runs ahead of its timestamps).
+    drift: f64,
 }
 
 impl AudioTimeline {
@@ -42,6 +55,7 @@ impl AudioTimeline {
             chunks: VecDeque::new(),
             current: Vec::with_capacity(CHUNK_FRAMES * CHANNELS),
             max_gap,
+            drift: 0.0,
         }
     }
 
@@ -72,8 +86,12 @@ impl AudioTimeline {
         let end = self.end();
         let drift = pos - end;
         if drift.abs() <= TOLERANCE && !discontinuity {
-            self.append(samples);
-        } else if drift > 0 {
+            self.continue_with(drift, samples);
+            return;
+        }
+        // Re-synced: whatever drift there was is gone.
+        self.drift = 0.0;
+        if drift > 0 {
             if drift > self.max_gap {
                 self.reset(pos);
             } else {
@@ -84,6 +102,35 @@ impl AudioTimeline {
             // Overlap: keep what we have, drop the part of the packet already covered.
             let skip = usize::try_from(-drift).unwrap_or(usize::MAX).min(frames);
             self.append(&samples[skip * CHANNELS..]);
+        }
+    }
+
+    /// Writes a packet whose timestamp the driver says is wrong (WASAPI's timestamp error):
+    /// it continues the track as it is, unless the track is far from `estimate` (where the
+    /// clock puts the packet), which then counts as its position.
+    pub fn write_unstamped(&mut self, estimate: i64, samples: &[i16]) {
+        if (estimate - self.end()).abs() <= TOLERANCE {
+            let frames = samples.len() / CHANNELS;
+            self.append(&samples[..frames * CHANNELS]);
+        } else {
+            self.write(estimate, samples, false);
+        }
+    }
+
+    /// Appends a packet that continues the track, `drift` frames from where it belongs (module
+    /// docs): past the threshold, one frame is repeated (the track is late) or dropped (ahead).
+    fn continue_with(&mut self, drift: i64, samples: &[i16]) {
+        self.drift += (drift as f64 - self.drift) * SLEW_SMOOTHING;
+        let frames = samples.len() / CHANNELS;
+        if self.drift > SLEW_THRESHOLD && frames > 0 {
+            self.append(samples);
+            self.append(&samples[samples.len() - CHANNELS..]);
+            self.drift -= 1.0;
+        } else if self.drift < -SLEW_THRESHOLD && frames > 1 {
+            self.append(&samples[..samples.len() - CHANNELS]);
+            self.drift += 1.0;
+        } else {
+            self.append(samples);
         }
     }
 
@@ -267,6 +314,82 @@ mod tests {
         t2.write(0, &frames(1, 100), false);
         t2.write(300, &frames(2, 100), false);
         assert_eq!(t2.end(), 200); // within tolerance: appended
+    }
+
+    /// A device whose clock runs `ppm` apart from the QPC for an hour, 10 ms packets with up to
+    /// 1 ms of timestamp jitter: returns the largest correction made at once (frames) and the
+    /// largest distance between a packet's timestamp and where it landed, once settled.
+    fn simulate_drift(ppm: f64) -> (i64, i64) {
+        const PACKET: usize = 480;
+        let mut t = AudioTimeline::new(0, 48_000 * 60);
+        let samples = frames(1, PACKET);
+        let mut seed = 12_345u32;
+        let (mut worst_step, mut worst_offset) = (0, 0);
+        // Packets carry `PACKET` device frames, which last `PACKET / (1 + ppm)` QPC frames.
+        let qpc_frames = PACKET as f64 / (1.0 + ppm * 1e-6);
+        for n in 0..360_000u32 {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            let jitter = i64::from(seed >> 16) % 97 - 48;
+            let pos = (f64::from(n) * qpc_frames).round() as i64 + jitter;
+            let before = t.end();
+            t.write(pos, &samples, false);
+            worst_step = worst_step.max((t.end() - before - PACKET as i64).abs());
+            if n > 100 {
+                worst_offset = worst_offset.max((pos - jitter - before).abs());
+            }
+            if n % 1000 == 0 {
+                t.trim(t.end() - 48_000 * 10);
+            }
+        }
+        (worst_step, worst_offset)
+    }
+
+    #[test]
+    fn follows_a_drifting_device_clock_without_jumps() {
+        for ppm in [100.0, -100.0, 300.0] {
+            let (step, offset) = simulate_drift(ppm);
+            // Never more than a frame at once (it used to jump 20 ms every few minutes)...
+            assert!(step <= 1, "{ppm} ppm: {step} frames at once");
+            // ...and the track stays within a few ms of the clock (0.36 s an hour without).
+            assert!(offset <= 144, "{ppm} ppm: {offset} frames off");
+        }
+        // Jitter alone moves nothing.
+        let (step, _) = simulate_drift(0.0);
+        assert_eq!(step, 0);
+    }
+
+    #[test]
+    fn real_jumps_still_resync_at_once() {
+        let mut t = AudioTimeline::new(0, 48_000 * 60);
+        for n in 0..100 {
+            t.write(n * 480 + 300, &frames(1, 480), false);
+        }
+        // 300 frames late, inside the tolerance: taken back one frame per packet, not at once.
+        assert!(t.end() > 100 * 480 + 50 && t.end() < 100 * 480 + 200);
+        let end = t.end();
+        // 50 ms ahead: silence, then the packet where it belongs.
+        t.write(end + 2400, &frames(2, 480), false);
+        assert_eq!(t.end(), end + 2400 + 480);
+        // A discontinuity inside the tolerance re-syncs at once too.
+        t.write(t.end() + 300, &frames(3, 480), true);
+        assert_eq!(t.end(), end + 2400 + 480 + 300 + 480);
+    }
+
+    #[test]
+    fn a_packet_without_a_valid_timestamp_continues_the_track() {
+        let mut t = AudioTimeline::new(0, 48_000 * 60);
+        t.write(0, &frames(1, 480), false);
+        // Its guessed position is 15 ms off: appended right after, no silence, no overlap.
+        t.write_unstamped(480 + 720, &frames(2, 480));
+        assert_eq!(t.end(), 960);
+        t.write_unstamped(960 - 720, &frames(3, 480));
+        assert_eq!(t.end(), 1440);
+        let all = left(&t.snapshot().read(0, 1440));
+        assert_eq!((all[479], all[480], all[960]), (1, 2, 3));
+        // Far from where the clock puts it (after silence): placed there.
+        t.write_unstamped(10_000, &frames(4, 480));
+        assert_eq!(t.end(), 10_480);
+        assert_eq!(left(&t.snapshot().read(9_999, 2)), [0, 4]);
     }
 
     #[test]

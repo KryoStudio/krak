@@ -1,5 +1,11 @@
 //! Turning a snapshot of the buffers into a clip file.
 //!
+//! A clip ends with the picture shown at the press. The encoder hands pictures over a few
+//! hundred ms after their capture (lookahead, B-frames) and the audio threads add a packet
+//! every 10 ms, so the save first waits (`collect`) for the picture of the press and the sound
+//! up to it: for the video, as late as the newest picture was at the press plus a quarter of a
+//! second; for the audio, half a second past the clip's end; never longer.
+//!
 //! Tracks: with the microphone on, "Mix" (game + mic, clipped, the main track), "Game" and
 //! "Microphone" (mono), passed to the muxer in that order (it writes the main track last, see
 //! `mp4_writer`); otherwise a single "Game" track. Audio covers exactly the video range
@@ -8,20 +14,30 @@
 
 use std::io::ErrorKind;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use super::naming::{self, Stamp};
-use super::ring::StreamParams;
-use super::timeline::{self, AudioSnapshot, SAMPLE_RATE};
-use super::{EMPTY, ENCODE_FAILED, WRITE_FAILED, pcm};
+use super::ring::{Pending, StreamParams};
+use super::timeline::{self, AudioSnapshot, AudioTimeline, SAMPLE_RATE};
+use super::{EMPTY, ENCODE_FAILED, Shared, WRITE_FAILED, clock, pcm};
 use crate::media::aac::{self, AacConfig, AacStream};
 use crate::media::codec::VideoPacket;
 use crate::media::mp4_writer::{self, AudioTrack, Colour, Options, VideoSample, VideoTrack};
 use crate::media::{ComGuard, MfGuard, TICKS_PER_SECOND};
+use crate::state::lock;
 
 pub(super) const MIC_BITRATE: u32 = 96_000;
 /// Name collisions (another clip in the same second) retried before giving up.
 pub(super) const MAX_ATTEMPTS: u32 = 20;
+/// The encoder's delay never counts for more than this (100 ns): a stalled encoder.
+const MAX_ENCODER_DELAY: i64 = 2 * TICKS_PER_SECOND;
+/// Waited for the picture of the press beyond the encoder's delay: its B-frames, a late tick.
+const VIDEO_MARGIN: i64 = TICKS_PER_SECOND / 4;
+/// Waited at most past the clip's end for its sound (the audio threads extend the timelines
+/// with silence 100 ms behind the clock when nothing arrives).
+const AUDIO_WAIT: i64 = TICKS_PER_SECOND / 2;
+const POLL: Duration = Duration::from_millis(10);
 
 /// Where and under which name to save.
 #[derive(Debug, Clone)]
@@ -43,6 +59,8 @@ pub(super) struct Snapshot {
     pub mic: Option<AudioSnapshot>,
     /// AAC bitrate of the stereo tracks (Mix, Game), bit/s.
     pub audio_bitrate: u32,
+    /// The longest clip there can be (100 ns): the replay window and the audio margin.
+    pub max_span: i64,
 }
 
 struct Track {
@@ -84,6 +102,68 @@ fn tracks(
         }
         None => vec![stereo("Game", game)],
     }
+}
+
+/// What the save of `pending` writes, once the encoder has handed over the picture shown at the
+/// press and the audio threads have captured the sound up to the clip's end, or once waiting
+/// longer would not help (module docs). Runs at normal priority: the audio timelines move on
+/// meanwhile, and a starved wait could find the clip's start gone.
+pub(super) fn collect(
+    shared: &Shared,
+    params: Arc<StreamParams>,
+    mut pending: Pending,
+) -> Snapshot {
+    let frame = TICKS_PER_SECOND / i64::from(params.fps.max(1));
+    let until = pending.until();
+    // The picture of the press comes out about as late as the newest one was at the press.
+    let delay = (until - pending.newest().unwrap_or(until)).clamp(0, MAX_ENCODER_DELAY);
+    let deadline = until + delay + VIDEO_MARGIN;
+    loop {
+        pending.catch_up(&lock(&shared.video));
+        if pending.complete(frame) || clock::now() >= deadline || !shared.sleep(POLL) {
+            break;
+        }
+    }
+    let video = pending.finish(frame);
+    let end = video.iter().map(|p| p.pts + frame).max().unwrap_or(until);
+    let target = timeline::position(end);
+    let captured = |track: &Mutex<AudioTimeline>| lock(track).end() >= target;
+    while !(captured(&shared.game_audio) && shared.mic_audio.as_ref().is_none_or(captured))
+        && clock::now() < end + AUDIO_WAIT
+        && shared.sleep(POLL)
+    {}
+    Snapshot {
+        params,
+        video,
+        game: lock(&shared.game_audio).snapshot(),
+        mic: shared.mic_audio.as_ref().map(|m| lock(m).snapshot()),
+        audio_bitrate: shared.config.audio_bitrate,
+        max_span: shared.max_clip(),
+    }
+}
+
+/// The clip's packets from the first keyframe that keeps it within `max_span` (100 ns from the
+/// first decode time to the end of the last picture). The ring never gives more than its window
+/// and a GOP; this is the backstop that keeps a clip from ever spanning hours (and its audio
+/// from needing hours of PCM in memory).
+fn bounded(video: &[Arc<VideoPacket>], max_span: i64, frame: i64) -> &[Arc<VideoPacket>] {
+    let Some(end) = video.iter().map(|p| p.pts + frame).max() else {
+        return video;
+    };
+    let mut start = 0;
+    while end - video[start].dts > max_span
+        && let Some(next) = video[start + 1..].iter().position(|p| p.keyframe)
+    {
+        start += next + 1;
+    }
+    &video[start..]
+}
+
+/// Audio frames for video from `origin` to `end` (100 ns), never more than `max_span` holds
+/// (a GOP that cannot be cut keeps its video, the audio stops there).
+fn audio_frames(origin: i64, end: i64, max_span: i64) -> usize {
+    let frames = timeline::position(end) - timeline::position(origin);
+    usize::try_from(frames.min(timeline::position(max_span))).unwrap_or(0)
 }
 
 /// Lowers the calling thread's CPU, disk and memory priorities (Windows' background mode):
@@ -137,8 +217,7 @@ pub(super) fn write_clip(
     let video = VideoTrack {
         config: &snapshot.params.config,
         colour: Some(Colour::BT709),
-        samples: snapshot
-            .video
+        samples: bounded(&snapshot.video, snapshot.max_span, frame)
             .iter()
             .map(|p| VideoSample {
                 data: &p.data,
@@ -151,9 +230,7 @@ pub(super) fn write_clip(
     };
     // Audio from the first decode time to the end of the last picture (module docs).
     let origin = video.origin();
-    let frames =
-        usize::try_from(timeline::position(video.presentation_end()) - timeline::position(origin))
-            .unwrap_or(0);
+    let frames = audio_frames(origin, video.presentation_end(), snapshot.max_span);
     let tracks = tracks(
         &snapshot.game,
         snapshot.mic.as_ref(),
@@ -206,6 +283,199 @@ pub(super) fn write_clip(
 mod tests {
     use super::*;
     use crate::capture::timeline::AudioTimeline;
+
+    /// A packet presented at `pts` seconds (decoded at the same time), a keyframe or not.
+    fn at(seconds: f64, keyframe: bool) -> Arc<VideoPacket> {
+        let t = (seconds * TICKS_PER_SECOND as f64) as i64;
+        Arc::new(VideoPacket {
+            data: vec![0; 10],
+            pts: t,
+            dts: t,
+            keyframe,
+            clean_end: true,
+        })
+    }
+
+    /// Engine buffers with nothing running: the tests play the video and audio threads.
+    fn engine(buffer_seconds: u32) -> Arc<Shared> {
+        use crate::capture::{EngineConfig, VideoSettings};
+        use crate::settings::{CodecChoice, Quality, Resolution, ScreenFit};
+        struct Quiet;
+        impl crate::capture::EngineEvents for Quiet {
+            fn status_changed(&self, _: &crate::capture::CaptureStatus) {}
+            fn saved(&self, _: &std::path::Path) {}
+            fn save_failed(&self, _: &'static str) {}
+        }
+        let config = EngineConfig {
+            video: VideoSettings {
+                quality: Quality::High,
+                codec: CodecChoice::Auto,
+                resolution: Resolution::Native,
+                fps: 60,
+                bitrate: 40,
+                ten_bit: false,
+            },
+            screen_fit: ScreenFit::Screen,
+            audio_bitrate: 192_000,
+            buffer_seconds,
+            microphone: false,
+            microphone_device: None,
+        };
+        Arc::new(Shared::new(config, Arc::new(Quiet)))
+    }
+
+    const FPS: u32 = 60;
+
+    /// Picture `k` of a 60 fps stream without B-frames, a keyframe every second.
+    fn picture(base: i64, k: i64) -> Arc<VideoPacket> {
+        let t = base + k * TICKS_PER_SECOND / i64::from(FPS);
+        Arc::new(VideoPacket {
+            data: vec![0; 10],
+            pts: t,
+            dts: t,
+            keyframe: k % i64::from(FPS) == 0,
+            clean_end: true,
+        })
+    }
+
+    fn params() -> Arc<StreamParams> {
+        Arc::new(StreamParams {
+            config: crate::media::codec::CodecConfig::Avc {
+                sps: vec![0x67, 1],
+                pps: vec![0x68, 2],
+            },
+            width: 1280,
+            height: 720,
+            fps: FPS,
+        })
+    }
+
+    /// Plays the video thread (pictures captured at their pts, handed over `delay` later) and
+    /// the loopback thread (sound `level`, 10 ms behind the clock) until `stop`.
+    fn capture(shared: &Shared, base: i64, delay: i64, stop: &std::sync::atomic::AtomicBool) {
+        use std::sync::atomic::Ordering;
+        let window = shared.window();
+        let mut k = 0;
+        while !stop.load(Ordering::Relaxed) {
+            let now = clock::now();
+            {
+                let mut ring = lock(&shared.video);
+                while picture(base, k).pts + delay <= now {
+                    ring.push(picture(base, k), window, usize::MAX);
+                    k += 1;
+                }
+            }
+            {
+                let mut game = lock(&shared.game_audio);
+                let from = game.end();
+                let to = timeline::position(now) - 480;
+                if to > from {
+                    let frames = usize::try_from(to - from).unwrap_or(0);
+                    game.write(from, &vec![7; frames * 2], false);
+                }
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    #[test]
+    fn a_save_waits_for_the_picture_and_the_sound_of_the_press() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let shared = engine(10);
+        let frame = TICKS_PER_SECOND / i64::from(FPS);
+        // The encoder hands pictures over 150 ms after their capture.
+        let delay = TICKS_PER_SECOND * 15 / 100;
+        let base = clock::now() - 2 * TICKS_PER_SECOND;
+        let stop = AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            let capturing = scope.spawn(|| capture(&shared, base, delay, &stop));
+            std::thread::sleep(Duration::from_millis(300));
+            let press = clock::now();
+            let pending = lock(&shared.video)
+                .pending(press, shared.window())
+                .expect("a clip");
+            assert!(
+                pending
+                    .newest()
+                    .is_some_and(|t| t < press - delay + 2 * frame)
+            );
+            let snapshot = collect(&shared, params(), pending);
+            let waited = clock::now() - press;
+            stop.store(true, Ordering::Relaxed);
+            capturing.join().expect("capture");
+
+            // The picture shown at the press is in, and nothing much after it.
+            let last = snapshot.video.iter().map(|p| p.pts).max().unwrap_or(0);
+            assert!(last > press - frame, "{} ms short", (press - last) / 10_000);
+            assert!(last <= press + frame);
+            assert_eq!(snapshot.video[0].pts, base, "from the first keyframe");
+            assert!(waited >= delay - frame && waited < delay + TICKS_PER_SECOND / 4);
+            // The sound up to the end of that picture was captured, not padded with silence.
+            let end = timeline::position(last + frame);
+            assert!(snapshot.game.read(end - 48, 48).iter().all(|&s| s == 7));
+            assert_eq!(snapshot.max_span, 18 * TICKS_PER_SECOND);
+        });
+    }
+
+    #[test]
+    fn a_save_does_not_wait_for_a_stalled_encoder_or_a_stopping_engine() {
+        let shared = engine(10);
+        // Pictures up to 100 ms before the press, and then nothing.
+        let press = clock::now();
+        let base = press - 2 * TICKS_PER_SECOND;
+        {
+            let mut ring = lock(&shared.video);
+            for k in 0..=114 {
+                ring.push(picture(base, k), shared.window(), usize::MAX);
+            }
+        }
+        let pending = lock(&shared.video).pending(press, shared.window());
+        let snapshot = collect(&shared, params(), pending.expect("a clip"));
+        let waited = clock::now() - press;
+        // The encoder's 100 ms and the quarter second margin, then the audio's half second
+        // past the clip's end (no audio thread here).
+        assert!(waited < TICKS_PER_SECOND * 3 / 4, "{} ms", waited / 10_000);
+        assert_eq!(snapshot.video.len(), 115);
+        assert_eq!(snapshot.video[114].pts, picture(base, 114).pts);
+
+        let pending = lock(&shared.video).pending(clock::now(), shared.window());
+        shared
+            .stop
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let started = clock::now();
+        let snapshot = collect(&shared, params(), pending.expect("a clip"));
+        assert!(clock::now() - started < TICKS_PER_SECOND / 10);
+        assert_eq!(snapshot.video.len(), 115);
+    }
+
+    #[test]
+    fn never_writes_a_clip_longer_than_the_buffer() {
+        const S: i64 = TICKS_PER_SECOND;
+        let frame = S / 10;
+        // A GOP from eight hours ago, then two seconds of video now (two GOPs).
+        let hours = 8.0 * 3600.0;
+        let mut video = vec![at(0.0, true), at(0.1, false)];
+        for i in 0..20 {
+            video.push(at(hours + f64::from(i) / 10.0, i % 10 == 0));
+        }
+        let kept = bounded(&video, 40 * S, frame);
+        assert_eq!(kept.len(), 20);
+        assert_eq!(kept[0].pts, (hours * S as f64) as i64);
+        // Whole GOPs only: 1.5 s allowed keeps the last one.
+        let kept = bounded(&video, 15 * S / 10, frame);
+        assert_eq!((kept.len(), kept[0].pts), (10, video[12].pts));
+        assert!(kept[0].keyframe);
+        // Within the limit: everything.
+        assert_eq!(bounded(&video[2..], 40 * S, frame).len(), 20);
+        assert!(bounded(&[], S, frame).is_empty());
+        // One GOP longer than the limit cannot be cut: its audio stops at the limit.
+        let long = [at(0.0, true), at(hours, false)];
+        assert_eq!(bounded(&long, 40 * S, frame).len(), 2);
+        let end = long[1].pts + frame;
+        assert_eq!(audio_frames(0, end, 40 * S), 40 * 48_000);
+        assert_eq!(audio_frames(S, 2 * S, 40 * S), 48_000);
+        assert_eq!(audio_frames(2 * S, S, 40 * S), 0);
+    }
 
     #[test]
     fn builds_tracks_for_the_video_range() {

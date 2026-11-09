@@ -14,7 +14,8 @@ use serde::Serialize;
 use windows::Win32::Devices::FunctionDiscovery::PKEY_Device_FriendlyName;
 use windows::Win32::Foundation::ERROR_NOT_FOUND;
 use windows::Win32::Media::Audio::{
-    AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY, AUDCLNT_BUFFERFLAGS_SILENT, AUDCLNT_SHAREMODE_SHARED,
+    AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY, AUDCLNT_BUFFERFLAGS_SILENT,
+    AUDCLNT_BUFFERFLAGS_TIMESTAMP_ERROR, AUDCLNT_SHAREMODE_SHARED,
     AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM, AUDCLNT_STREAMFLAGS_LOOPBACK,
     AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY, DEVICE_STATE_ACTIVE, EDataFlow, IAudioCaptureClient,
     IAudioClient, IMMDevice, IMMDeviceEnumerator, MMDeviceEnumerator, WAVE_FORMAT_PCM,
@@ -64,9 +65,17 @@ impl Source {
     }
 }
 
-/// A packet read from WASAPI, already converted: (timeline position, stereo samples,
-/// discontinuity).
-type Packet = (i64, Vec<i16>, bool);
+/// A packet read from WASAPI, already converted.
+struct Packet {
+    /// Timeline position of its first frame.
+    position: i64,
+    /// Interleaved stereo.
+    samples: Vec<i16>,
+    /// WASAPI says it does not follow the previous one.
+    discontinuity: bool,
+    /// The driver flagged its timestamp as wrong: `position` is only the clock's guess.
+    unstamped: bool,
+}
 
 pub(super) fn run(source: Source, shared: &Shared) {
     let _com = ComGuard::new();
@@ -124,8 +133,12 @@ pub(super) fn run(source: Source, shared: &Shared) {
         }
         {
             let mut track = lock(timeline);
-            for (pos, samples, discontinuity) in packets.drain(..) {
-                track.write(pos, &samples, discontinuity);
+            for packet in packets.drain(..) {
+                if packet.unstamped && !packet.discontinuity {
+                    track.write_unstamped(packet.position, &packet.samples);
+                } else {
+                    track.write(packet.position, &packet.samples, packet.discontinuity);
+                }
             }
             track.fill_until(timeline::position(clock::now()) - SILENCE_SLACK);
             let keep_from = track.end() - shared.audio_keep();
@@ -280,15 +293,22 @@ impl Stream {
                     }
                 }
                 self.capture.ReleaseBuffer(frames)?;
-                let discontinuity =
-                    flags & AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY.0.cast_unsigned() != 0;
-                out.push((self.position(qpc, frames), samples, discontinuity));
+                let flag = |f: i32| flags & f.cast_unsigned() != 0;
+                // A timestamp the driver flags as wrong is not trusted: it would move the
+                // track by whatever the driver got wrong.
+                let unstamped = flag(AUDCLNT_BUFFERFLAGS_TIMESTAMP_ERROR.0);
+                out.push(Packet {
+                    position: self.position(if unstamped { 0 } else { qpc }, frames),
+                    samples,
+                    discontinuity: flag(AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY.0),
+                    unstamped,
+                });
             }
         }
     }
 
     /// Timeline position of a packet's first frame from its QPC time; if a driver reports
-    /// nothing usable, assume the packet just ended.
+    /// nothing usable (or `qpc` is 0), assume the packet just ended.
     fn position(&self, qpc: u64, frames: u32) -> i64 {
         let now = clock::now();
         let duration = i64::from(frames) * TICKS_PER_SECOND / i64::from(self.rate.max(1));
@@ -504,17 +524,19 @@ mod tests {
             let mut lags = Vec::new();
             let mut sizes = Vec::new();
             let mut flags = 0;
+            let mut unstamped = 0;
             let started = Instant::now();
             let mut packets = Vec::new();
             while started.elapsed() < Duration::from_secs(3) {
                 stream.read(&mut packets).expect("read");
                 let now = timeline::position(clock::now());
-                for (pos, samples, discontinuity) in packets.drain(..) {
-                    let frames = (samples.len() / CHANNELS) as i64;
+                for packet in packets.drain(..) {
+                    let frames = (packet.samples.len() / CHANNELS) as i64;
                     // How long ago the packet's last frame was captured, in ms.
-                    lags.push((now - (pos + frames)) as f64 / 48.0);
+                    lags.push((now - (packet.position + frames)) as f64 / 48.0);
                     sizes.push(frames);
-                    flags += i32::from(discontinuity);
+                    flags += i32::from(packet.discontinuity);
+                    unstamped += i32::from(packet.unstamped);
                 }
                 std::thread::sleep(POLL);
             }
@@ -525,7 +547,7 @@ mod tests {
             lags.sort_by(f64::total_cmp);
             sizes.sort_unstable();
             println!(
-                "  {} packets, frames min {} max {}, end-of-packet lag ms min {:.1} median {:.1} max {:.1}, discontinuities {flags}",
+                "  {} packets, frames min {} max {}, end-of-packet lag ms min {:.1} median {:.1} max {:.1}, discontinuities {flags}, timestamp errors {unstamped}",
                 lags.len(),
                 sizes[0],
                 sizes[sizes.len() - 1],

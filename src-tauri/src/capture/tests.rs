@@ -979,6 +979,7 @@ fn save_keeps_av_sync_with_b_frames() {
             game: game.snapshot(),
             mic: None,
             audio_bitrate: 192_000,
+            max_span: 60 * TICKS_PER_SECOND,
         };
         let request = SaveRequest {
             clips_dir: dir.clone(),
