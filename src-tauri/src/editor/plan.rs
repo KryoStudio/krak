@@ -156,15 +156,8 @@ pub fn discord_target(
     if video < MIN_VIDEO_BITRATE {
         return Err(TOO_LONG);
     }
-    let ceiling = ceiling
-        .filter(|c| c.is_finite() && *c > 0.0)
-        .map_or(MAX_VIDEO_BITRATE, |c| {
-            c.clamp(MIN_VIDEO_BITRATE, MAX_VIDEO_BITRATE)
-        });
-    // The retry's factor applies to the ceiling too: it must come out smaller.
-    let video = video
-        .min(ceiling * factor.min(1.0))
-        .clamp(MIN_VIDEO_BITRATE, MAX_VIDEO_BITRATE);
+    // Size and frame rate follow what the limit allows: a source that needs fewer bits (the
+    // ceiling below) keeps its picture at those bits rather than shrinking to fit them.
     // A 30 fps clip keeps 1080p from 2.5 Mbit/s, like a 60 fps one from 5.
     let rate_share = f64::from(output_fps(source_fps, 60)) / 60.0;
     let short_side = LADDER
@@ -177,11 +170,20 @@ pub fn discord_target(
     } else {
         60
     };
+    let ceiling = ceiling
+        .filter(|c| c.is_finite() && *c > 0.0)
+        .map_or(MAX_VIDEO_BITRATE, |c| {
+            c.clamp(MIN_VIDEO_BITRATE, MAX_VIDEO_BITRATE)
+        });
+    // The retry's factor applies to the ceiling too: it must come out smaller.
+    let bitrate = video
+        .min(ceiling * factor.min(1.0))
+        .clamp(MIN_VIDEO_BITRATE, MAX_VIDEO_BITRATE);
     Ok(VideoTarget {
         width,
         height,
         fps: output_fps(source_fps, cap),
-        bitrate: video as u32,
+        bitrate: bitrate as u32,
     })
 }
 
@@ -720,6 +722,16 @@ mod tests {
         // A source of almost nothing still gets a watchable minimum; nonsense is ignored.
         let t = discord_target((1920, 1080), 60.0, 30.0, 20 * mb, 1.0, Some(10_000.0)).unwrap();
         assert_eq!(t.bitrate, MIN_VIDEO_BITRATE as u32);
+        // ...at the size and rate the limit allows, as without a ceiling: a light source was
+        // shrunk to 480p before.
+        let free = discord_target((1920, 1080), 60.0, 30.0, 20 * mb, 1.0, None).unwrap();
+        assert_eq!(
+            (t.width, t.height, t.fps),
+            (free.width, free.height, free.fps)
+        );
+        assert_eq!((t.width, t.height), (1280, 720));
+        let big = discord_target((1920, 1080), 60.0, 30.0, 500 * mb, 1.0, Some(10_000.0));
+        assert_eq!(big.map(|t| (t.width, t.fps)), Ok((1920, 60)));
         let t = discord_target((1920, 1080), 60.0, 1.0, 500 * mb, 1.0, Some(f64::NAN)).unwrap();
         assert_eq!(t.bitrate, 50_000_000);
     }
