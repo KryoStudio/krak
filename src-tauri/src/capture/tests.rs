@@ -431,6 +431,145 @@ fn engine_end_to_end_software() {
     run("Software", video(Quality::High, 60), false, true);
 }
 
+/// The other process of `engine_under_gpu_load`: does nothing unless `KRYO_GPU_LOAD` (GPU
+/// milliseconds per game frame) is set, then loads the GPU like a heavy game until killed.
+#[test]
+#[ignore = "helper process of engine_under_gpu_load"]
+fn gpu_load_helper() {
+    let Some(frame_ms) = std::env::var("KRYO_GPU_LOAD")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+    else {
+        return;
+    };
+    let high = std::env::var("KRYO_LOAD_HIGH").is_ok_and(|v| v == "1");
+    let vram = std::env::var("KRYO_LOAD_VRAM_MB")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    super::load::run(frame_ms, high, vram);
+}
+
+/// How smooth a clip is: its frames' spacing, in ticks of the rate it says it has.
+#[derive(Debug)]
+struct Smoothness {
+    frames: usize,
+    seconds: f64,
+    /// Frames per second actually in the clip.
+    fps: f64,
+    /// Gaps longer than one and a half frames.
+    irregular: usize,
+    worst_ms: f64,
+}
+
+fn smoothness(path: &Path, ten_bit: bool, fps: u32) -> Smoothness {
+    let frames = testing::decode_video_timestamps(path, ten_bit);
+    let tick = TICKS_PER_SECOND / i64::from(fps.max(1));
+    let gaps: Vec<i64> = frames.windows(2).map(|w| w[1] - w[0]).collect();
+    let span = frames.last().copied().unwrap_or(0) - frames.first().copied().unwrap_or(0);
+    let seconds = span as f64 / 1e7;
+    Smoothness {
+        frames: frames.len(),
+        seconds,
+        fps: if seconds > 0.0 {
+            (frames.len() - 1) as f64 / seconds
+        } else {
+            0.0
+        },
+        irregular: gaps.iter().filter(|&&g| g * 2 > tick * 3).count(),
+        worst_ms: gaps.iter().copied().max().unwrap_or(0) as f64 / 1e4,
+    }
+}
+
+/// Records while another process loads the GPU like a heavy game (`load`), then measures the
+/// saved clip. Tunables: `KRYO_LOAD_MS` (GPU work per game frame, default 12),
+/// `KRYO_LOAD_HIGH=1` (the game gets the high GPU class, like a foreground game),
+/// `KRYO_LOAD_QUALITY` (standard / high / premium, default premium), `KRYO_LOAD_FPS` (default
+/// 120), `KRYO_LOAD_SECONDS` (default 20).
+#[test]
+#[ignore = "records the screen (silently) while loading the GPU from another process; run with --ignored"]
+fn engine_under_gpu_load() {
+    let env = |name: &str, default: &str| std::env::var(name).unwrap_or_else(|_| default.into());
+    let load_ms = env("KRYO_LOAD_MS", "12");
+    let mut helper = std::process::Command::new(std::env::current_exe().expect("test binary"))
+        .args([
+            "--ignored",
+            "--exact",
+            "capture::tests::gpu_load_helper",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env("KRYO_GPU_LOAD", &load_ms)
+        .env("KRYO_LOAD_HIGH", env("KRYO_LOAD_HIGH", "0"))
+        .env("KRYO_LOAD_VRAM_MB", env("KRYO_LOAD_VRAM_MB", "0"))
+        .spawn()
+        .expect("load process");
+    // Calibration and a few loaded frames before recording.
+    std::thread::sleep(Duration::from_secs(4));
+    let quality = match env("KRYO_LOAD_QUALITY", "premium").as_str() {
+        "standard" => Quality::Standard,
+        "high" => Quality::High,
+        _ => Quality::Premium,
+    };
+    let fps: u32 = env("KRYO_LOAD_FPS", "120").parse().expect("fps");
+    let seconds: u64 = env("KRYO_LOAD_SECONDS", "20").parse().expect("seconds");
+    let result = std::panic::catch_unwind(|| record_under_load(quality, fps, seconds));
+    let _ = helper.kill();
+    let _ = helper.wait();
+    let (status, clip) = result.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+    println!(
+        "UNDER LOAD ({load_ms} ms/frame): status {:?} {:?} {} fps; clip {:.1} fps over {:.1} s ({} frames), {} irregular gaps, worst {:.1} ms",
+        status.codec, status.encoder, status.fps, clip.fps, clip.seconds, clip.frames, clip.irregular, clip.worst_ms
+    );
+}
+
+fn record_under_load(quality: Quality, fps: u32, seconds: u64) -> (CaptureStatus, Smoothness) {
+    let _com = ComGuard::new();
+    let _mf = MfGuard::new().expect("media foundation");
+    let recorder = Arc::new(Recorder::default());
+    let config = EngineConfig {
+        screen_fit: crate::settings::ScreenFit::Screen,
+        video: video(quality, fps),
+        audio_bitrate: 192_000,
+        buffer_seconds: 10,
+        microphone: false,
+        microphone_device: None,
+    };
+    let mut gpu = testing::GpuUsage::start();
+    let engine = Engine::start(config, recorder.clone());
+    let started = Instant::now();
+    while started.elapsed() < Duration::from_secs(seconds) {
+        std::thread::sleep(Duration::from_secs(1));
+        if let Some(gpu) = gpu.as_mut() {
+            gpu.sample();
+        }
+    }
+    let status = engine.status();
+    engine
+        .save(SaveRequest {
+            clips_dir: out_dir(),
+            game: None,
+            desktop_label: "Under load".into(),
+            stamp: Stamp::now(),
+        })
+        .expect("save accepted");
+    let path = recorder
+        .wait(Duration::from_secs(30), |seen| seen.saved.clone())
+        .expect("saved");
+    drop(engine);
+    if let Some(gpu) = gpu {
+        let engines: Vec<String> = gpu
+            .averages()
+            .iter()
+            .map(|(engine, percent)| format!("{engine} {percent:.2}%"))
+            .collect();
+        println!("GPU engines while capturing: {}", engines.join(", "));
+    }
+    println!("clip: {}", path.display());
+    let clip = smoothness(&path, status.ten_bit, status.fps);
+    (status, clip)
+}
+
 /// Checks a recording like `run` checks clips, with Media Foundation: one video stream and
 /// `audio` AAC streams, every frame decoding one tick apart, the audio covering the video.
 /// Returns the duration.

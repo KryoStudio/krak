@@ -29,6 +29,8 @@ pub mod screen;
 pub mod screenshot;
 pub mod sound;
 #[cfg(test)]
+mod load;
+#[cfg(test)]
 mod tests;
 mod timeline;
 mod video;
