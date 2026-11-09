@@ -184,6 +184,10 @@ export interface ExportRequest {
   watermark?: boolean;
   /** Stretch a clip narrower than 16:9 (a stretched 4:3) over 16:9 (forces a re-encode). */
   stretch?: boolean;
+  /** Vertical 9:16 (1080×1920), a window of the picture (forces a re-encode). */
+  vertical?: boolean;
+  /** Where that window is: 0 left, 1 right, 0.5 centred. */
+  cropX?: number;
 }
 
 export interface ExportResult {

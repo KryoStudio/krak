@@ -8,6 +8,8 @@
   import GameIcon from './GameIcon.svelte';
   import RenameInput from './RenameInput.svelte';
   import Editor from './Editor.svelte';
+  import CropFrame from './CropFrame.svelte';
+  import { canFrame, framing } from '$lib/framing.svelte';
   import { mediaSrc } from '$lib/api';
   import { getEdit, type Edit } from '$lib/edits';
   import { gameTint } from '$lib/games';
@@ -28,6 +30,8 @@
 
   let video = $state<HTMLVideoElement>();
   let mix = $state<LiveMix>();
+  /** The clip's picture size, once the video knows it (for the vertical frame). */
+  let natural = $state<[number, number] | null>(null);
   /** The clip's last edit; the editor keeps it current while it is open. */
   let edit = $state<Edit | null>(null);
   const id = $derived(shard?.id);
@@ -36,7 +40,9 @@
 
   $effect(() => {
     edit = id ? getEdit(id) : null;
+    natural = null;
   });
+  const framed = $derived(ui.editing && framing.vertical && !!natural && canFrame(natural[0], natural[1]));
 
   // Krak minimized or sent to the tray: the clip (and the editor) stop playing.
   $effect(() => {
@@ -192,7 +198,18 @@
         <div class="screen" in:scale={{ start: 0.985, duration: 240 * motion, opacity: 0 }}>
           {#if shard.path}
             <!-- svelte-ignore a11y_media_has_caption -->
-            <video bind:this={video} src={mediaSrc(shard.path)} controls={!ui.editing} autoplay></video>
+            <video
+              bind:this={video}
+              src={mediaSrc(shard.path)}
+              controls={!ui.editing}
+              autoplay
+              onloadedmetadata={(e) => (natural = [e.currentTarget.videoWidth, e.currentTarget.videoHeight])}
+            ></video>
+            {#if framed && natural}
+              <div class="overlay" transition:fade={{ duration: 160 * motion }}>
+                <CropFrame width={natural[0]} height={natural[1]} />
+              </div>
+            {/if}
           {:else}
             <div class="placeholder" style:--a={tint[0]} style:--b={tint[1]}>
               <span>{t('player.demo')}</span>
@@ -310,6 +327,18 @@
   }
   video {
     outline: none;
+  }
+  /* The vertical frame, over the video (same grid cell, same box). */
+  video,
+  .overlay {
+    grid-area: 1 / 1;
+  }
+  .overlay {
+    display: grid;
+    place-items: center;
+    width: 100%;
+    height: 100%;
+    pointer-events: none;
   }
   .placeholder {
     display: grid;

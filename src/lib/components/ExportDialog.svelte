@@ -8,6 +8,7 @@
   import Icon, { type IconName } from './Icon.svelte';
   import { api, errorCode, native, on, type ExportRequest, type Shard } from '$lib/api';
   import { CLIPS_CHANNEL, openLink } from '$lib/community';
+  import { canFrame, framing } from '$lib/framing.svelte';
   import { MB, formatDuration, formatSize, hasKey, t } from '$lib/i18n.svelte';
   import { library } from '$lib/library.svelte';
   import { settings } from '$lib/settings.svelte';
@@ -58,6 +59,9 @@
 
   // A clip narrower than 16:9 (a stretched 4:3 resolution) can be stretched to fill the player.
   const narrow = $derived(!!size && size[0] >= size[1] && size[0] < ((size[1] * 16) / 9) * 0.99);
+  // A clip wider than 9:16 can go vertical (the window placed in the editor).
+  const frameable = $derived(!!size && canFrame(size[0], size[1]));
+  const vertical = $derived(frameable && framing.vertical);
   let stretch = $state(readStretch());
 
   function readStretch(): boolean {
@@ -147,7 +151,9 @@
         maxBytes: target === 'discord' ? limit * 1_000_000 : null,
         path,
         watermark: settings.value.watermark,
-        stretch: narrow && stretch,
+        stretch: narrow && stretch && !vertical,
+        vertical,
+        cropX: framing.x,
       });
       if (done.shard) library.upsert(done.shard);
       result = done;
@@ -234,7 +240,18 @@
         <Toggle label={t('export.watermark')} checked={settings.value.watermark} onchange={(v) => settings.update({ watermark: v }).catch(() => {})} />
       </div>
 
-      {#if narrow && size}
+      {#if frameable}
+        <div class="badge-row">
+          <span class="vertical-preview" class:on={vertical} aria-hidden="true"><span></span></span>
+          <div class="badge-text">
+            <strong>{t('export.vertical')}</strong>
+            <span>{t('export.verticalHint')}</span>
+          </div>
+          <Toggle label={t('export.vertical')} checked={vertical} onchange={(on) => (framing.vertical = on)} />
+        </div>
+      {/if}
+
+      {#if narrow && size && !vertical}
         <div class="badge-row">
           <span class="stretch-preview" class:on={stretch} aria-hidden="true"><span></span></span>
           <div class="badge-text">
@@ -530,6 +547,33 @@
   }
   .stretch-preview.on span {
     width: 46px;
+  }
+  /* A 16:9 frame; on, the 9:16 window it keeps. */
+  .vertical-preview {
+    display: grid;
+    place-items: center;
+    width: 46px;
+    height: 26px;
+    flex: none;
+    border-radius: 5px;
+    background: linear-gradient(135deg, color-mix(in srgb, var(--accent) 45%, #000), color-mix(in srgb, var(--accent) 20%, #000));
+    box-shadow: inset 0 0 0 1px var(--border-strong);
+    overflow: hidden;
+  }
+  .vertical-preview span {
+    width: 46px;
+    height: 26px;
+    border-radius: 4px;
+    box-shadow: inset 0 0 0 2px transparent;
+    transition:
+      width var(--slow) var(--ease-out),
+      box-shadow var(--slow);
+  }
+  .vertical-preview.on span {
+    width: 15px;
+    box-shadow:
+      inset 0 0 0 2px var(--accent),
+      0 0 0 40px rgba(5, 6, 8, 0.55);
   }
   .badge-text {
     display: flex;
