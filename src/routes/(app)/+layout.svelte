@@ -13,6 +13,12 @@
   import ConfirmDialog from '$lib/components/ConfirmDialog.svelte';
   import Toasts from '$lib/components/Toasts.svelte';
   import Onboarding from '$lib/components/Onboarding.svelte';
+  import UpdatePrompt from '$lib/components/UpdatePrompt.svelte';
+  import CommunityInvite from '$lib/components/CommunityInvite.svelte';
+  import ShareDialog from '$lib/components/ShareDialog.svelte';
+  import { share } from '$lib/share.svelte';
+  import { invite } from '$lib/invite.svelte';
+  import { appWindow } from '$lib/app-window.svelte';
   import { native, on } from '$lib/api';
   import { capture, formatClock, saveReplay } from '$lib/capture.svelte';
   import { hasKey, t } from '$lib/i18n.svelte';
@@ -37,12 +43,15 @@
   onMount(() => {
     library.load().catch(console.error);
     screens.load().catch(console.error);
-    if (!native) return;
+    const stopInvite = invite.start();
+    if (!native) return stopInvite;
 
     capture.refresh().catch(console.error);
     capture.loadEncoder();
-    // Look for an update once things have settled.
-    const updateCheck = setTimeout(() => updates.check(true), 8000);
+    // Look for an update right after the start (Windows startup too, in the tray), then now and
+    // then for a Krak that stays open for days.
+    const updateCheck = setTimeout(() => updates.check(true), 3000);
+    const updateRecheck = setInterval(() => updates.check(true), 6 * 60 * 60 * 1000);
     // Buffer fill and memory move every second; only ask while someone is looking.
     const poll = setInterval(() => {
       if (document.visibilityState === 'visible' && capture.status.state !== 'paused') capture.refresh().catch(() => {});
@@ -89,10 +98,17 @@
         });
       }),
       on('navigate', (route) => goto(route)),
+      on('update-install', () => {
+        if (!updates.available) return;
+        updates.offered = true;
+        updates.install();
+      }),
     ];
     return () => {
+      stopInvite();
       clearInterval(poll);
       clearTimeout(updateCheck);
+      clearInterval(updateRecheck);
       listeners.forEach((l) => l.then((unlisten) => unlisten()));
     };
   });
@@ -142,6 +158,15 @@
 
 {#if !settings.value.onboarded}
   <Onboarding />
+{:else if appWindow.shown && updates.offered}
+  <UpdatePrompt />
+{:else if appWindow.shown && invite.due && !ui.playing}
+  <CommunityInvite />
+{/if}
+{#if share.request}
+  {#key share.request}
+    <ShareDialog request={share.request} />
+  {/key}
 {/if}
 <ContextMenu />
 <ConfirmDialog />

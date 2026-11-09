@@ -26,7 +26,7 @@
 
 - **Always ready.** The last seconds of gameplay are kept in memory. Press a key and they are saved instantly, no re-encoding.
 - **Light.** Encoding runs on your graphics card (NVIDIA, AMD or Intel). The impact on your FPS should be invisible.
-- **Yours.** Everything stays on your PC. Clips are plain MP4 files. Nothing is uploaded unless you decide to.
+- **Yours.** Everything stays on your PC. Clips are plain MP4 files. Nothing is uploaded unless you decide to share it.
 - **Anti-cheat safe.** Krak captures the screen like OBS or Discord do. It never injects into a game or reads its memory.
 - **Simple.** Works out of the box. Advanced options are there, tucked away.
 
@@ -43,13 +43,14 @@ A clip is called a **shard**. Your library is the **Glacier**.
 - [x] Screenshots, with their own page and a crop tool (copy the part you keep, or save it)
 - [x] Separate audio tracks: game and microphone, plus a mix that every player picks by default
 - [x] Editor: trim bar, waveforms, volume of each audio track, remembered per clip
-- [x] Export to a file, to the Glacier or to Discord under 10 MB, 50 MB or 500 MB, with an optional "by krak" badge, and 4:3 clips stretched to 16:9
+- [x] Export to a file, to the Glacier or to Discord under 20 MB, 50 MB or 500 MB, with an optional "by krak" badge, 4:3 clips stretched to 16:9, and vertical 9:16 for TikTok, Shorts and Reels (the frame placed in the editor)
+- [x] The Krak Discord one click away, and clips shared to its #clips from the app, opt-in (the app's side is ready; the community's bot opens it)
 - [x] Discord Rich Presence, with your Discord profile shown in the app (read from Discord itself, no login)
 - [x] Installer and signed automatic updates
 - [ ] Windows code signing (no SmartScreen warning)
 - [ ] Native AMD and Intel encoders, separate Discord voice track, mouse cursor in clips, choice of the captured screen
 
-**Later:** auto-clips (Rocket League first), vertical 9:16 format, slow motion, text and local subtitles, importing clips from ShadowPlay / OBS / Medal, community translations and detectors.
+**Later:** auto-clips (Rocket League first), slow motion, text and local subtitles, importing clips from ShadowPlay / OBS / Medal, community translations and detectors.
 
 ## Building from source
 
@@ -63,7 +64,7 @@ npm run tauri build   # build the installer
 
 `tauri build` also signs the in-app update files, so it needs the update signing key: set `TAURI_SIGNING_PRIVATE_KEY` to the key (or its path) first. Forks generate their own pair with `npx tauri signer generate` and put the public key in `src-tauri/tauri.conf.json`.
 
-Releases are built by GitHub Actions: push a tag such as `v0.2.0` (matching the version in `tauri.conf.json`) and a draft release is created with the installer and the signed update manifest.
+Releases are built by GitHub Actions: push a tag such as `v0.2.0` (matching the version in `tauri.conf.json`) and a draft release is created with the installer and the signed update manifest. Windows code signing (SignPath) and VirusTotal scans of the installer are optional: [`docs/SIGNING.md`](docs/SIGNING.md) explains how to turn them on, and what to do when Defender flags a release.
 
 ### How capture works
 

@@ -3,6 +3,7 @@
 mod capture;
 mod clipboard;
 mod commands;
+mod community;
 mod editor;
 mod hotkey;
 mod i18n;
@@ -65,6 +66,7 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
+        .manage(community::Community::default())
         .setup(setup)
         .on_window_event(window::on_event)
         .invoke_handler(tauri::generate_handler![
@@ -87,6 +89,16 @@ pub fn run() {
             commands::choose_export_path,
             commands::reveal_export,
             commands::get_presence,
+            commands::set_update_badge,
+            community::community_info,
+            community::community_account,
+            community::community_pair,
+            community::community_pair_status,
+            community::community_me,
+            community::community_upload,
+            community::community_cancel_upload,
+            community::community_delete,
+            community::community_unlink,
             commands::get_encoder_info,
             commands::resolve_video,
             commands::list_microphones,

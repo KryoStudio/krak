@@ -25,7 +25,7 @@ use crate::media::{ComGuard, MfGuard, d3d};
 use crate::settings::{Settings, SettingsPatch};
 use crate::state::{AppState, lock};
 use crate::storage::{self, StorageInfo};
-use crate::{clipboard, editor, i18n, names, presence, replay, shell, update, window};
+use crate::{clipboard, editor, i18n, names, presence, replay, shell, tray, update, window};
 
 type CmdResult<T> = Result<T, String>;
 
@@ -284,9 +284,9 @@ pub async fn probe_shard(app: AppHandle, id: String) -> CmdResult<ShardInfo> {
 }
 
 /// Exports a trimmed, re-mixed clip: a copy next to the original (`copy`), a file where the
-/// user chose (`file`, from `choose_export_path`), or a file under `maxBytes` put on the
-/// clipboard (`discord`); with `watermark`, the "by krak" badge burnt in. Progress comes as
-/// `export-progress` events.
+/// user chose (`file`, from `choose_export_path`), a file under `maxBytes` put on the
+/// clipboard (`discord`), or one for the Krak community to upload (`share`); with `watermark`,
+/// the "by krak" badge burnt in. Progress comes as `export-progress` events.
 #[tauri::command]
 pub async fn export_shard(app: AppHandle, request: ExportRequest) -> CmdResult<ExportResult> {
     // Held until the result is ready (clipboard included).
@@ -303,7 +303,7 @@ pub async fn export_shard(app: AppHandle, request: ExportRequest) -> CmdResult<E
         Target::File => Destination::File {
             path: naming::export_file(request.path.as_deref().ok_or(INVALID_REQUEST)?)?,
         },
-        Target::Discord => {
+        Target::Discord | Target::Share => {
             let max_bytes = request
                 .max_bytes
                 .filter(|m| m.is_finite() && *m >= 1.0)
@@ -326,6 +326,7 @@ pub async fn export_shard(app: AppHandle, request: ExportRequest) -> CmdResult<E
         destination,
         watermark: request.watermark,
         stretch: request.stretch,
+        vertical: request.vertical_position(),
         options: editor::transcode::Options::default(),
     };
     let cancel = slot.cancel_flag();
@@ -395,6 +396,8 @@ pub async fn export_shard(app: AppHandle, request: ExportRequest) -> CmdResult<E
                 .map_err(String::from)?;
             None
         }
+        // `community_upload` takes it from there.
+        Target::Share => None,
     };
     lock(&state.exports).files.insert(exported.path.clone());
     drop(slot);
@@ -541,6 +544,21 @@ pub async fn reveal_export(app: AppHandle, path: String) -> CmdResult<()> {
         .map_err(|_| "reveal_failed".to_string())
 }
 
+/// The tray shows that an update waits (`version`), or no longer does (`null`).
+#[tauri::command]
+pub async fn set_update_badge(app: AppHandle, version: Option<String>) -> CmdResult<()> {
+    let version = version.filter(|v| valid_version(v));
+    tray::set_update(&app, version).map_err(|_| INTERNAL.to_string())
+}
+
+/// A release version as the updater reports it ("0.7.0", "1.0.0-beta.2").
+fn valid_version(version: &str) -> bool {
+    (1..=32).contains(&version.len())
+        && version
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '+'))
+}
+
 /// Whether the Discord status is on, and whether Discord is there to show it.
 #[tauri::command]
 pub async fn get_presence(app: AppHandle) -> CmdResult<presence::PresenceInfo> {
@@ -608,5 +626,22 @@ mod tests {
         fs::write(&outside, b"x").unwrap();
         assert_eq!(shard_id_of(&clips, &outside), None);
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn accepts_release_versions_only() {
+        for ok in ["0.7.0", "1.0.0-beta.2", "2.0.0+build.5"] {
+            assert!(valid_version(ok), "{ok}");
+        }
+        for bad in [
+            "",
+            "0.7.0 ",
+            "../x",
+            "a
+b",
+            &"9".repeat(33),
+        ] {
+            assert!(!valid_version(bad), "{bad}");
+        }
     }
 }

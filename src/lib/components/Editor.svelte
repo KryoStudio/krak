@@ -8,6 +8,7 @@
   import ExportDialog from './ExportDialog.svelte';
   import { api, mediaSrc, native, type Shard, type ShardInfo, type Waveform } from '$lib/api';
   import { getEdit, saveEdit, type Edit } from '$lib/edits';
+  import { canFrame, framing } from '$lib/framing.svelte';
   import { gameTint } from '$lib/games';
   import { t } from '$lib/i18n.svelte';
   import { library } from '$lib/library.svelte';
@@ -46,6 +47,8 @@
   const selection = $derived(Math.max(0, end - start));
   const real = $derived(native && !library.demo);
   const trimmed = $derived(start > 0.05 || end < duration - 0.05);
+  /** A vertical window can be cut out of this clip (it is wider than 9:16). */
+  const frameable = $derived(!!info && canFrame(info.width, info.height));
 
   // One lane per thing the user can turn up or down: game + mic, or the only track.
   const lanes = $derived.by((): Lane[] => {
@@ -91,6 +94,8 @@
     };
     waveforms = null;
     loadedId = null;
+    framing.vertical = false;
+    framing.x = 0.5;
     const apply = (next: ShardInfo) => {
       if (shard.id !== id) return;
       info = { ...next, duration: next.duration || fallback.duration };
@@ -100,6 +105,8 @@
       start = saved ? Math.min(Math.max(0, saved.start), Math.max(0, d - 0.5)) : 0;
       end = saved ? Math.min(d, Math.max(start + 0.5, saved.end)) : d;
       gains = saved ? { ...saved.gains } : { game: 1, mic: 1 };
+      framing.vertical = !!saved?.vertical;
+      framing.x = typeof saved?.cropX === 'number' ? Math.min(1, Math.max(0, saved.cropX)) : 0.5;
       if (saved) seek(start);
       loadedId = id;
     };
@@ -140,7 +147,7 @@
   // editor closes before that).
   let unsaved: (() => void) | null = null;
   $effect(() => {
-    const edit = { start, end, gains: { ...gains } };
+    const edit: Edit = { start, end, gains: { ...gains }, vertical: framing.vertical, cropX: framing.x };
     const id = loadedId;
     const d = duration;
     if (!id || id !== shard.id || !d) return;
@@ -242,6 +249,19 @@
       <span class="selection" class:trimmed>{t('editor.selection', { duration: `${selection.toFixed(1)} s` })}</span>
     </div>
 
+    {#if frameable}
+      <span class="divider"></span>
+      <button
+        class="chip format"
+        class:on={framing.vertical}
+        aria-pressed={framing.vertical}
+        onclick={() => (framing.vertical = !framing.vertical)}
+        use:tooltip={{ text: t('editor.verticalHint'), side: 'top' }}
+      >
+        <Icon name="vertical" size={14} />{t('editor.vertical')}
+      </button>
+    {/if}
+
     <div class="actions">
       <button class="button primary" onclick={() => (exporting = true)} disabled={!info}>
         <Icon name="share" size={14} />{t('export.title')}
@@ -341,6 +361,18 @@
   .chip:hover {
     color: var(--text);
     background: var(--surface-3);
+  }
+  .chip.format {
+    display: inline-flex;
+    gap: 6px;
+    font-size: 12.5px;
+    font-weight: 600;
+    white-space: nowrap;
+  }
+  .chip.format.on {
+    color: var(--accent-fg);
+    background: var(--accent);
+    box-shadow: none;
   }
   .bracket {
     font-weight: 700;

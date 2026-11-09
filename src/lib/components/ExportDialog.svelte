@@ -7,6 +7,9 @@
   import { prefersReducedMotion } from 'svelte/motion';
   import Icon, { type IconName } from './Icon.svelte';
   import { api, errorCode, native, on, type ExportRequest, type Shard } from '$lib/api';
+  import { CLIPS_CHANNEL, openLink } from '$lib/community';
+  import { canFrame, framing } from '$lib/framing.svelte';
+  import { share } from '$lib/share.svelte';
   import { MB, formatDuration, formatSize, hasKey, t } from '$lib/i18n.svelte';
   import { library } from '$lib/library.svelte';
   import { settings } from '$lib/settings.svelte';
@@ -33,8 +36,12 @@
     onclose: () => void;
   } = $props();
 
-  type Target = ExportRequest['target'];
-  const limits = [10, 50, 500] as const;
+  /** Where to: an export target, or the Krak community (the share sheet takes over). */
+  type Target = Exclude<ExportRequest['target'], 'share'> | 'community';
+  // Discord's upload limits: 20 MiB without Nitro, 50 MB with Nitro Basic, 500 MB with Nitro.
+  // Asked for in millions of bytes (20 000 000 is 95 % of 20 MiB), and the backend aims under
+  // 92 to 95 % of that: room for the container and the encoder's overshoot.
+  const limits = [20, 50, 500] as const;
   type Limit = (typeof limits)[number];
 
   let target = $state<Target>('discord');
@@ -54,6 +61,9 @@
 
   // A clip narrower than 16:9 (a stretched 4:3 resolution) can be stretched to fill the player.
   const narrow = $derived(!!size && size[0] >= size[1] && size[0] < ((size[1] * 16) / 9) * 0.99);
+  // A clip wider than 9:16 can go vertical (the window placed in the editor).
+  const frameable = $derived(!!size && canFrame(size[0], size[1]));
+  const vertical = $derived(frameable && framing.vertical);
   let stretch = $state(readStretch());
 
   function readStretch(): boolean {
@@ -76,9 +86,14 @@
   function readLimit(): Limit {
     try {
       const saved = Number(localStorage.getItem('krak.discord-limit') ?? localStorage.getItem('kryo-shard.discord-limit'));
-      return limits.find((l) => l === saved) ?? 10;
+      // The no-Nitro limit was 10 MB until Discord raised it to 20.
+      if (saved === 10) {
+        localStorage.setItem('krak.discord-limit', '20');
+        return 20;
+      }
+      return limits.find((l) => l === saved) ?? 20;
     } catch {
-      return 10;
+      return 20;
     }
   }
 
@@ -93,11 +108,18 @@
 
   const options: { id: Target; icon: IconName }[] = [
     { id: 'discord', icon: 'share' },
+    { id: 'community', icon: 'users' },
     { id: 'file', icon: 'drive' },
     { id: 'copy', icon: 'copy' },
   ];
 
   async function go() {
+    if (target === 'community') {
+      // Sized for the server and uploaded by the share sheet, with these edits.
+      share.request = { shard, start, end, gains: { ...gains }, vertical, cropX: framing.x };
+      onclose();
+      return;
+    }
     let path: string | null = null;
     if (target === 'file') {
       if (!real) {
@@ -138,7 +160,9 @@
         maxBytes: target === 'discord' ? limit * 1_000_000 : null,
         path,
         watermark: settings.value.watermark,
-        stretch: narrow && stretch,
+        stretch: narrow && stretch && !vertical,
+        vertical,
+        cropX: framing.x,
       });
       if (done.shard) library.upsert(done.shard);
       result = done;
@@ -225,7 +249,18 @@
         <Toggle label={t('export.watermark')} checked={settings.value.watermark} onchange={(v) => settings.update({ watermark: v }).catch(() => {})} />
       </div>
 
-      {#if narrow && size}
+      {#if frameable}
+        <div class="badge-row">
+          <span class="vertical-preview" class:on={vertical} aria-hidden="true"><span></span></span>
+          <div class="badge-text">
+            <strong>{t('export.vertical')}</strong>
+            <span>{t('export.verticalHint')}</span>
+          </div>
+          <Toggle label={t('export.vertical')} checked={vertical} onchange={(on) => (framing.vertical = on)} />
+        </div>
+      {/if}
+
+      {#if narrow && size && !vertical}
         <div class="badge-row">
           <span class="stretch-preview" class:on={stretch} aria-hidden="true"><span></span></span>
           <div class="badge-text">
@@ -238,8 +273,10 @@
       </div>
 
       <footer>
-        <span class="estimate">≈ {formatSize(target === 'discord' ? Math.min(estimate, limit * 0.95e6) : estimate)}</span>
-        <button class="primary" onclick={go}><Icon name={options.find((o) => o.id === target)?.icon ?? 'share'} size={15} />{t('export.go')}</button>
+        <span class="estimate">{target === 'community' ? '' : `≈ ${formatSize(target === 'discord' ? Math.min(estimate, limit * 0.95e6) : estimate)}`}</span>
+        <button class="primary" onclick={go}>
+          <Icon name={options.find((o) => o.id === target)?.icon ?? 'share'} size={15} />{t(target === 'community' ? 'export.continue' : 'export.go')}
+        </button>
       </footer>
     {:else if stage === 'working'}
       <div class="status" in:fade={{ duration: 160 * motion }}>
@@ -265,8 +302,16 @@
               <Icon name="folder" size={14} />{t('export.reveal')}
             </button>
           {/if}
+          {#if target === 'discord'}
+            <button class="secondary" onclick={() => openLink(CLIPS_CHANNEL)}>
+              <Icon name="message" size={14} />{t('export.postClips')}
+            </button>
+          {/if}
           <button class="primary" onclick={onclose}>{t('export.done')}</button>
         </div>
+        {#if target === 'discord'}
+          <span class="clips-hint">{t('export.postClipsHint')}</span>
+        {/if}
       </div>
     {/if}
   </div>
@@ -514,6 +559,33 @@
   .stretch-preview.on span {
     width: 46px;
   }
+  /* A 16:9 frame; on, the 9:16 window it keeps. */
+  .vertical-preview {
+    display: grid;
+    place-items: center;
+    width: 46px;
+    height: 26px;
+    flex: none;
+    border-radius: 5px;
+    background: linear-gradient(135deg, color-mix(in srgb, var(--accent) 45%, #000), color-mix(in srgb, var(--accent) 20%, #000));
+    box-shadow: inset 0 0 0 1px var(--border-strong);
+    overflow: hidden;
+  }
+  .vertical-preview span {
+    width: 46px;
+    height: 26px;
+    border-radius: 4px;
+    box-shadow: inset 0 0 0 2px transparent;
+    transition:
+      width var(--slow) var(--ease-out),
+      box-shadow var(--slow);
+  }
+  .vertical-preview.on span {
+    width: 15px;
+    box-shadow:
+      inset 0 0 0 2px var(--accent),
+      0 0 0 40px rgba(5, 6, 8, 0.55);
+  }
   .badge-text {
     display: flex;
     flex-direction: column;
@@ -635,6 +707,10 @@
     display: flex;
     gap: 8px;
     margin-top: 6px;
+  }
+  .clips-hint {
+    font-size: 12px;
+    color: var(--text-3);
   }
 
   @keyframes pop {

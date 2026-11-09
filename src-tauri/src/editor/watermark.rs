@@ -4,6 +4,10 @@
 //! video gets the same badge as its landscape version instead of one covering a fifth of its
 //! width), at least 16 px, with a 2.5 % margin. Position and size are even: 4:2:0 chroma.
 //!
+//! A vertical video (9:16 or taller) is watched in TikTok, Shorts or Reels, whose buttons and
+//! tabs cover its top edge: there the badge sits lower, 9 % of the height from the top, still on
+//! the right where nothing covers it until the side buttons halfway down.
+//!
 //! The PNG (`assets/watermark.png`, 128 px tall, straight alpha) is decoded and scaled with WIC
 //! (premultiplied BGRA, high-quality cubic), then turned into premultiplied studio-range BT.709
 //! Y'CbCr, the encoder's input: a full-size luma image (Y'·a, a) and a half-size chroma one
@@ -64,6 +68,10 @@ const MIN_HEIGHT: f64 = 16.0;
 const MAX_WIDTH_SHARE: f64 = 0.4;
 /// No badge on frames this small: it could not be read.
 const SMALLEST: u32 = 8;
+/// Vertical videos: frames at least this much taller than wide, and the badge's distance from
+/// their top as a share of their height.
+const VERTICAL_RATIO: f64 = 1.7;
+const VERTICAL_TOP_SHARE: f64 = 0.09;
 
 /// Where the badge goes in a frame, in pixels (all even).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -91,9 +99,16 @@ pub fn layout(frame: (u32, u32), aspect: f64) -> Option<Rect> {
     if height < SMALLEST || width + 2 * margin > fw || height + 2 * margin > fh {
         return None;
     }
+    let top = if f64::from(fh) >= f64::from(fw) * VERTICAL_RATIO {
+        even(f64::from(fh) * VERTICAL_TOP_SHARE)
+            .max(margin)
+            .min(fh - height - margin)
+    } else {
+        margin
+    };
     Some(Rect {
         x: fw - margin - width,
-        y: margin,
+        y: top,
         width,
         height,
     })
@@ -581,10 +596,15 @@ mod tests {
         );
         assert_eq!(layout((1280, 720), ASPECT).unwrap().height, 32);
         assert_eq!(layout((3840, 2160), ASPECT).unwrap().height, 98);
-        // Portrait: same badge as the landscape version, not 4.5 % of 1920.
+        // Portrait: same badge as the landscape version, not 4.5 % of 1920, and below the top
+        // band the vertical video apps cover with their buttons.
         let portrait = layout((1080, 1920), ASPECT).unwrap();
         assert_eq!((portrait.width, portrait.height), (120, 48));
         assert_eq!(portrait.x + portrait.width + 28, 1080);
+        assert_eq!(portrait.y, 172);
+        assert_eq!(layout((720, 1280), ASPECT).unwrap().y, 116);
+        // A portrait picture that is not that tall keeps the corner.
+        assert_eq!(layout((1080, 1350), ASPECT).unwrap().y, 28);
         // Small frames: the minimum height.
         assert_eq!(layout((640, 360), ASPECT).unwrap().height, 16);
         // Odd sizes use the even part (what the encoder gets).

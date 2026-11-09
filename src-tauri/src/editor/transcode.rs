@@ -18,6 +18,10 @@
 //!
 //! With the "by krak" badge ([`watermark`](super::watermark)), every frame goes through our own
 //! target texture (never the decoder's), where the badge is drawn before encoding.
+//!
+//! A vertical export ([`Job::crop`]) decodes at the source's size, copies the 9:16 window
+//! ([`plan::vertical_window`]) out of each frame and scales it to the output size with the
+//! video processor.
 
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -41,7 +45,7 @@ use windows::Win32::Media::MediaFoundation::{
 use windows::Win32::System::Com::StructuredStorage::PROPVARIANT;
 use windows::core::{GUID, HSTRING, Interface};
 
-use super::plan::{TOLERANCE, VideoTarget};
+use super::plan::{self, TOLERANCE, VideoTarget, Window};
 use super::watermark::Stamp;
 use super::{CANCELLED, EXPORT_FAILED, Span, UNSUPPORTED, UNSUPPORTED_CODEC, media_failure};
 use crate::capture::encoders;
@@ -109,6 +113,8 @@ pub struct Job<'a> {
     pub target: VideoTarget,
     /// Burn the "by krak" badge in.
     pub watermark: bool,
+    /// Vertical: where the 9:16 window of each picture is ([`plan::vertical_window`]).
+    pub crop: Option<f64>,
     pub options: Options,
 }
 
@@ -121,6 +127,7 @@ pub fn transcode(job: Job, gpu: &Gpu, progress: &Span) -> Result<Encoded, &'stat
         end,
         target,
         watermark,
+        crop,
         options,
     } = job;
     let fail = |what: &'static str| move |err: MediaError| media_failure(what, err);
@@ -138,7 +145,10 @@ pub fn transcode(job: Job, gpu: &Gpu, progress: &Span) -> Result<Encoded, &'stat
         None => 0,
     };
     reader
-        .select_output((target.width, target.height), options.gpu_scaling)
+        .select_output(
+            (target.width, target.height),
+            options.gpu_scaling || crop.is_some(),
+        )
         .map_err(|err| {
             if err.code == UNSUPPORTED_CODEC {
                 eprintln!("krak: export: Windows cannot decode this video ({err})");
@@ -163,7 +173,7 @@ pub fn transcode(job: Job, gpu: &Gpu, progress: &Span) -> Result<Encoded, &'stat
     } else {
         None
     };
-    let mut frames = FramePipeline::new(gpu, size, stamp);
+    let mut frames = FramePipeline::new(gpu, size, stamp, crop);
     let mut packets = Vec::new();
     let mut slots = Slots {
         start,
@@ -653,10 +663,12 @@ struct FramePipeline<'g> {
     stamp: Option<Stamp<'g>>,
     /// How the badge was drawn on the last frame.
     badge: Option<&'static str>,
+    /// Vertical: the position of the 9:16 window.
+    crop: Option<f64>,
 }
 
 impl<'g> FramePipeline<'g> {
-    fn new(gpu: &'g Gpu, size: (u32, u32), stamp: Option<Stamp<'g>>) -> Self {
+    fn new(gpu: &'g Gpu, size: (u32, u32), stamp: Option<Stamp<'g>>, crop: Option<f64>) -> Self {
         Self {
             gpu,
             size,
@@ -669,6 +681,7 @@ impl<'g> FramePipeline<'g> {
             path: "",
             stamp,
             badge: None,
+            crop,
         }
     }
 
@@ -682,17 +695,38 @@ impl<'g> FramePipeline<'g> {
         let scaled_by_reader = visible == self.size;
         // SAFETY: reading the buffers of a sample the reader handed us.
         let buffer = unsafe { sample.GetBufferByIndex(0) }.code(EXPORT_FAILED)?;
+        if let Some(position) = self.crop {
+            // Vertical: the window, out of the source-size frame, then scaled to the output.
+            let window = plan::vertical_window(visible, position).unwrap_or(Window {
+                x: 0,
+                y: 0,
+                width: visible.0,
+                height: visible.1,
+            });
+            let size = (window.width, window.height);
+            let native = self.native(size)?;
+            if let Ok(dxgi) = buffer.cast::<IMFDXGIBuffer>() {
+                self.path = "gpu-cropped";
+                let (texture, subresource) = resource(&dxgi)?;
+                copy(
+                    self.gpu,
+                    &native,
+                    &texture,
+                    subresource,
+                    (window.x, window.y),
+                    size,
+                );
+            } else {
+                self.path = "memory-cropped";
+                let pixels = read_memory(&buffer, reader)?;
+                let cropped = crop_nv12(&pixels, visible, window);
+                self.upload(&native, &cropped, size)?;
+            }
+            self.scale(&native, size)?;
+            return self.finish(textures);
+        }
         if let Ok(dxgi) = buffer.cast::<IMFDXGIBuffer>() {
-            // SAFETY: the buffer wraps one subresource of a D3D11 texture.
-            let (texture, subresource) = unsafe {
-                let mut raw = std::ptr::null_mut();
-                dxgi.GetResource(&ID3D11Texture2D::IID, &mut raw)
-                    .code(EXPORT_FAILED)?;
-                (
-                    ID3D11Texture2D::from_raw(raw),
-                    dxgi.GetSubresourceIndex().code(EXPORT_FAILED)?,
-                )
-            };
+            let (texture, subresource) = resource(&dxgi)?;
             if scaled_by_reader {
                 let desc = describe(&texture);
                 let exact = (desc.Width, desc.Height) == self.size
@@ -705,11 +739,11 @@ impl<'g> FramePipeline<'g> {
                 }
                 self.path = "gpu-copy";
                 let target = self.target()?;
-                copy(self.gpu, &target, &texture, subresource, self.size);
+                copy(self.gpu, &target, &texture, subresource, (0, 0), self.size);
             } else {
                 self.path = "gpu-scaled";
                 let native = self.native(visible)?;
-                copy(self.gpu, &native, &texture, subresource, visible);
+                copy(self.gpu, &native, &texture, subresource, (0, 0), visible);
                 self.scale(&native, visible)?;
             }
         } else {
@@ -735,6 +769,11 @@ impl<'g> FramePipeline<'g> {
                 self.scale(&native, visible)?;
             }
         }
+        self.finish(textures)
+    }
+
+    /// The target texture holds the frame: the badge, then the encoder's input.
+    fn finish(&mut self, textures: bool) -> MediaResult<Prepared> {
         if self.stamp.is_some() {
             let target = self.target()?;
             if let Some(stamp) = self.stamp.as_mut() {
@@ -851,6 +890,20 @@ impl<'g> FramePipeline<'g> {
     }
 }
 
+/// The texture and subresource a decoded buffer wraps.
+fn resource(dxgi: &IMFDXGIBuffer) -> MediaResult<(ID3D11Texture2D, u32)> {
+    // SAFETY: the buffer wraps one subresource of a D3D11 texture.
+    unsafe {
+        let mut raw = std::ptr::null_mut();
+        dxgi.GetResource(&ID3D11Texture2D::IID, &mut raw)
+            .code(EXPORT_FAILED)?;
+        Ok((
+            ID3D11Texture2D::from_raw(raw),
+            dxgi.GetSubresourceIndex().code(EXPORT_FAILED)?,
+        ))
+    }
+}
+
 fn describe(texture: &ID3D11Texture2D) -> D3D11_TEXTURE2D_DESC {
     let mut desc = D3D11_TEXTURE2D_DESC::default();
     // SAFETY: plain descriptor read.
@@ -858,28 +911,55 @@ fn describe(texture: &ID3D11Texture2D) -> D3D11_TEXTURE2D_DESC {
     desc
 }
 
-/// Copies the top-left `size` of `src`'s `subresource` into `dst` (subresource 0).
+/// Copies the `size` area at `origin` of `src`'s `subresource` into the top left of `dst`
+/// (subresource 0).
 fn copy(
     gpu: &Gpu,
     dst: &ID3D11Texture2D,
     src: &ID3D11Texture2D,
     subresource: u32,
+    origin: (u32, u32),
     size: (u32, u32),
 ) {
     let area = D3D11_BOX {
-        left: 0,
-        top: 0,
+        left: origin.0,
+        top: origin.1,
         front: 0,
-        right: size.0,
-        bottom: size.1,
+        right: origin.0 + size.0,
+        bottom: origin.1 + size.1,
         back: 1,
     };
-    // SAFETY: both are NV12 textures at least `size` large (even dimensions); the copy is
-    // queued on the multithread-protected immediate context.
+    // SAFETY: both are NV12 textures, `src` holding the area and `dst` at least `size` large
+    // (even offsets and dimensions); the copy is queued on the multithread-protected immediate
+    // context.
     unsafe {
         gpu.context
             .CopySubresourceRegion(dst, 0, 0, 0, 0, src, subresource, Some(&area));
     }
+}
+
+/// The `window` of a tightly packed NV12 frame of `size`, tightly packed. A window that does
+/// not fit in the frame comes out black.
+pub fn crop_nv12(frame: &[u8], size: (u32, u32), window: Window) -> Vec<u8> {
+    let (w, h) = (size.0 as usize, size.1 as usize);
+    let (x, y) = (window.x as usize & !1, window.y as usize & !1);
+    let (cw, ch) = (window.width as usize & !1, window.height as usize & !1);
+    let mut out = vec![16u8; cw * ch];
+    out.resize(cw * ch * 3 / 2, 128);
+    if x + cw > w || y + ch > h || frame.len() < w * h * 3 / 2 {
+        return out;
+    }
+    let (luma, chroma) = frame.split_at(w * h);
+    let (out_luma, out_chroma) = out.split_at_mut(cw * ch);
+    for (row, dst) in out_luma.chunks_exact_mut(cw).enumerate() {
+        let from = (y + row) * w + x;
+        dst.copy_from_slice(&luma[from..from + cw]);
+    }
+    for (row, dst) in out_chroma.chunks_exact_mut(cw).enumerate() {
+        let from = (y / 2 + row) * w + x;
+        dst.copy_from_slice(&chroma[from..from + cw]);
+    }
+    out
 }
 
 /// Tightly packed NV12 (visible area) from a system-memory buffer.

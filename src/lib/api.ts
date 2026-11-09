@@ -54,6 +54,10 @@ export interface Settings {
   storageLimitGb: number | null;
   /** First-run wizard done. */
   onboarded: boolean;
+  /** The one-time invitation to the Krak Discord: not shown yet, put off, answered. */
+  communityInvite: 'pending' | 'later' | 'joined' | 'never';
+  /** When it was put off ("Not now"), in ms since 1970. */
+  communityInviteAt: number | null;
 }
 
 /** What the engine would record with given settings. */
@@ -172,14 +176,19 @@ export interface ExportRequest {
   /** 0 to 2, 1 = unchanged. `mic` only matters when the clip has a separate microphone track. */
   gains: { game: number; mic: number };
   /** copy: a new clip next to the original. discord: a file under `maxBytes`, put on the clipboard.
-   *  file: written to `path` (chosen with chooseExportPath), all tracks, original quality. */
-  target: 'copy' | 'discord' | 'file';
+   *  file: written to `path` (chosen with chooseExportPath), all tracks, original quality.
+   *  share: like discord, for the Krak community's bot (not put on the clipboard). */
+  target: 'copy' | 'discord' | 'file' | 'share';
   maxBytes: number | null;
   path?: string | null;
   /** Burn a small "by krak" badge in the top right corner (forces a re-encode). */
   watermark?: boolean;
   /** Stretch a clip narrower than 16:9 (a stretched 4:3) over 16:9 (forces a re-encode). */
   stretch?: boolean;
+  /** Vertical 9:16 (1080×1920), a window of the picture (forces a re-encode). */
+  vertical?: boolean;
+  /** Where that window is: 0 left, 1 right, 0.5 centred. */
+  cropX?: number;
 }
 
 export interface ExportResult {
@@ -210,6 +219,56 @@ export interface Presence {
   connected: boolean;
   /** Known while connected. */
   user: DiscordUser | null;
+}
+
+/** krakclip.com/api/community. `api` null: sharing from Krak is not open yet. */
+export interface CommunityInfo {
+  invite: string | null;
+  guildId: string | null;
+  clipsChannelId: string | null;
+  api: string | null;
+}
+
+/** A Discord account, as the Krak bot describes it. */
+export interface CommunityUser {
+  id: string;
+  username: string;
+  globalName: string | null;
+  avatarUrl: string | null;
+}
+
+export interface Pairing {
+  code: string;
+  /** dm: confirm in a DM from the bot. command: type `/share link code:<code>` in the server. */
+  via: 'dm' | 'command';
+  /** An ISO date or a timestamp. */
+  expiresAt: unknown;
+}
+
+export type PairStatus =
+  | { status: 'pending' }
+  | { status: 'linked'; user: CommunityUser }
+  | { status: 'expired' }
+  | { status: 'denied' };
+
+export interface CommunityMe {
+  user: CommunityUser | null;
+  canShare: boolean;
+  reason: string | null;
+  maxBytes: number;
+  remaining: { hour: number | null; day: number | null };
+  games: string[];
+  clipsUrl: string | null;
+  /** What the export must stay under; null when the server's limit is unusable. */
+  shareLimit: number | null;
+}
+
+/** What community commands fail with. */
+export interface CommunityError {
+  code: string;
+  reason: string | null;
+  retryAfter: number | null;
+  maxBytes: number | null;
 }
 
 export const api = {
@@ -251,6 +310,21 @@ export const api = {
   chooseExportPath: (suggestedName: string) => invoke<string | null>('choose_export_path', { suggestedName }),
   /** Shows a file made by an export (this session) in Explorer. */
   revealExport: (path: string) => invoke<void>('reveal_export', { path }),
+  /** The tray icon's badge, menu entry and tooltip for an update that waits (null: none). */
+  setUpdateBadge: (version: string | null) => invoke<void>('set_update_badge', { version }),
+  /** The calls below reach the network: only once the user asked to share (or to unlink). */
+  communityInfo: () => invoke<CommunityInfo>('community_info'),
+  /** The linked account, from the encrypted token file (no network). */
+  communityAccount: () => invoke<CommunityUser | null>('community_account'),
+  communityPair: () => invoke<Pairing>('community_pair'),
+  communityPairStatus: () => invoke<PairStatus>('community_pair_status'),
+  communityMe: () => invoke<CommunityMe>('community_me'),
+  /** Posts a file an export wrote this session; progress as `community-upload-progress`. */
+  communityUpload: (path: string, title: string, game: string | null, spoiler: boolean) =>
+    invoke<{ threadId: string; url: string }>('community_upload', { path, title, game, spoiler }),
+  communityCancelUpload: () => invoke<void>('community_cancel_upload'),
+  communityDelete: (threadId: string) => invoke<void>('community_delete', { threadId }),
+  communityUnlink: () => invoke<void>('community_unlink'),
 };
 
 type Events = {
@@ -264,6 +338,9 @@ type Events = {
   'capture-failed': string;
   'export-progress': { id: string; progress: number };
   navigate: string;
+  /** "Update Krak" was picked in the tray menu. */
+  'update-install': null;
+  'community-upload-progress': { sent: number; total: number };
 };
 
 export function on<E extends keyof Events>(event: E, handler: (payload: Events[E]) => void): Promise<UnlistenFn> {
@@ -275,4 +352,10 @@ export const mediaSrc = (path: string) => convertFileSrc(path);
 /** Backend errors are short codes ("exists", "hotkey_taken"…); anything else is unexpected. */
 export function errorCode(e: unknown): string {
   return typeof e === 'string' ? e : 'unknown';
+}
+
+/** A community command's error, or an unexpected one as such. */
+export function communityError(e: unknown): CommunityError {
+  if (e && typeof e === 'object' && typeof (e as CommunityError).code === 'string') return e as CommunityError;
+  return { code: typeof e === 'string' ? e : 'community_failed', reason: null, retryAfter: null, maxBytes: null };
 }

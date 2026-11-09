@@ -100,8 +100,16 @@ pub const DISCORD_BUDGET: f64 = 0.92;
 pub const DISCORD_PASSTHROUGH: f64 = 0.95;
 /// Second attempt when the first re-encode came out too big.
 pub const DISCORD_RETRY: f64 = 0.85;
-/// Discord exports carry one AAC stereo track at this rate.
+/// Discord exports carry one AAC stereo track at this rate...
 pub const DISCORD_AUDIO_BITRATE: u32 = 128_000;
+/// ...or at this one, the AAC encoder's lowest for stereo (still clean for game sound and
+/// voices), when the whole file has less than [`TIGHT_BUDGET`] a second: a long clip under a
+/// small limit, whose picture needs every bit.
+pub const DISCORD_AUDIO_BITRATE_LOW: u32 = 96_000;
+const TIGHT_BUDGET: f64 = 1_500_000.0;
+/// A re-encode gets at most this much more than the source's own bitrate (as H.264): a little
+/// more makes up for encoding twice, a lot more only makes a bigger file of the same picture.
+pub const REENCODE_HEADROOM: f64 = 1.25;
 /// Below this video bitrate the result is not worth watching: ask the user to trim.
 pub const MIN_VIDEO_BITRATE: f64 = 150_000.0;
 /// No point in more for a clip this short (and H.264 level limits).
@@ -110,7 +118,8 @@ const MAX_VIDEO_BITRATE: f64 = 50_000_000.0;
 const MAX_SIDE: u32 = 4096;
 const MAX_PIXELS: u64 = 4096 * 2304;
 
-/// Ladder: (minimum video bitrate, maximum short side).
+/// Ladder: (minimum video bitrate, maximum short side), for 60 frames a second; a clip with
+/// fewer frames needs proportionally less for the same bits per picture.
 const LADDER: [(f64, u32); 4] = [
     (5_000_000.0, 1080),
     (2_500_000.0, 720),
@@ -120,24 +129,47 @@ const LADDER: [(f64, u32); 4] = [
 /// Below this the frame rate drops to 30.
 const FULL_RATE_MIN_BITRATE: f64 = 3_000_000.0;
 
+/// The audio bitrate of a Discord export of `duration` seconds under `max_bytes`.
+pub fn discord_audio_bitrate(max_bytes: u64, duration: f64) -> u32 {
+    let total = max_bytes as f64 * DISCORD_BUDGET * 8.0 / duration.max(0.1);
+    if total < TIGHT_BUDGET {
+        DISCORD_AUDIO_BITRATE_LOW
+    } else {
+        DISCORD_AUDIO_BITRATE
+    }
+}
+
 /// Video settings for a Discord export of `duration` seconds under `max_bytes`, with
-/// `factor` = 1 for the first attempt and [`DISCORD_RETRY`] for the second.
+/// `factor` = 1 for the first attempt and [`DISCORD_RETRY`] for the second. `ceiling` is the
+/// most video bitrate worth spending on this source (see [`REENCODE_HEADROOM`]), when known:
+/// a large limit then makes a file as good as the source, not one many times its size.
 pub fn discord_target(
     source: (u32, u32),
     source_fps: f64,
     duration: f64,
     max_bytes: u64,
     factor: f64,
+    ceiling: Option<f64>,
 ) -> Result<VideoTarget, &'static str> {
     let total = max_bytes as f64 * DISCORD_BUDGET * 8.0 / duration.max(0.1);
-    let video = (total - f64::from(DISCORD_AUDIO_BITRATE)) * factor;
+    let video = (total - f64::from(discord_audio_bitrate(max_bytes, duration))) * factor;
     if video < MIN_VIDEO_BITRATE {
         return Err(TOO_LONG);
     }
-    let video = video.min(MAX_VIDEO_BITRATE);
+    let ceiling = ceiling
+        .filter(|c| c.is_finite() && *c > 0.0)
+        .map_or(MAX_VIDEO_BITRATE, |c| {
+            c.clamp(MIN_VIDEO_BITRATE, MAX_VIDEO_BITRATE)
+        });
+    // The retry's factor applies to the ceiling too: it must come out smaller.
+    let video = video
+        .min(ceiling * factor.min(1.0))
+        .clamp(MIN_VIDEO_BITRATE, MAX_VIDEO_BITRATE);
+    // A 30 fps clip keeps 1080p from 2.5 Mbit/s, like a 60 fps one from 5.
+    let rate_share = f64::from(output_fps(source_fps, 60)) / 60.0;
     let short_side = LADDER
         .iter()
-        .find(|(min, _)| video >= *min)
+        .find(|(min, _)| video >= *min * rate_share)
         .map_or(480, |(_, side)| *side);
     let (width, height) = fit(source, short_side);
     let cap = if video < FULL_RATE_MIN_BITRATE {
@@ -207,6 +239,44 @@ pub fn widescreen((width, height): (u32, u32)) -> Option<(u32, u32)> {
         return None;
     }
     Some(((wide / 2.0).round() as u32 * 2, height))
+}
+
+/// Output size of a vertical export: the 1080×1920 TikTok, YouTube Shorts and Reels expect.
+pub const VERTICAL: (u32, u32) = (1080, 1920);
+
+/// A rectangle of a picture, in pixels (even: 4:2:0 chroma).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Window {
+    pub x: u32,
+    pub y: u32,
+    pub width: u32,
+    pub height: u32,
+}
+
+/// The 9:16 window of a `frame` that a vertical export keeps: its whole height, at `position`
+/// across what is left (0: against the left edge, 1: the right one, 0.5: centred). `None` for
+/// a picture already 9:16 or narrower: it is kept whole.
+pub fn vertical_window((width, height): (u32, u32), position: f64) -> Option<Window> {
+    let (w, h) = (width & !1, height & !1);
+    if w < 2 || h < 2 {
+        return None;
+    }
+    let crop = ((f64::from(h) * 9.0 / 16.0 / 2.0).round() as u32 * 2).max(2);
+    if f64::from(crop) >= f64::from(w) * 0.99 {
+        return None;
+    }
+    let position = if position.is_finite() {
+        position.clamp(0.0, 1.0)
+    } else {
+        0.5
+    };
+    let x = ((f64::from(w - crop) * position / 2.0).round() as u32 * 2).min(w - crop);
+    Some(Window {
+        x,
+        y: 0,
+        width: crop,
+        height: h,
+    })
 }
 
 /// Scales `source` so its short side is at most `short_side` (never up), within the H.264
@@ -467,55 +537,191 @@ mod tests {
     }
 
     #[test]
+    fn crops_a_vertical_window() {
+        // 1080p: 608 px wide (1080 × 9/16, even), centred by default.
+        let w = vertical_window((1920, 1080), 0.5).unwrap();
+        assert_eq!(
+            w,
+            Window {
+                x: 656,
+                y: 0,
+                width: 608,
+                height: 1080
+            }
+        );
+        assert_eq!(w.x * 2 + w.width, 1920, "centred");
+        // Against either edge, and anything in between (even, inside the picture).
+        assert_eq!(vertical_window((1920, 1080), 0.0).unwrap().x, 0);
+        assert_eq!(vertical_window((1920, 1080), 1.0).unwrap().x, 1920 - 608);
+        assert_eq!(vertical_window((1920, 1080), -3.0).unwrap().x, 0);
+        assert_eq!(vertical_window((1920, 1080), 7.0).unwrap().x, 1312);
+        assert_eq!(vertical_window((1920, 1080), f64::NAN).unwrap().x, 656);
+        for size in [
+            (2560, 1440),
+            (1280, 720),
+            (3440, 1440),
+            (1440, 1080),
+            (1366, 767),
+        ] {
+            for step in 0..=20 {
+                let w = vertical_window(size, f64::from(step) / 20.0).unwrap();
+                assert!(
+                    [w.x, w.width, w.height].iter().all(|v| v % 2 == 0),
+                    "{size:?}: {w:?}"
+                );
+                assert!(
+                    w.x + w.width <= size.0 && w.height <= size.1,
+                    "{size:?}: {w:?}"
+                );
+                let ratio = f64::from(w.width) / f64::from(w.height);
+                assert!((ratio - 9.0 / 16.0).abs() < 0.01, "{size:?}: {ratio}");
+            }
+        }
+        // Already vertical (or close to it): kept whole.
+        for size in [(1080, 1920), (608, 1080), (720, 1280), (0, 0), (1, 1)] {
+            assert_eq!(vertical_window(size, 0.5), None, "{size:?}");
+        }
+    }
+
+    #[test]
+    fn plans_vertical_exports_like_any_portrait_video() {
+        let mb = 1_000_000u64;
+        // Short enough: 1080×1920 for Discord too.
+        let t = discord_target(VERTICAL, 60.0, 10.0, 20 * mb, 1.0, None).unwrap();
+        assert_eq!((t.width, t.height, t.fps), (1080, 1920, 60));
+        // Longer: the ladder keeps it vertical.
+        let t = discord_target(VERTICAL, 60.0, 30.0, 20 * mb, 1.0, None).unwrap();
+        assert_eq!((t.width, t.height), (720, 1280));
+        let t = copy_target(VERTICAL, 60.0, Some(20_000_000.0));
+        assert_eq!((t.width, t.height, t.bitrate), (1080, 1920, 20_000_000));
+    }
+
+    #[test]
     fn discord_ladder() {
         let src = (1920, 1080);
         let mb = 1_000_000u64;
         // 10 MB over 10 s: 7.36 Mbit/s total, 7.23 for video: 1080p60.
-        let t = discord_target(src, 60.0, 10.0, 10 * mb, 1.0).unwrap();
+        let t = discord_target(src, 60.0, 10.0, 10 * mb, 1.0, None).unwrap();
         assert_eq!((t.width, t.height, t.fps), (1920, 1080, 60));
         assert_eq!(t.bitrate, 7_232_000);
         // 30 s: 2.32 Mbit/s → 540p, under 3 Mbit/s → 30 fps.
-        let t = discord_target(src, 60.0, 30.0, 10 * mb, 1.0).unwrap();
+        let t = discord_target(src, 60.0, 30.0, 10 * mb, 1.0, None).unwrap();
         assert_eq!((t.width, t.height, t.fps), (960, 540, 30));
         // 20 s: 3.55 Mbit/s → 720p60.
-        let t = discord_target(src, 60.0, 20.0, 10 * mb, 1.0).unwrap();
+        let t = discord_target(src, 60.0, 20.0, 10 * mb, 1.0, None).unwrap();
         assert_eq!((t.width, t.height, t.fps), (1280, 720, 60));
         // 60 s: 1.1 Mbit/s → 480p30 (854 wide, even).
-        let t = discord_target(src, 60.0, 60.0, 10 * mb, 1.0).unwrap();
+        let t = discord_target(src, 60.0, 60.0, 10 * mb, 1.0, None).unwrap();
         assert_eq!((t.width, t.height, t.fps), (854, 480, 30));
         // The retry spends 85 % of the video budget.
-        let first = discord_target(src, 60.0, 10.0, 10 * mb, 1.0).unwrap();
-        let retry = discord_target(src, 60.0, 10.0, 10 * mb, DISCORD_RETRY).unwrap();
+        let first = discord_target(src, 60.0, 10.0, 10 * mb, 1.0, None).unwrap();
+        let retry = discord_target(src, 60.0, 10.0, 10 * mb, DISCORD_RETRY, None).unwrap();
         assert_eq!(retry.bitrate, (f64::from(first.bitrate) * 0.85) as u32);
         // Short clips: capped bitrate, source size and rate kept (never upscaled).
-        let t = discord_target((1280, 720), 30.0, 1.0, 500 * mb, 1.0).unwrap();
+        let t = discord_target((1280, 720), 30.0, 1.0, 500 * mb, 1.0, None).unwrap();
         assert_eq!(
             (t.width, t.height, t.fps, t.bitrate),
             (1280, 720, 30, 50_000_000)
         );
         // 1440p source at 1080p; portrait keeps its orientation.
-        let t = discord_target((2560, 1440), 60.0, 5.0, 10 * mb, 1.0).unwrap();
+        let t = discord_target((2560, 1440), 60.0, 5.0, 10 * mb, 1.0, None).unwrap();
         assert_eq!((t.width, t.height), (1920, 1080));
-        let t = discord_target((1080, 1920), 60.0, 30.0, 10 * mb, 1.0).unwrap();
+        let t = discord_target((1080, 1920), 60.0, 30.0, 10 * mb, 1.0, None).unwrap();
         assert_eq!((t.width, t.height), (540, 960));
+    }
+
+    #[test]
+    fn no_nitro_limit_stays_under_20_mib() {
+        // The UI asks for 20 000 000 bytes without Nitro (Discord allows 20 MiB): even a
+        // passthrough at the very top of what is kept leaves the container some room.
+        let max_bytes = 20 * 1_000_000u64;
+        let mib20 = 20.0 * 1024.0 * 1024.0;
+        assert!(max_bytes as f64 * DISCORD_PASSTHROUGH < mib20 * 0.91);
+        assert!(max_bytes as f64 * DISCORD_BUDGET < mib20 * 0.88);
+        // 30 s: 4.91 Mbit/s total, 4.78 for video: 720p60 (it was 540p30 under 10 MB).
+        let t = discord_target((1920, 1080), 60.0, 30.0, max_bytes, 1.0, None).unwrap();
+        assert_eq!((t.width, t.height, t.fps), (1280, 720, 60));
+        assert_eq!(t.bitrate, 4_778_666);
+        // 10 s: 1080p60.
+        let t = discord_target((1920, 1080), 60.0, 10.0, max_bytes, 1.0, None).unwrap();
+        assert_eq!((t.width, t.height, t.fps), (1920, 1080, 60));
     }
 
     #[test]
     fn too_long_below_the_minimum_bitrate() {
         let mb = 1_000_000u64;
-        // 10 MB over 5 minutes: 245 kbit/s total, 117 for video.
+        // 10 MB over 5 minutes: 245 kbit/s total, 149 for video (96 for the sound).
         assert_eq!(
-            discord_target((1920, 1080), 60.0, 300.0, 10 * mb, 1.0),
+            discord_target((1920, 1080), 60.0, 300.0, 10 * mb, 1.0, None),
             Err(TOO_LONG)
         );
-        // 10 MB over 250 s: 166 kbit/s of video works at first, not at 85 %.
-        let first = discord_target((1920, 1080), 60.0, 250.0, 10 * mb, 1.0).unwrap();
-        assert_eq!((first.height, first.fps, first.bitrate), (480, 30, 166_400));
+        // 10 MB over 290 s: 158 kbit/s of video works at first, not at 85 %.
+        let first = discord_target((1920, 1080), 60.0, 290.0, 10 * mb, 1.0, None).unwrap();
+        assert_eq!((first.height, first.fps, first.bitrate), (480, 30, 157_793));
         assert_eq!(
-            discord_target((1920, 1080), 60.0, 250.0, 10 * mb, DISCORD_RETRY),
+            discord_target((1920, 1080), 60.0, 290.0, 10 * mb, DISCORD_RETRY, None),
             Err(TOO_LONG)
         );
-        assert!(discord_target((1920, 1080), 60.0, 300.0, 50 * mb, 1.0).is_ok());
+        assert!(discord_target((1920, 1080), 60.0, 300.0, 50 * mb, 1.0, None).is_ok());
+    }
+
+    #[test]
+    fn lighter_sound_when_the_budget_is_tight() {
+        let mb = 1_000_000u64;
+        // 20 MB over a minute: 2.45 Mbit/s, the usual 128 kbit/s; over two: 96.
+        assert_eq!(discord_audio_bitrate(20 * mb, 60.0), DISCORD_AUDIO_BITRATE);
+        assert_eq!(
+            discord_audio_bitrate(20 * mb, 120.0),
+            DISCORD_AUDIO_BITRATE_LOW
+        );
+        assert_eq!(
+            discord_audio_bitrate(500 * mb, 300.0),
+            DISCORD_AUDIO_BITRATE
+        );
+        // The 32 kbit/s go to the picture.
+        let t = discord_target((1920, 1080), 60.0, 120.0, 20 * mb, 1.0, None).unwrap();
+        assert_eq!(t.bitrate, 1_130_666);
+    }
+
+    #[test]
+    fn ladder_follows_the_frame_rate() {
+        let mb = 1_000_000u64;
+        // 3.55 Mbit/s of video: 720p60 for a 60 fps clip, but 1080p for a 30 fps one (as many
+        // bits per picture as 1080p60 at 7 Mbit/s); 24 fps the same.
+        let t = discord_target((1920, 1080), 60.0, 20.0, 10 * mb, 1.0, None).unwrap();
+        assert_eq!((t.height, t.fps), (720, 60));
+        let t = discord_target((1920, 1080), 30.0, 20.0, 10 * mb, 1.0, None).unwrap();
+        assert_eq!((t.height, t.fps), (1080, 30));
+        let t = discord_target((1920, 1080), 23.976, 20.0, 10 * mb, 1.0, None).unwrap();
+        assert_eq!((t.height, t.fps), (1080, 24));
+        // 144 fps is exported at 60: the 60 fps ladder.
+        let t = discord_target((1920, 1080), 144.0, 20.0, 10 * mb, 1.0, None).unwrap();
+        assert_eq!((t.height, t.fps), (720, 60));
+        // An unknown rate is exported at 30: its ladder too.
+        let t = discord_target((1920, 1080), 0.0, 20.0, 10 * mb, 1.0, None).unwrap();
+        assert_eq!((t.height, t.fps), (1080, 30));
+    }
+
+    #[test]
+    fn never_spends_much_more_than_the_source() {
+        let mb = 1_000_000u64;
+        // A 12 Mbit/s HEVC clip under 500 MB: 21 Mbit/s of H.264 (×1.4 for H.264, ×1.25
+        // headroom), not 50.
+        let ceiling = Some(12_000_000.0 * 1.4 * REENCODE_HEADROOM);
+        let t = discord_target((1920, 1080), 60.0, 30.0, 500 * mb, 1.0, ceiling).unwrap();
+        assert_eq!((t.width, t.fps), (1920, 60));
+        assert!(t.bitrate.abs_diff(21_000_000) <= 1, "{}", t.bitrate);
+        // The retry still comes out smaller.
+        let retry = discord_target((1920, 1080), 60.0, 30.0, 500 * mb, DISCORD_RETRY, ceiling);
+        assert!(retry.unwrap().bitrate.abs_diff(17_850_000) <= 1);
+        // Under a small limit the budget decides, as before.
+        let t = discord_target((1920, 1080), 60.0, 30.0, 20 * mb, 1.0, ceiling).unwrap();
+        assert_eq!(t.bitrate, 4_778_666);
+        // A source of almost nothing still gets a watchable minimum; nonsense is ignored.
+        let t = discord_target((1920, 1080), 60.0, 30.0, 20 * mb, 1.0, Some(10_000.0)).unwrap();
+        assert_eq!(t.bitrate, MIN_VIDEO_BITRATE as u32);
+        let t = discord_target((1920, 1080), 60.0, 1.0, 500 * mb, 1.0, Some(f64::NAN)).unwrap();
+        assert_eq!(t.bitrate, 50_000_000);
     }
 
     #[test]

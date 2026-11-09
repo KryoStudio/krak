@@ -2,6 +2,7 @@
 import { api, errorCode, type Shard } from './api';
 import { hasKey, t } from './i18n.svelte';
 import { library } from './library.svelte';
+import { shareShard } from './share.svelte';
 import { confirm, toast, ui, type MenuItem } from './ui.svelte';
 
 export const gameName = (s: Shard) => s.game ?? t('game.desktop');
@@ -83,6 +84,7 @@ export function shardMenu(s: Shard): MenuItem[] {
     { label: t(s.favorite ? 'shard.unfavorite' : 'shard.favorite'), icon: 'star', shortcut: 'F', run: () => toggleFavorite(s) },
     'separator',
     { label: t('shard.copy'), icon: 'copy', shortcut: 'Ctrl+C', run: () => copy(s) },
+    { label: t('share.title'), icon: 'users', run: () => shareShard(s) },
     { label: t('shard.reveal'), icon: 'folder', run: () => reveal(s) },
     'separator',
     { label: t('shard.delete'), icon: 'trash', shortcut: t('key.delete'), danger: true, run: () => remove(s) },

@@ -1,10 +1,15 @@
-// The editor remembers each clip's trim and volumes, so reopening it starts where you left off.
-// Kept per PC in local storage, keyed by shard id (moved on rename, dropped on delete).
+// The editor remembers each clip's trim, volumes and vertical framing, so reopening it starts
+// where you left off. Kept per PC in local storage, keyed by shard id (moved on rename, dropped
+// on delete).
 
 export interface Edit {
   start: number;
   end: number;
   gains: { game: number; mic: number };
+  /** Exported as a vertical 9:16 window (absent in edits saved before it existed). */
+  vertical?: boolean;
+  /** Where that window is: 0 left, 1 right, 0.5 centred. */
+  cropX?: number;
 }
 
 const KEY = 'krak.edits';
@@ -33,7 +38,12 @@ export function getEdit(id: string): Edit | null {
 export function saveEdit(id: string, edit: Edit, duration: number) {
   const all = readAll();
   const untouched =
-    edit.start <= 0.05 && edit.end >= duration - 0.05 && edit.gains.game === 1 && edit.gains.mic === 1;
+    edit.start <= 0.05 &&
+    edit.end >= duration - 0.05 &&
+    edit.gains.game === 1 &&
+    edit.gains.mic === 1 &&
+    !edit.vertical &&
+    Math.abs((edit.cropX ?? 0.5) - 0.5) < 0.005;
   if (untouched) delete all[id];
   else all[id] = edit;
   writeAll(all);
