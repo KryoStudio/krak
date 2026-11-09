@@ -453,6 +453,13 @@ fn editor_end_to_end() {
             .collect()
     };
     println!("source keyframes at {keyframes:?}");
+    // A copy from 1.0 s starts at the keyframe there, which follows the display's own clock
+    // (119.98 Hz for "120": 1.00012 s), not exactly 1.0: compare the sound from there.
+    let copy_start = keyframes
+        .iter()
+        .copied()
+        .find(|k| (k - 1.0).abs() < 0.01)
+        .unwrap_or(1.0);
 
     // Out of range.
     let bad = run(
@@ -545,7 +552,7 @@ fn editor_end_to_end() {
     assert!((149..=151).contains(&shown), "{shown} frames shown");
     // Audio, with our decoder (edit lists applied): Mic silent, Game and Mix = half the
     // original game audio.
-    let source_game = channel(&our_audio(&source, "Game", 1.0, 3.5), 0);
+    let source_game = channel(&our_audio(&source, "Game", copy_start, copy_start + 2.5), 0);
     let copy_mix = our_audio(&exported.path, "Mix", 0.0, 2.5);
     let copy_game = channel(&our_audio(&exported.path, "Game", 0.0, 2.5), 0);
     let copy_mic = our_audio(&exported.path, "Microphone", 0.0, 2.5);
