@@ -120,6 +120,10 @@ struct Timings {
     convert: Stage,
     encode: Stage,
     encoder: EncodeStats,
+    /// Display updates seen, and the tick grid's moves (`PhaseLock`), in engine ticks.
+    updates: u64,
+    corrections: u64,
+    shift: i64,
 }
 
 /// Frame-rate health of a pipeline, logged when it ends.
@@ -656,7 +660,11 @@ impl Pipeline {
             let polled = clock::now();
             self.timings.desktop.add(polled - now);
             if let Some(presented) = self.dup.as_mut().and_then(Duplication::take_presented) {
-                start += phase.correct(now, presented);
+                let shift = phase.correct(now, presented);
+                start += shift;
+                self.timings.updates += 1;
+                self.timings.corrections += u64::from(shift != 0);
+                self.timings.shift += shift;
             }
             if self.blank {
                 // No desktop image yet in a new copy (pipeline start, display mode change):
@@ -755,12 +763,22 @@ impl Pipeline {
         let memory = d3d::video_memory(&self.gpu)
             .map(|(usage, budget)| format!("; video memory {} of {} MB", usage >> 20, budget >> 20))
             .unwrap_or_default();
+        let phase = if t.corrections > 0 {
+            format!(
+                "; ticks locked to the display ({} of {} updates moved them, {:+.1} ms in all)",
+                t.corrections,
+                t.updates,
+                t.shift as f64 / 1e4
+            )
+        } else {
+            format!("; {} display updates", t.updates)
+        };
         let engine = match (shared.contention.total(), shared.contention.ours()) {
             (Some(total), Some(ours)) => format!("; 3D engine {total} % busy ({ours} % ours)"),
             _ => String::new(),
         };
         eprintln!(
-            "krak: health over {seconds:.0} s: {:.1} fps encoded ({} configured, tier {:?}, one tick in {}), {} late ticks, GPU behind on {} ticks (worst backlog {}); ms per tick avg/worst: desktop {}, convert {}, encode {} (map {:.0} ms, submit {:.0} ms, lock {:.0} ms in total){memory}{engine}",
+            "krak: health over {seconds:.0} s: {:.1} fps encoded ({} configured, tier {:?}, one tick in {}), {} late ticks, GPU behind on {} ticks (worst backlog {}); ms per tick avg/worst: desktop {}, convert {}, encode {} (map {:.0} ms, submit {:.0} ms, lock {:.0} ms in total){memory}{engine}{phase}",
             stats.frames_in.saturating_sub(t.encoder.frames_in) as f64 / seconds.max(0.001),
             self.plan.resolved.fps,
             self.plan.tier,
@@ -1461,6 +1479,8 @@ struct PhaseLock {
     last: Option<i64>,
     /// The last 16 updates: on the refresh grid or not (one bit each).
     aligned: u16,
+    /// The tick's place in the refresh against mid-way, smoothed over timer jitter.
+    error: f64,
 }
 
 impl PhaseLock {
@@ -1478,6 +1498,7 @@ impl PhaseLock {
             },
             last: None,
             aligned: 0,
+            error: 0.0,
         }
     }
 
@@ -1495,9 +1516,15 @@ impl PhaseLock {
         if self.aligned.count_ones() < 12 {
             return 0;
         }
-        // > 0: the tick comes late in the refresh, close to the next update.
+        // > 0: the tick comes late in the refresh, close to the next update. Smoothed, and
+        // left alone within the middle quarter: the grid moves only when it drifts out (the
+        // rates differ a little), so frame durations stay the configured ones nearly always.
         let error = ((now - presented) as f64).rem_euclid(r) - r / 2.0;
-        -(error / 16.0).clamp(-r / 50.0, r / 50.0).round() as i64
+        self.error += (error - self.error) / 8.0;
+        if self.error.abs() < r / 8.0 {
+            return 0;
+        }
+        -(self.error / 16.0).clamp(-r / 50.0, r / 50.0).round() as i64
     }
 }
 
@@ -1765,19 +1792,25 @@ pub(super) mod tests {
         let mut lock = PhaseLock::new(refresh_hz, fps);
         let mut start = 0i64;
         let mut worst_late = 0.0f64;
+        let mut moved = 0;
+        let mut x = 99u64;
         for tick in 0..(60 * fps) {
-            let now = start + tick * TICKS_PER_SECOND / fps;
+            // Timer jitter: woken up to 0.5 ms late.
+            x = x.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let now = start + tick * TICKS_PER_SECOND / fps + (x >> 33) as i64 % 5_000;
             // The last update shown at or before `now`.
             let presented = ((now as f64 / r).floor() * r) as i64;
             let shift = lock.correct(now, presented);
             assert!(shift.abs() as f64 <= r / 50.0 + 1.0);
             start += shift;
-            if tick > fps {
+            if tick > 2 * fps {
                 let phase = ((now - presented) as f64).rem_euclid(r);
                 worst_late = worst_late.max((phase - r / 2.0).abs());
+                moved += usize::from(shift != 0);
             }
         }
-        assert!(worst_late < r / 8.0, "phase error {worst_late} of {r}");
+        assert!(worst_late < r / 4.0, "phase error {worst_late} of {r}");
+        assert!(moved < 58 * fps as usize / 4, "moved {moved} ticks");
 
         // Updates at random times: no correction.
         let mut lock = PhaseLock::new(refresh_hz, fps);
