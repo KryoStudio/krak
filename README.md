@@ -50,6 +50,7 @@ A clip is called a **shard**. Your library is the **Glacier**.
 - [x] Game-only capture ("stream-proof"): only the game's window is filmed, found by itself or picked from the open apps, so overlays, notifications, Discord and the desktop never end up in a clip
 - [x] Choice of the captured screen, and the mouse cursor in clips (optional)
 - [x] Editor tools: cut a passage out, mute or bleep the mic or the game over a zone, slow motion, blurred zones, captions, all previewed live
+- [x] Easy to edit: zones dragged on the timeline (or S at the start and end), handles to adjust them, one key per tool, Ctrl+Z / Ctrl+Y in the editor and the best-of, and a shortcuts help
 - [x] Best-of: shards one after another as edited, cut, fade or flash transitions, an intro title, your music lowered under voices and action, 16:9 or 9:16, with a guided tour
 - [x] Markers: a shortcut marks a moment while you play, found again on the editor's timeline
 - [x] Collections: shards grouped by hand (a session, a tournament, a montage to come), the files staying where they are
