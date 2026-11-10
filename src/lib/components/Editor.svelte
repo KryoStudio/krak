@@ -3,23 +3,30 @@
      Discord. A zone selected on the timeline's ruler can be cut out, muted or bleeped, slowed
      down; captions and blurred zones go on the picture (moved on the player). All of it is
      previewed live: cut passages are skipped, mutes and bleeps heard, slow motion played.
+     A zone is dragged on the lanes (its edges then dragged), or marked from the keyboard: S at
+     its start and again at its end, or a tool's key twice (X cut, M mute, B bleep, R slow). A
+     tool with no zone applies for a few seconds from the playhead. Ctrl+Z / Ctrl+Y undo and
+     redo; the toolbar's help (or "?") lists every key and opens by itself the first time.
      Keys: Space play/pause, I/O set the start/end at the playhead, ←/→ seek (Shift: 5 s),
-     X cut the zone, Delete remove the selected effect, Escape let go of the zone. -->
+     Delete remove the selected effect, Escape let go of the zone. -->
 <script lang="ts">
   import { onDestroy, onMount, untrack } from 'svelte';
   import Icon from './Icon.svelte';
   import Timeline, { type Lane } from './Timeline.svelte';
   import ExportDialog from './ExportDialog.svelte';
+  import EditorHelp from './EditorHelp.svelte';
   import Segmented from './Segmented.svelte';
   import Toggle from './Toggle.svelte';
   import { api, mediaSrc, native, type Shard, type ShardInfo, type Waveform } from '$lib/api';
   import { getEdit, saveEdit, type Edit } from '$lib/edits';
+  import { History } from '$lib/history.svelte';
   import {
     CAPTION_SIZES,
     add,
     cutAt,
     fx,
     hasEffects,
+    listOf,
     loadEffects,
     muteAt,
     playedLength,
@@ -44,6 +51,7 @@
     video,
     mix,
     onedit,
+    busy = $bindable(false),
   }: {
     shard: Shard;
     video?: HTMLVideoElement;
@@ -51,6 +59,9 @@
     mix?: LiveMix;
     /** Every change of the trim or volumes, as it happens. */
     onedit?: (edit: Edit) => void;
+    /** Escape has something to let go of here (the help, a zone, a selected effect) before it
+     *  closes the editor. */
+    busy?: boolean;
   } = $props();
 
   const BUCKETS = 800;
@@ -69,6 +80,15 @@
   let zone = $state<Range | null>(null);
   /** Markers put while the clip was recorded (seconds into it). */
   let markers = $state<number[]>([]);
+  /** Where an open zone starts (S, or a tool's key, pressed once): the zone follows the playhead
+   *  until the second press. */
+  let pending = $state<number | null>(null);
+  /** The help with the shortcuts is open. */
+  let helping = $state(false);
+  const HELP_KEY = 'krak.guide.editor';
+  $effect(() => {
+    busy = helping || pending !== null || !!zone || !!fx.selected;
+  });
 
   const duration = $derived(info?.duration ?? 0);
   const hasMic = $derived(!!info?.audioTracks.some((track) => track.kind === 'mic'));
@@ -100,6 +120,31 @@
     ];
   });
 
+  // Ctrl+Z / Ctrl+Y over the whole edit: trim, volumes, framing, effects.
+  const history = new History<Edit>(
+    () => ({ start, end, gains: { ...gains }, vertical: framing.vertical, cropX: framing.x, fx: snapshot() }),
+    (edit) => {
+      start = edit.start;
+      end = edit.end;
+      gains = { ...edit.gains };
+      framing.vertical = !!edit.vertical;
+      framing.x = edit.cropX ?? 0.5;
+      const picked = fx.selected;
+      loadEffects(edit.fx);
+      if (picked && listOf(picked.kind).length > picked.index) fx.selected = picked;
+      pending = null;
+      zone = null;
+    },
+  );
+
+  function undo() {
+    history.undo();
+  }
+
+  function redo() {
+    history.redo();
+  }
+
   // What the clip contains and its waveforms. Only a change of clip re-runs this.
   $effect(() => {
     const id = shard.id;
@@ -122,6 +167,8 @@
     };
     waveforms = null;
     loadedId = null;
+    history.dispose();
+    pending = null;
     framing.vertical = false;
     framing.x = 0.5;
     loadEffects(null);
@@ -143,6 +190,7 @@
       loadEffects(saved?.fx);
       if (saved) seek(start);
       loadedId = id;
+      history.reset();
     };
     if (real) {
       api.probeShard(id).then(apply, () => apply(fallback));
@@ -185,7 +233,10 @@
     const id = loadedId;
     const d = duration;
     if (!id || id !== shard.id || !d) return;
-    untrack(() => onedit?.(edit));
+    untrack(() => {
+      onedit?.(edit);
+      history.changed();
+    });
     const save = () => {
       saveEdit(id, edit, d);
       unsaved = null;
@@ -196,6 +247,7 @@
   });
   onDestroy(() => {
     unsaved?.();
+    history.dispose();
     setBeep(0);
     if (video) video.playbackRate = 1;
     fx.selected = null;
@@ -232,6 +284,12 @@
           setBeep(playing ? muted.beep : 0);
         }
       }
+      // An open zone stretches to the playhead.
+      if (pending !== null) {
+        const from = Math.min(pending, current);
+        const to = Math.max(pending, current);
+        if (!zone || zone.start !== from || zone.end !== to) zone = { start: from, end: to };
+      }
       frame = requestAnimationFrame(tick);
     });
     return () => cancelAnimationFrame(frame);
@@ -265,27 +323,66 @@
 
   // Tools ------------------------------------------------------------------------------
 
+  /** How long a tool lasts when no zone is chosen, from the playhead (s). */
+  const DEFAULT_LENGTH = 3;
+
   const clampZone = (z: Range): Range => ({ start: Math.max(0, z.start), end: Math.min(duration, z.end) });
 
+  /** Starts a zone at the playhead; it follows the playhead until `closeZone`. */
+  function openZone() {
+    fx.selected = null;
+    pending = current;
+    zone = { start: current, end: current };
+  }
+
+  /** Ends the open zone at the playhead (too short: no zone). */
+  function closeZone() {
+    if (pending === null) return;
+    const from = Math.min(pending, current);
+    const to = Math.max(pending, current);
+    pending = null;
+    zone = to - from >= 0.1 ? { start: from, end: to } : null;
+  }
+
+  /** S: the start of a zone, then its end. */
+  function markZone() {
+    if (pending === null) openZone();
+    else closeZone();
+  }
+
+  function clearZone() {
+    pending = null;
+    zone = null;
+  }
+
+  /** What a tool applies to: the zone (an open one ends at the playhead), or a few seconds from
+   *  the playhead, inside the kept part of the clip. */
+  function toolRange(): Range {
+    closeZone();
+    if (zone) return clampZone(zone);
+    let from = Math.min(Math.max(current, start), end);
+    const to = Math.min(end, from + DEFAULT_LENGTH);
+    if (to - from < 1) from = Math.max(start, to - DEFAULT_LENGTH);
+    return { start: from, end: to };
+  }
+
   function cutZone() {
-    if (!zone) return;
-    add('cut', clampZone(zone));
+    add('cut', toolRange());
     zone = null;
   }
 
   function muteZone(track: MuteTrack, beep: boolean) {
-    if (!zone) return;
-    add('mute', { ...clampZone(zone), track, beep });
+    add('mute', { ...toolRange(), track, beep });
     zone = null;
   }
 
   function slowZone(rate: number) {
-    if (!zone) return;
-    add('slow', { ...clampZone(zone), rate });
+    add('slow', { ...toolRange(), rate });
     zone = null;
   }
 
   function addText() {
+    closeZone();
     const range = zone ? clampZone(zone) : { start: current, end: Math.min(end, current + 3) };
     if (range.end - range.start < 0.3) range.end = Math.min(duration, range.start + 3);
     add('text', { ...range, text: t('editor.textDefault'), x: 0.5, y: 0.82, size: CAPTION_SIZES.m, style: 'shadow' });
@@ -293,8 +390,21 @@
   }
 
   function addBlur() {
+    closeZone();
     add('blur', { x: 0.36, y: 0.36, w: 0.28, h: 0.28, ...(zone ? clampZone(zone) : {}) });
     zone = null;
+  }
+
+  /** A tool's key: the first press starts a zone at the playhead, the second ends it there and
+   *  applies the tool. With a zone already chosen, applies it right away. */
+  function byKey(apply: () => void) {
+    if (pending === null && !zone) return openZone();
+    if (pending !== null) {
+      closeZone();
+      // Pressed twice at the same moment: nothing to apply it to.
+      if (!zone) return;
+    }
+    apply();
   }
 
   function menuAt(e: MouseEvent, items: { label: string; run: () => void }[]) {
@@ -306,6 +416,8 @@
     (hasMic ? (['mic', 'game', 'all'] as const) : (['game'] as const)).map((value) => ({ value: value as MuteTrack, label: t(`editor.track.${value}`) })),
   );
   const rates = [0.5, 0.25].map((value) => ({ value, label: `×${value}` }));
+  /** The track M and B act on: the microphone when it has its own track. */
+  const quickTrack = $derived<MuteTrack>(hasMic ? 'mic' : 'game');
   const sizes = $derived(
     (Object.entries(CAPTION_SIZES) as [keyof typeof CAPTION_SIZES, number][]).map(([key, value]) => ({ value, label: t(`editor.textSize.${key}`) })),
   );
@@ -317,14 +429,30 @@
   const played = $derived(playedLength(start, end, fx));
 
   function onkeydown(e: KeyboardEvent) {
-    const tag = (e.target as HTMLElement).tagName;
-    if (tag === 'INPUT' || tag === 'TEXTAREA' || e.ctrlKey || e.altKey) return;
+    const target = e.target as HTMLElement;
+    const tag = target.tagName;
+    if (tag === 'INPUT' || tag === 'TEXTAREA' || target.isContentEditable || e.altKey || exporting || e.defaultPrevented) return;
     const key = e.key.toLowerCase();
-    if (key === 'x' && zone) cutZone();
+    if (e.ctrlKey || e.metaKey) {
+      if (key === 'z' && !e.shiftKey) undo();
+      else if (key === 'y' || (key === 'z' && e.shiftKey)) redo();
+      else return;
+      e.preventDefault();
+      return;
+    }
+    if (e.key === '?') helping = !helping;
+    else if (key === 's') markZone();
+    else if (key === 'x') byKey(cutZone);
+    else if (key === 'm') byKey(() => muteZone(quickTrack, false));
+    else if (key === 'b') byKey(() => muteZone(quickTrack, true));
+    else if (key === 'r') byKey(() => slowZone(0.5));
     else if ((key === 'delete' || key === 'backspace') && fx.selected) remove(fx.selected.kind, fx.selected.index);
-    else if (key === 'escape' && (zone || fx.selected)) {
-      zone = null;
-      fx.selected = null;
+    else if (key === 'escape' && (helping || pending !== null || zone || fx.selected)) {
+      if (helping) helping = false;
+      else {
+        clearZone();
+        fx.selected = null;
+      }
     } else if (key === ' ' && tag !== 'BUTTON') toggle();
     else if (key === 'i') start = Math.min(current, end - 0.5);
     else if (key === 'o') end = Math.max(current, start + 0.5);
@@ -334,6 +462,23 @@
     e.preventDefault();
   }
 
+  // The help opens by itself the first time the editor does.
+  onMount(() => {
+    try {
+      if (localStorage.getItem(HELP_KEY) !== '1') helping = true;
+    } catch {
+      // no storage: it stays closed
+    }
+  });
+  $effect(() => {
+    if (!helping) return;
+    try {
+      localStorage.setItem(HELP_KEY, '1');
+    } catch {
+      // no storage
+    }
+  });
+
   const clock = (time: number) => {
     const m = Math.floor(time / 60);
     const s = (time % 60).toFixed(1).padStart(4, '0');
@@ -341,11 +486,17 @@
   };
 </script>
 
-<svelte:window {onkeydown} />
+<svelte:window
+  {onkeydown}
+  onpointerdown={() => history.hold(true)}
+  onpointerup={() => history.hold(false)}
+  onpointercancel={() => history.hold(false)}
+  onblur={() => history.hold(false)}
+/>
 
 <div class="editor">
   <div class="toolbar">
-    <button class="play" onclick={toggle} aria-label={t('shard.play')} use:tooltip={{ text: `${t('shard.play')} · Espace`, side: 'top' }}>
+    <button class="play" onclick={toggle} aria-label={t('shard.play')} use:tooltip={{ text: `${t('shard.play')} · ${t('key.space')}`, side: 'top' }}>
       <Icon name={playing ? 'pause' : 'play'} size={15} fill />
     </button>
     <span class="clock">{clock(current)} <span>/ {clock(duration)}</span></span>
@@ -361,7 +512,7 @@
       </button>
       {#if trimmed}
         <button class="chip" onclick={() => ((start = 0), (end = duration))} aria-label={t('editor.reset')} use:tooltip={{ text: t('editor.reset'), side: 'top' }}>
-          <Icon name="undo" size={13} />
+          <Icon name="refresh" size={13} />
         </button>
       {/if}
       <span class="selection" class:trimmed={trimmed || hasEffects(fx)}>{t('editor.selection', { duration: `${(hasEffects(fx) ? played : selection).toFixed(1)} s` })}</span>
@@ -381,6 +532,26 @@
     {/if}
 
     <div class="actions">
+      <button class="chip" onclick={undo} disabled={!history.canUndo} aria-label={t('editor.undo')} use:tooltip={{ text: `${t('editor.undo')} · Ctrl+Z`, side: 'top' }}>
+        <Icon name="undo" size={14} />
+      </button>
+      <button class="chip" onclick={redo} disabled={!history.canRedo} aria-label={t('editor.redo')} use:tooltip={{ text: `${t('editor.redo')} · Ctrl+Y`, side: 'top' }}>
+        <Icon name="redo" size={14} />
+      </button>
+      <button
+        class="chip help-button"
+        class:on={helping}
+        data-editor-help
+        onclick={() => (helping = !helping)}
+        aria-expanded={helping}
+        use:tooltip={{ text: `${t('editor.help.title')} · ?`, side: 'top' }}
+      >
+        <Icon name="keyboard" size={14} />{t('editor.shortcuts')}
+      </button>
+      {#if helping}
+        <EditorHelp onclose={() => (helping = false)} />
+      {/if}
+      <span class="divider"></span>
       <button class="button primary" onclick={() => (exporting = true)} disabled={!info}>
         <Icon name="share" size={14} />{t('export.title')}
       </button>
@@ -393,16 +564,18 @@
       {@const i = selected.index}
       <span class="tools-label strong">{t(`editor.kind.${kind}`)}</span>
       {#if kind === 'cut'}
-        <span class="tools-label">{t('editor.cutHint')}</span>
+        <span class="tools-label">{t('editor.cutHint')} {t('editor.edgesHint')}</span>
         <button class="tool" onclick={() => remove('cut', i)}><Icon name="undo" size={13} />{t('editor.restore')}</button>
       {:else if kind === 'slow' && fx.slow[i]}
         <Segmented label={t('editor.slow')} options={rates} value={fx.slow[i].rate} onchange={(v) => (fx.slow[i].rate = v)} />
+        <span class="tools-label">{t('editor.edgesHint')}</span>
       {:else if kind === 'mute' && fx.mutes[i]}
         <Segmented label={t('editor.muteZone')} options={tracks} value={fx.mutes[i].track} onchange={(v) => (fx.mutes[i].track = v)} />
         <label class="inline-toggle">
           <Toggle label={t('editor.beep')} checked={fx.mutes[i].beep} onchange={(v) => (fx.mutes[i].beep = v)} />
           {t('editor.beep')}
         </label>
+        <span class="tools-label">{t('editor.edgesHint')}</span>
       {:else if kind === 'blur' && fx.blurs[i]}
         <Segmented
           label={t('editor.blur')}
@@ -430,7 +603,7 @@
       {/if}
       <div class="tools-end">
         {#if kind !== 'cut'}
-          <button class="tool danger" onclick={() => remove(kind, i)} use:tooltip={{ text: `${t('editor.remove')} · Suppr`, side: 'top' }}>
+          <button class="tool danger" onclick={() => remove(kind, i)} use:tooltip={{ text: `${t('editor.remove')} · ${t('key.delete')}`, side: 'top' }}>
             <Icon name="trash" size={13} />{t('editor.remove')}
           </button>
         {/if}
@@ -438,39 +611,40 @@
       </div>
     {:else}
       <span class="tools-label" class:strong={!!zone}>
-        {zone ? t('editor.zone', { duration: `${zoneLength.toFixed(1)} s` }) : t('editor.toolsHint')}
+        {pending !== null
+          ? t('editor.zoneOpen', { time: clock(pending) })
+          : zone
+            ? t('editor.zone', { duration: `${zoneLength.toFixed(1)} s` })
+            : t('editor.toolsHint')}
       </span>
-      <button class="tool" disabled={!zone} onclick={cutZone} use:tooltip={{ text: `${t('editor.cutTip')} · X`, side: 'top' }}>
+      <button class="tool" onclick={cutZone} use:tooltip={{ text: `${t('editor.cutTip')} · X`, side: 'top' }}>
         <Icon name="scissors" size={13} />{t('editor.cut')}
       </button>
       <button
         class="tool"
-        disabled={!zone}
         onclick={(e) => menuAt(e, tracks.map((tr) => ({ label: tr.label, run: () => muteZone(tr.value, false) })))}
-        use:tooltip={{ text: t('editor.muteTip'), side: 'top' }}
+        use:tooltip={{ text: `${t('editor.muteTip')} · M`, side: 'top' }}
       >
         <Icon name="mute" size={13} />{t('editor.muteZone')}<Icon name="chevronDown" size={11} />
       </button>
       <button
         class="tool"
-        disabled={!zone}
         onclick={(e) => menuAt(e, tracks.map((tr) => ({ label: tr.label, run: () => muteZone(tr.value, true) })))}
-        use:tooltip={{ text: t('editor.beepTip'), side: 'top' }}
+        use:tooltip={{ text: `${t('editor.beepTip')} · B`, side: 'top' }}
       >
         <Icon name="zap" size={13} />{t('editor.beep')}<Icon name="chevronDown" size={11} />
       </button>
       <button
         class="tool"
-        disabled={!zone}
         onclick={(e) => menuAt(e, rates.map((r) => ({ label: r.label, run: () => slowZone(r.value) })))}
-        use:tooltip={{ text: t('editor.slowTip'), side: 'top' }}
+        use:tooltip={{ text: `${t('editor.slowTip')} · R`, side: 'top' }}
       >
         <Icon name="clock" size={13} />{t('editor.slow')}<Icon name="chevronDown" size={11} />
       </button>
       <button class="tool" onclick={addText} use:tooltip={{ text: t('editor.textTip'), side: 'top' }}><b class="t">T</b>{t('editor.text')}</button>
       <button class="tool" onclick={addBlur} use:tooltip={{ text: t('editor.blurTip'), side: 'top' }}><Icon name="grid" size={13} />{t('editor.blur')}</button>
-      {#if zone}
-        <button class="tool ghost" onclick={() => (zone = null)} aria-label={t('editor.clearZone')} use:tooltip={{ text: `${t('editor.clearZone')} · Échap`, side: 'top' }}>
+      {#if zone || pending !== null}
+        <button class="tool ghost" onclick={clearZone} aria-label={t('editor.clearZone')} use:tooltip={{ text: `${t('editor.clearZone')} · ${t('key.escape')}`, side: 'top' }}>
           <Icon name="x" size={13} />
         </button>
       {/if}
@@ -483,6 +657,7 @@
       bind:start
       bind:end
       bind:zone
+      zoneOpen={pending !== null}
       {markers}
       {current}
       src={shard.path ? mediaSrc(shard.path) : null}
@@ -576,9 +751,25 @@
       background var(--fast),
       color var(--fast);
   }
-  .chip:hover {
+  .chip:hover:not(:disabled) {
     color: var(--text);
     background: var(--surface-3);
+  }
+  .chip:disabled {
+    opacity: 0.4;
+    cursor: default;
+  }
+  .help-button {
+    display: inline-flex;
+    gap: 6px;
+    font-size: 12.5px;
+    font-weight: 600;
+    white-space: nowrap;
+  }
+  .help-button.on {
+    color: var(--text);
+    background: var(--surface-3);
+    box-shadow: inset 0 0 0 1px var(--border-strong);
   }
   .chip.format {
     display: inline-flex;
@@ -703,10 +894,14 @@
   }
 
   .actions {
+    position: relative;
     display: flex;
     align-items: center;
     gap: 6px;
     margin-left: auto;
+  }
+  .actions .divider {
+    margin: 0 4px;
   }
   .button {
     display: inline-flex;

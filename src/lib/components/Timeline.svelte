@@ -1,9 +1,10 @@
 <!-- Multi-track timeline: ruler, video filmstrip and one lane per audio source (waveform, volume,
      mute), then the effects (captions, blurs). The kept range and the playhead span every lane:
-     drag the handles to trim, drag anywhere else to scrub. Dragging on the ruler (or anywhere
-     with Shift) selects a zone for the editor's tools; the effects show where they apply (cuts
-     across every lane, slow motion on the video, mutes on their track) and are picked with a
-     click, their edges dragged to resize them. -->
+     drag the handles to trim, click or drag on the ruler to move the playhead (its knob sits
+     there). On the lanes, a click moves the playhead and a drag selects a zone for the editor's
+     tools, whose edges are then dragged like the trim handles. The effects show where they
+     apply (cuts across every lane, slow motion on the video, mutes on their track) and are
+     picked with a click, their edges dragged to resize them. -->
 <script lang="ts" module>
   import type { IconName } from './Icon.svelte';
 
@@ -32,6 +33,7 @@
     tint,
     lanes,
     zone = $bindable(null),
+    zoneOpen = false,
     markers = [],
     onseek,
     ongain,
@@ -45,6 +47,8 @@
     lanes: Lane[];
     /** The zone selected for the tools, null when none. */
     zone?: Range | null;
+    /** The zone is being marked from the keyboard: its end follows the playhead. */
+    zoneOpen?: boolean;
     /** Markers put while recording, seconds into the clip. */
     markers?: number[];
     onseek: (time: number) => void;
@@ -205,7 +209,8 @@
     };
   }
 
-  /** Drag on the ruler (or Shift-drag anywhere): select a zone. A click without dragging seeks. */
+  /** Drag on the lanes: select a zone (then the playhead goes to its start). A click without
+   *  dragging moves the playhead and lets go of the zone. */
   function selectZone(e: PointerEvent) {
     if (e.button !== 0) return;
     e.preventDefault();
@@ -223,21 +228,32 @@
     };
     const up = () => {
       el.removeEventListener('pointermove', move);
-      if (!moved || (zone && zone.end - zone.start < 0.05)) {
+      if (!moved || !zone || zone.end - zone.start < 0.05) {
         zone = null;
-        onseek(from);
-      }
+        onseek(Math.min(end, Math.max(start, from)));
+      } else onseek(zone.start);
     };
     el.addEventListener('pointermove', move);
     el.addEventListener('pointerup', up, { once: true });
   }
 
-  function areaDown(e: PointerEvent) {
-    if (e.shiftKey) selectZone(e);
-    else {
-      fx.selected = null;
-      drag('head')(e);
-    }
+  /** Drags an edge of the zone, like a trim handle. */
+  function resizeZone(edge: 'start' | 'end') {
+    return (e: PointerEvent) => {
+      if (e.button !== 0 || !zone) return;
+      e.preventDefault();
+      e.stopPropagation();
+      const el = e.currentTarget as HTMLElement;
+      el.setPointerCapture(e.pointerId);
+      const move = (ev: PointerEvent) => {
+        if (!zone) return;
+        const time = timeAt(ev.clientX);
+        zone = edge === 'start' ? { start: Math.min(time, zone.end - 0.1), end: zone.end } : { start: zone.start, end: Math.max(time, zone.start + 0.1) };
+        onseek(edge === 'start' ? zone.start : zone.end);
+      };
+      el.addEventListener('pointermove', move);
+      el.addEventListener('pointerup', () => el.removeEventListener('pointermove', move), { once: true });
+    };
   }
 
   /** Picks an effect (and moves the playhead into it). */
@@ -332,8 +348,8 @@
   </div>
 
   <!-- svelte-ignore a11y_no_static_element_interactions -->
-  <div class="area" bind:this={area} onpointerdown={areaDown}>
-    <div class="ruler" onpointerdown={selectZone} use:tooltip={{ text: t('editor.zoneHint'), side: 'top' }}>
+  <div class="area" bind:this={area} onpointerdown={selectZone}>
+    <div class="ruler" onpointerdown={drag('head')} use:tooltip={{ text: t('editor.rulerHint'), side: 'top' }}>
       {#each markers as marker, i (i)}
         <button
           class="marker"
@@ -450,8 +466,12 @@
     {/each}
 
     {#if zone}
-      <div class="zone" style:left={pct(zone.start)} style:width={pct(zone.end - zone.start)}>
+      <div class="zone" class:open={zoneOpen} style:left={pct(zone.start)} style:width={pct(zone.end - zone.start)}>
         <span class="zone-length">{(zone.end - zone.start).toFixed(1)} s</span>
+        {#if !zoneOpen}
+          <span class="zone-edge left" onpointerdown={resizeZone('start')} role="presentation"><span></span></span>
+          <span class="zone-edge right" onpointerdown={resizeZone('end')} role="presentation"><span></span></span>
+        {/if}
       </div>
     {/if}
 
@@ -697,7 +717,7 @@
     height: 30px;
   }
   .ruler {
-    cursor: crosshair;
+    cursor: pointer;
   }
   .seg {
     position: absolute;
@@ -825,6 +845,48 @@
     box-shadow: inset 0 0 0 1.5px var(--accent);
     pointer-events: none;
     z-index: 5;
+  }
+  .zone.open {
+    background: color-mix(in srgb, var(--accent) 10%, transparent);
+    box-shadow: inset 0 0 0 1.5px color-mix(in srgb, var(--accent) 70%, transparent);
+    animation: zone-open 1.2s ease-in-out infinite;
+  }
+  @keyframes zone-open {
+    50% {
+      background: color-mix(in srgb, var(--accent) 22%, transparent);
+    }
+  }
+  .zone-edge {
+    position: absolute;
+    top: calc(var(--ruler) + var(--gap) - 2px);
+    bottom: 0;
+    width: 10px;
+    border-radius: 4px;
+    background: var(--accent);
+    box-shadow: 0 1px 6px rgba(0, 0, 0, 0.45);
+    cursor: ew-resize;
+    pointer-events: auto;
+    transition: filter var(--fast);
+  }
+  .zone-edge:hover {
+    filter: brightness(1.12);
+  }
+  .zone-edge span {
+    position: absolute;
+    left: 50%;
+    top: 50%;
+    width: 2px;
+    height: 18px;
+    border-radius: 2px;
+    background: var(--accent-fg);
+    opacity: 0.55;
+    transform: translate(-50%, -50%);
+  }
+  .zone-edge.left {
+    left: -5px;
+  }
+  .zone-edge.right {
+    right: -5px;
   }
   .zone-length {
     position: absolute;

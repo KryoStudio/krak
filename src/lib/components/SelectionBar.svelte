@@ -37,7 +37,7 @@
 </script>
 
 <div class="bar" use:portal={'.content'} transition:fly={{ y: 24, duration: 260 * motion, easing: cubicOut, opacity: 0 }} role="toolbar" aria-label={t('selection.count', { count })}>
-  <button class="icon" onclick={onclear} aria-label={t('selection.clear')} use:tooltip={{ text: `${t('selection.clear')} · Échap`, side: 'top' }}>
+  <button class="icon" onclick={onclear} aria-label={t('selection.clear')} use:tooltip={{ text: `${t('selection.clear')} · ${t('key.escape')}`, side: 'top' }}>
     <Icon name="x" size={15} />
   </button>
   {#key count}

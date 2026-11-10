@@ -35,6 +35,8 @@
   let natural = $state<[number, number] | null>(null);
   /** The clip's last edit; the editor keeps it current while it is open. */
   let edit = $state<Edit | null>(null);
+  /** The editor has a help, zone or selection for Escape to let go of first. */
+  let editorBusy = $state(false);
   const id = $derived(shard?.id);
   /** What plays when not editing: the edit, if clips play as edited. */
   const applied = $derived(!ui.editing && settings.value.playEdited ? edit : null);
@@ -129,9 +131,11 @@
     const tag = (e.target as HTMLElement).tagName;
     if (tag === 'INPUT') return;
     if (e.key === 'Escape') {
+      // The editor first lets go of its help, zone or selected effect (its own handler).
+      if (ui.editing && editorBusy) return;
       if (ui.editing) ui.editing = false;
       else close();
-    } else if (ui.editing && [' ', 'ArrowLeft', 'ArrowRight'].includes(e.key)) return; // the editor's keys
+    } else if (ui.editing && [' ', 'ArrowLeft', 'ArrowRight', 'Delete', 'Backspace'].includes(e.key)) return; // the editor's keys
     else if (e.key === 'ArrowLeft' && tag !== 'VIDEO') go(-1);
     else if (e.key === 'ArrowRight' && tag !== 'VIDEO') go(1);
     else if (e.key === ' ' && video && tag !== 'VIDEO' && tag !== 'BUTTON') video.paused ? video.play() : video.pause();
@@ -231,7 +235,7 @@
 
     {#if ui.editing}
       <div class="tools-panel" transition:fly={{ y: 16, duration: 260 * motion }}>
-        <Editor {shard} {video} {mix} onedit={(next) => (edit = next)} />
+        <Editor {shard} {video} {mix} bind:busy={editorBusy} onedit={(next) => (edit = next)} />
       </div>
     {/if}
   </div>
