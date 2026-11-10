@@ -20,7 +20,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 use crate::recording::{RECORDING_FAILED, RECORDING_SAVED};
-use crate::replay::{CAPTURE_FAILED, SHARD_SAVING};
+use crate::replay::{CAPTURE_FAILED, MARKER_ADDED, SHARD_SAVING};
 use crate::screenshots::SCREENSHOT_SAVED;
 use crate::state::AppState;
 
@@ -40,6 +40,7 @@ pub fn init(app: &AppHandle) {
     let _ = window.set_ignore_cursor_events(true);
     for event in [
         SHARD_SAVING,
+        MARKER_ADDED,
         CAPTURE_FAILED,
         SCREENSHOT_SAVED,
         RECORDING_SAVED,

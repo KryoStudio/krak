@@ -630,4 +630,9 @@ export const tr: Translation = {
   'tour.next': 'İleri',
   'tour.back': 'Geri',
   'tour.done': 'Hadi başlayalım!',
+  'settings.marker': 'İşaret kısayolu',
+  'settings.markerHint': 'Oynarken bir anı işaretler: düzenleyicinin zaman çizelgesinde bayrak olarak bulursun (klipler ve kayıtlar).',
+  'overlay.marker': 'İşaret kondu',
+  'overlay.markerHint': 'Klibin zaman çizelgesinde',
+  'editor.marker': 'İşaret',
 };

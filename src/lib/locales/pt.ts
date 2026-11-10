@@ -628,4 +628,9 @@ export const pt: Translation = {
   'tour.next': 'Próximo',
   'tour.back': 'Voltar',
   'tour.done': 'Vamos lá!',
+  'settings.marker': 'Atalho de marcador',
+  'settings.markerHint': 'Marca um momento enquanto você joga: ele aparece como bandeira na linha do tempo do editor (clipes e gravações).',
+  'overlay.marker': 'Marcador adicionado',
+  'overlay.markerHint': 'Na linha do tempo do clipe',
+  'editor.marker': 'Marcador',
 };

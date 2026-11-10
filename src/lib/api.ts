@@ -16,6 +16,8 @@ export interface Settings {
   recordHotkey: string;
   /** Saves the current frame as a PNG. */
   screenshotHotkey: string;
+  /** Puts a marker, found again on the editor's timeline. */
+  markerHotkey: string;
   /** Controller buttons held together to keep a shard ("LB+RB"), '' = none. */
   controllerHotkey: string;
   /** A short buzz when the controller shortcut keeps a shard, two if it failed. */
@@ -388,6 +390,8 @@ export const api = {
   getAudioStems: (id: string) => invoke<ArrayBuffer>('get_audio_stems', { id }),
   /** Waits (up to 10 s) for controller buttons held together then released: "LB+RB". */
   captureControllerCombo: () => invoke<string>('capture_controller_combo'),
+  /** The markers put while the clip was recorded, seconds into it. */
+  getMarkers: (id: string) => invoke<number[]>('get_markers', { id }),
   /** Apps with a window open, games first (game-only capture picker). */
   listOpenApps: () => invoke<OpenApp[]>('list_open_apps'),
   listDisplays: () => invoke<DisplayInfo[]>('list_displays'),
@@ -421,6 +425,7 @@ type Events = {
   'library-changed': null;
   'capture-status': CaptureStatus;
   'shard-saving': SavingShard;
+  'marker-added': null;
   'shard-saved': Shard;
   'recording-saved': Shard;
   'screenshot-saved': Screenshot;

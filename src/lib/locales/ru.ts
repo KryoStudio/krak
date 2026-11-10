@@ -652,4 +652,9 @@ export const ru: Translation = {
   'tour.next': 'Далее',
   'tour.back': 'Назад',
   'tour.done': 'Поехали!',
+  'settings.marker': 'Клавиша метки',
+  'settings.markerHint': 'Отмечает момент во время игры: он появится флажком на таймлайне редактора (клипы и записи).',
+  'overlay.marker': 'Метка поставлена',
+  'overlay.markerHint': 'Ищи на таймлайне клипа',
+  'editor.marker': 'Метка',
 };

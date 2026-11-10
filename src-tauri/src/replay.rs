@@ -33,6 +33,8 @@ pub const CAPTURE_STATUS: &str = "capture-status";
 /// A press was accepted: the clip is being written.
 pub const SHARD_SAVING: &str = "shard-saving";
 pub const SHARD_SAVED: &str = "shard-saved";
+/// The marker hotkey put a marker (the in-game notification says so).
+pub const MARKER_ADDED: &str = "marker-added";
 pub const CAPTURE_FAILED: &str = "capture-failed";
 /// Presses closer than this to the previous accepted one are ignored.
 const DEBOUNCE: Duration = Duration::from_secs(1);
@@ -261,6 +263,22 @@ pub fn request_save(app: &AppHandle) -> Press {
     }
 }
 
+/// The marker hotkey: a marker now, kept by the clip or recording that holds this moment.
+pub fn mark(app: &AppHandle) {
+    let result = with_engine(app, |engine| {
+        engine.map_or(Err(capture::NOT_READY), Engine::mark)
+    });
+    match result {
+        Ok(()) => {
+            if app.state::<AppState>().settings().capture_sound {
+                capture::sound::play_chime();
+            }
+            let _ = app.emit(MARKER_ADDED, ());
+        }
+        Err(code) => capture_failed(app, code),
+    }
+}
+
 /// A clip or screenshot that was asked for will not exist: the failure sound, and
 /// `capture-failed` for the notification and the main window.
 pub fn capture_failed(app: &AppHandle, code: &'static str) {
@@ -300,6 +318,16 @@ impl EngineEvents for AppEvents {
 
     fn save_failed(&self, code: &'static str) {
         capture_failed(&self.app, code);
+    }
+
+    fn marked(&self, path: &Path, marks: &[f64]) {
+        let state = self.app.state::<AppState>();
+        let Some(id) = shard_id(&state.clips_dir(), path) else {
+            return;
+        };
+        let mut meta = lock(&state.meta);
+        meta.markers.insert(id, marks.to_vec());
+        let _ = meta.save(&state.meta_path);
     }
 
     fn recording_saved(&self, path: &Path) {

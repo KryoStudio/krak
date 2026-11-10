@@ -626,4 +626,9 @@ export const ja: Translation = {
   'tour.next': '次へ',
   'tour.back': '戻る',
   'tour.done': '始めよう！',
+  'settings.marker': 'マーカーのショートカット',
+  'settings.markerHint': 'プレイ中の瞬間に印を付けます。エディターのタイムラインに旗として表示されます（クリップと録画）。',
+  'overlay.marker': 'マーカーを追加',
+  'overlay.markerHint': 'クリップのタイムラインで確認できます',
+  'editor.marker': 'マーカー',
 };

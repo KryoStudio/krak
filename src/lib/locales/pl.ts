@@ -652,4 +652,9 @@ export const pl: Translation = {
   'tour.next': 'Dalej',
   'tour.back': 'Wstecz',
   'tour.done': 'Do dzieła!',
+  'settings.marker': 'Skrót znacznika',
+  'settings.markerHint': 'Zaznacza moment podczas gry: znajdziesz go jako chorągiewkę na osi czasu edytora (klipy i nagrania).',
+  'overlay.marker': 'Znacznik dodany',
+  'overlay.markerHint': 'Na osi czasu klipu',
+  'editor.marker': 'Znacznik',
 };

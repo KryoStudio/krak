@@ -33,6 +33,8 @@ pub struct Shard {
 #[serde(default)]
 pub struct LibraryMeta {
     pub favorites: BTreeSet<String>,
+    /// Markers put while playing (the marker hotkey), seconds into each clip.
+    pub markers: std::collections::BTreeMap<String, Vec<f64>>,
 }
 
 impl LibraryMeta {
@@ -389,8 +391,14 @@ mod tests {
 
         let meta = LibraryMeta {
             favorites: BTreeSet::from(["a.mp4".to_string()]),
+            markers: [("Valorant/b.mp4".to_string(), vec![1.5, 12.25])].into(),
         };
         meta.save(&path).expect("save");
-        assert_eq!(LibraryMeta::load(&path).favorites, meta.favorites);
+        let loaded = LibraryMeta::load(&path);
+        assert_eq!(loaded.favorites, meta.favorites);
+        assert_eq!(loaded.markers, meta.markers);
+        // A file from before markers existed still loads.
+        fs::write(&path, r#"{"favorites": ["c.mp4"]}"#).expect("write");
+        assert!(LibraryMeta::load(&path).markers.is_empty());
     }
 }

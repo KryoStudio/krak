@@ -157,6 +157,7 @@
 
   let recordError = $state('');
   let screenshotError = $state('');
+  let markerError = $state('');
   let presence = $state<Presence | null>(null);
   const discordUser = $derived(presence?.user ?? null);
   /** The Discord account Krak shares to the community as (read from disk, no network). */
@@ -181,6 +182,15 @@
       showError('community_failed');
     } finally {
       unlinking = false;
+    }
+  }
+
+  async function setMarkerHotkey(markerHotkey: string) {
+    markerError = '';
+    try {
+      await settings.update({ markerHotkey });
+    } catch (code) {
+      markerError = shortcutError(code);
     }
   }
 
@@ -453,6 +463,10 @@
               <ControllerInput value={s.controllerHotkey} onchange={(controllerHotkey) => settings.update({ controllerHotkey }).catch(showError)} />
             {/snippet}
             {@render row(t('settings.controller'), t('settings.controllerHint'), controller)}
+            {#snippet markerKey()}
+              <HotkeyInput value={s.markerHotkey} onchange={setMarkerHotkey} />
+            {/snippet}
+            {@render row(t('settings.marker'), markerError || t('settings.markerHint'), markerKey, markerError ? 'error' : '')}
             {#if s.controllerHotkey}
               {#snippet rumble()}
                 <Toggle label={t('settings.rumble')} checked={s.controllerRumble} onchange={(v) => set({ controllerRumble: v })} />

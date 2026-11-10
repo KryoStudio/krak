@@ -569,6 +569,7 @@ impl Recorder {
         };
         // What the file holds (packets left pending are not in it).
         let seconds = (part.video_end - part.first_pts) as f64 / TICKS_PER_SECOND as f64;
+        let (first_pts, video_end) = (part.first_pts, part.video_end);
         let Part {
             writer, path, part, ..
         } = part;
@@ -591,6 +592,10 @@ impl Recorder {
             }),
             None => {
                 if announce {
+                    let marks = self.shared.marks_between(first_pts, video_end);
+                    if !marks.is_empty() {
+                        self.shared.events.marked(&path, &marks);
+                    }
                     self.shared.events.recording_saved(&path);
                 }
                 Ok(Some(path))

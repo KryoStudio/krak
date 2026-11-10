@@ -152,8 +152,19 @@ pub async fn rename_shard(app: AppHandle, id: String, title: String) -> CmdResul
         let new_id = library::sibling_id(&id, &file_name);
         let favorites = {
             let mut meta = lock(&state.meta);
-            if new_id != id && meta.favorites.remove(&id) {
+            let favorite = new_id != id && meta.favorites.remove(&id);
+            if favorite {
                 meta.favorites.insert(new_id.clone());
+            }
+            let markers = if new_id == id {
+                None
+            } else {
+                meta.markers.remove(&id)
+            };
+            if let Some(markers) = &markers {
+                meta.markers.insert(new_id.clone(), markers.clone());
+            }
+            if favorite || markers.is_some() {
                 let _ = meta.save(&state.meta_path);
             }
             meta.favorites.clone()
@@ -219,10 +230,12 @@ pub async fn delete_shards(app: AppHandle, ids: Vec<String>) -> CmdResult<()> {
 
     // Forget metadata of every requested clip that is gone, even after a partial failure.
     let mut meta = lock(&state.meta);
-    let before = meta.favorites.len();
+    let before = (meta.favorites.len(), meta.markers.len());
     meta.favorites
         .retain(|fav| !ids.contains(fav) || library::resolve_id(&dir, fav).is_ok());
-    if meta.favorites.len() != before {
+    meta.markers
+        .retain(|id, _| !ids.contains(id) || library::resolve_id(&dir, id).is_ok());
+    if (meta.favorites.len(), meta.markers.len()) != before {
         let _ = meta.save(&state.meta_path);
     }
     drop(meta);
@@ -453,6 +466,17 @@ pub async fn list_microphones() -> CmdResult<Vec<Microphone>> {
 #[tauri::command]
 pub async fn get_storage_info(app: AppHandle) -> CmdResult<StorageInfo> {
     blocking(move || Ok(storage::info(&app.state::<AppState>().clips_dir()))).await
+}
+
+/// The markers put while a clip was recorded (seconds into it), for the editor's timeline.
+#[tauri::command]
+pub fn get_markers(app: AppHandle, id: String) -> Vec<f64> {
+    let state = app.state::<AppState>();
+    lock(&state.meta)
+        .markers
+        .get(&id)
+        .cloned()
+        .unwrap_or_default()
 }
 
 /// The apps with a window open, for the game-only capture picker (games first).

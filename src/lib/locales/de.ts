@@ -630,4 +630,9 @@ export const de: Translation = {
   'tour.next': 'Weiter',
   'tour.back': 'Zurück',
   'tour.done': 'Los geht’s!',
+  'settings.marker': 'Marker-Kürzel',
+  'settings.markerHint': 'Markiert einen Moment beim Spielen: Du findest ihn als Fähnchen auf der Zeitleiste des Editors (Clips und Aufnahmen).',
+  'overlay.marker': 'Marker gesetzt',
+  'overlay.markerHint': 'Auf der Zeitleiste des Clips',
+  'editor.marker': 'Marker',
 };

@@ -81,6 +81,8 @@ const AUDIO_MARGIN_SECONDS: u32 = 8;
 /// An extended clip stays within the longest clip plus this (what it holds is kept apart from
 /// the ring's budget while it can still grow).
 const MAX_EXTENSION: i64 = 60 * TICKS_PER_SECOND;
+/// Markers kept for one engine session.
+const MAX_MARKS: usize = 2000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EngineConfig {
@@ -185,6 +187,11 @@ pub trait EngineEvents: Send + Sync + 'static {
     fn recording_saved(&self, path: &Path) {
         let _ = path;
     }
+    /// Markers fell inside the clip or recording part saved at `path`: seconds from its start.
+    /// Called before `saved` / `recording_saved` for that file.
+    fn marked(&self, path: &Path, marks: &[f64]) {
+        let _ = (path, marks);
+    }
     /// The recording stopped: "write_failed" | "encode_failed". `kept` is the file finished
     /// with what was written, if any.
     fn recording_failed(&self, code: &'static str, kept: Option<&Path>) {
@@ -240,6 +247,8 @@ struct Shared {
     last_clip: Mutex<Option<LastClip>>,
     /// Engine clock time after which `last_clip` can go (0: none), read on every frame.
     last_clip_until: AtomicI64,
+    /// When the marker hotkey was pressed (engine time), newest last.
+    marks: Mutex<Vec<i64>>,
 }
 
 /// A clip the next press may extend.
@@ -291,6 +300,15 @@ impl<T: Clone> Later<T> {
     }
 }
 
+/// The engine's markers, readable from a save thread after the engine stopped.
+struct Marks(Arc<Shared>);
+
+impl Marks {
+    fn between(&self, from: i64, to: i64) -> Vec<f64> {
+        self.0.marks_between(from, to)
+    }
+}
+
 /// What a press got: the clip being written and its length.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Saving {
@@ -326,7 +344,17 @@ impl Shared {
             game_window: Mutex::default(),
             last_clip: Mutex::default(),
             last_clip_until: AtomicI64::new(0),
+            marks: Mutex::default(),
         }
+    }
+
+    /// The markers between `from` and `to` (engine time), in seconds from `from`.
+    fn marks_between(&self, from: i64, to: i64) -> Vec<f64> {
+        lock(&self.marks)
+            .iter()
+            .filter(|&&m| m >= from && m <= to)
+            .map(|&m| (m - from) as f64 / TICKS_PER_SECOND as f64)
+            .collect()
     }
 
     /// Lets the last clip go once no press can extend it (called on every frame: one atomic
@@ -470,6 +498,21 @@ impl Engine {
         self.shared.status()
     }
 
+    /// Puts a marker now: the clip or recording that holds this moment keeps it.
+    pub fn mark(&self) -> Result<(), &'static str> {
+        if lock(&self.shared.status).state != CaptureState::Ready {
+            return Err(NOT_READY);
+        }
+        let mut marks = lock(&self.shared.marks);
+        marks.push(clock::now());
+        // A long session: the oldest go first.
+        if marks.len() > MAX_MARKS {
+            let extra = marks.len() - MAX_MARKS;
+            marks.drain(..extra);
+        }
+        Ok(())
+    }
+
     /// In game-only capture, the name of the game being filmed (a clip belongs to it, whatever
     /// is in front at the press); `None` otherwise.
     pub fn filming(&self) -> Option<String> {
@@ -552,6 +595,7 @@ impl Engine {
             extended: previous.is_some(),
         };
         let engine = shared.clone();
+        let marks = Marks(shared.clone());
         let (collected, written) = (snapshot.clone(), file.clone());
         let spawned = std::thread::Builder::new()
             .name("kryo-save".into())
@@ -576,12 +620,20 @@ impl Engine {
                 };
                 let clip = Arc::new(clip);
                 collected.set(Some(clip.clone()));
+                let marks = clip
+                    .span_of()
+                    .map_or_else(Vec::new, |(from, to)| marks.between(from, to));
                 save::in_background();
                 let result = save::write_clip(&clip, &request, replacing.as_deref());
                 drop(clip);
                 written.set(result.clone());
                 match result {
-                    Ok(path) => events.saved(&path),
+                    Ok(path) => {
+                        if !marks.is_empty() {
+                            events.marked(&path, &marks);
+                        }
+                        events.saved(&path);
+                    }
                     Err(code) => events.save_failed(code),
                 }
             });

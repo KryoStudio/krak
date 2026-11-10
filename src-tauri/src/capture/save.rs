@@ -64,6 +64,14 @@ pub(super) struct Snapshot {
 }
 
 impl Snapshot {
+    /// From its first picture to the end of its last (engine time), `None` when empty.
+    pub fn span_of(&self) -> Option<(i64, i64)> {
+        let frame = TICKS_PER_SECOND / i64::from(self.params.fps.max(1));
+        let first = self.video.iter().map(|p| p.pts).min()?;
+        let last = self.video.iter().map(|p| p.pts).max()?;
+        Some((first, last + frame))
+    }
+
     /// This clip continued up to the end of `later` (collected after it): the same start, and
     /// everything the stream had since, `extra` longer at most than a clip may be. `None` when
     /// `later` is not the same stream going on without a hole (the capture restarted, or this
@@ -516,6 +524,29 @@ mod tests {
         assert_eq!(audio_frames(0, end, 40 * S), 40 * 48_000);
         assert_eq!(audio_frames(S, 2 * S, 40 * S), 48_000);
         assert_eq!(audio_frames(2 * S, S, 40 * S), 0);
+    }
+
+    #[test]
+    fn keeps_the_markers_a_clip_holds() {
+        const S: i64 = TICKS_PER_SECOND;
+        let shared = engine(10);
+        lock(&shared.marks).extend([2 * S, 5 * S, 9 * S, 30 * S]);
+        // A clip from 4 s to 10 s holds the markers at 5 and 9 s: 1 and 5 s into it.
+        assert_eq!(shared.marks_between(4 * S, 10 * S), vec![1.0, 5.0]);
+        assert!(shared.marks_between(10 * S + 1, 20 * S).is_empty());
+        // Its span: from its first picture to the end of its last.
+        let snapshot = Snapshot {
+            params: params(),
+            video: (0..120).map(|k| picture(4 * S, k)).collect(),
+            game: lock(&shared.game_audio).snapshot(),
+            mic: None,
+            audio_bitrate: 192_000,
+            max_span: 20 * S,
+        };
+        let (from, to) = snapshot.span_of().expect("a span");
+        // 60 fps frames are 166 666 ticks: within one of 6 s.
+        assert_eq!(from, 4 * S);
+        assert!((to - 6 * S).abs() <= 1, "{to}");
     }
 
     #[test]

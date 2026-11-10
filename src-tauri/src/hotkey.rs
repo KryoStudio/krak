@@ -1,5 +1,5 @@
 //! Global hotkeys (tauri-plugin-global-shortcut): save the replay, start / stop the continuous
-//! recording, take a screenshot. A press goes to the action whose shortcut it is in the
+//! recording, take a screenshot, put a marker. A press goes to the action whose shortcut it is in the
 //! settings; two actions never share one (`hotkey_duplicate`).
 
 use std::str::FromStr;
@@ -22,14 +22,16 @@ enum Action {
     SaveReplay,
     ToggleRecording,
     Screenshot,
+    Marker,
 }
 
 /// Each action and its accelerator in `settings`, in the order presses are matched.
-fn accelerators(settings: &Settings) -> [(Action, &str); 3] {
+fn accelerators(settings: &Settings) -> [(Action, &str); 4] {
     [
         (Action::SaveReplay, settings.hotkey.as_str()),
         (Action::ToggleRecording, settings.record_hotkey.as_str()),
         (Action::Screenshot, settings.screenshot_hotkey.as_str()),
+        (Action::Marker, settings.marker_hotkey.as_str()),
     ]
 }
 
@@ -49,6 +51,7 @@ pub fn plugin() -> TauriPlugin<Wry> {
                 }
                 Some(Action::ToggleRecording) => recording::toggle(app),
                 Some(Action::Screenshot) => screenshots::request(app),
+                Some(Action::Marker) => replay::mark(app),
                 None => {}
             }
         })

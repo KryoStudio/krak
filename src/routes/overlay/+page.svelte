@@ -44,6 +44,7 @@
             }`,
         ),
       ),
+      on('marker-added', () => present(false, () => t('overlay.marker'), () => t('overlay.markerHint'))),
       on('screenshot-saved', (shot) =>
         present(
           false,

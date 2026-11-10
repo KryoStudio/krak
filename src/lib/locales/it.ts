@@ -628,4 +628,9 @@ export const it: Translation = {
   'tour.next': 'Avanti',
   'tour.back': 'Indietro',
   'tour.done': 'Si parte!',
+  'settings.marker': 'Scorciatoia segnaposto',
+  'settings.markerHint': 'Segna un momento mentre giochi: lo ritrovi come bandierina sulla timeline dell’editor (clip e registrazioni).',
+  'overlay.marker': 'Segnaposto aggiunto',
+  'overlay.markerHint': 'Sulla timeline della clip',
+  'editor.marker': 'Segnaposto',
 };

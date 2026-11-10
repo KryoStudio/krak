@@ -625,4 +625,9 @@ export const en = {
   'tour.next': 'Next',
   'tour.back': 'Back',
   'tour.done': 'Let’s go!',
+  'settings.marker': 'Marker shortcut',
+  'settings.markerHint': 'Marks a moment while you play: find it again as a flag on the editor’s timeline (clips and recordings).',
+  'overlay.marker': 'Marker set',
+  'overlay.markerHint': 'Find it on the clip’s timeline',
+  'editor.marker': 'Marker',
 };

@@ -12,6 +12,8 @@ pub const DEFAULT_HOTKEY: &str = "F9";
 /// Not Alt+F9: that is NVIDIA's own recording shortcut, often already taken.
 pub const DEFAULT_RECORD_HOTKEY: &str = "Shift+F9";
 pub const DEFAULT_SCREENSHOT_HOTKEY: &str = "Ctrl+F9";
+/// Rarely bound by games, and close to the others.
+pub const DEFAULT_MARKER_HOTKEY: &str = "Ctrl+Shift+F9";
 const DEFAULT_BUFFER_SECONDS: u32 = 30;
 const MIN_BUFFER_SECONDS: u32 = 10;
 const MAX_BUFFER_SECONDS: u32 = 300;
@@ -119,6 +121,8 @@ pub struct Settings {
     /// Starts and stops a continuous recording.
     pub record_hotkey: String,
     pub screenshot_hotkey: String,
+    /// Puts a marker where the action is (found again on the editor's timeline).
+    pub marker_hotkey: String,
     /// Controller buttons held together to save the replay ("LB+RB", see `gamepad`); empty
     /// = none.
     pub controller_hotkey: String,
@@ -192,6 +196,7 @@ pub struct SettingsPatch {
     pub hotkey: Option<String>,
     pub record_hotkey: Option<String>,
     pub screenshot_hotkey: Option<String>,
+    pub marker_hotkey: Option<String>,
     pub controller_hotkey: Option<String>,
     pub controller_rumble: Option<bool>,
     pub extend_seconds: Option<f64>,
@@ -250,6 +255,7 @@ impl Settings {
             hotkey: DEFAULT_HOTKEY.into(),
             record_hotkey: DEFAULT_RECORD_HOTKEY.into(),
             screenshot_hotkey: DEFAULT_SCREENSHOT_HOTKEY.into(),
+            marker_hotkey: DEFAULT_MARKER_HOTKEY.into(),
             controller_hotkey: String::new(),
             controller_rumble: true,
             extend_seconds: DEFAULT_EXTEND_SECONDS,
@@ -298,6 +304,9 @@ impl Settings {
         }
         if let Some(hotkey) = patch.screenshot_hotkey {
             next.screenshot_hotkey = hotkey.trim().to_string();
+        }
+        if let Some(hotkey) = patch.marker_hotkey {
+            next.marker_hotkey = hotkey.trim().to_string();
         }
         if let Some(combo) = patch.controller_hotkey {
             // Anything that is not a combination of known buttons means none.
@@ -497,6 +506,7 @@ pub fn parse(text: &str, defaults: Settings) -> Option<Settings> {
         (&mut settings.hotkey, DEFAULT_HOTKEY),
         (&mut settings.record_hotkey, DEFAULT_RECORD_HOTKEY),
         (&mut settings.screenshot_hotkey, DEFAULT_SCREENSHOT_HOTKEY),
+        (&mut settings.marker_hotkey, DEFAULT_MARKER_HOTKEY),
     ] {
         if Shortcut::from_str(hotkey).is_err() {
             *hotkey = default.into();

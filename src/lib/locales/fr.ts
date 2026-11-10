@@ -626,4 +626,9 @@ export const fr: Translation = {
   'tour.next': 'Suivant',
   'tour.back': 'Précédent',
   'tour.done': 'C’est parti !',
+  'settings.marker': 'Raccourci marqueur',
+  'settings.markerHint': 'Marque un moment pendant que tu joues : tu le retrouves en drapeau sur la timeline de l’éditeur (clips et enregistrements).',
+  'overlay.marker': 'Marqueur posé',
+  'overlay.markerHint': 'À retrouver sur la timeline du clip',
+  'editor.marker': 'Marqueur',
 };

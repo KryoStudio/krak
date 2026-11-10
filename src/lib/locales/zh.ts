@@ -626,4 +626,9 @@ export const zh: Translation = {
   'tour.next': '下一步',
   'tour.back': '上一步',
   'tour.done': '开始吧！',
+  'settings.marker': '标记快捷键',
+  'settings.markerHint': '游戏时标记某个瞬间，之后会在编辑器时间轴上以小旗显示（剪辑和录制均可）。',
+  'overlay.marker': '已添加标记',
+  'overlay.markerHint': '可在剪辑时间轴上找到',
+  'editor.marker': '标记',
 };

@@ -32,6 +32,7 @@
     tint,
     lanes,
     zone = $bindable(null),
+    markers = [],
     onseek,
     ongain,
   }: {
@@ -44,6 +45,8 @@
     lanes: Lane[];
     /** The zone selected for the tools, null when none. */
     zone?: Range | null;
+    /** Markers put while recording, seconds into the clip. */
+    markers?: number[];
     onseek: (time: number) => void;
     ongain: (key: Lane['key'], gain: number) => void;
   } = $props();
@@ -331,6 +334,18 @@
   <!-- svelte-ignore a11y_no_static_element_interactions -->
   <div class="area" bind:this={area} onpointerdown={areaDown}>
     <div class="ruler" onpointerdown={selectZone} use:tooltip={{ text: t('editor.zoneHint'), side: 'top' }}>
+      {#each markers as marker, i (i)}
+        <button
+          class="marker"
+          style:left={pct(marker)}
+          onpointerdown={(e) => {
+            e.stopPropagation();
+            onseek(marker);
+          }}
+          aria-label="{t('editor.marker')} · {formatDuration(marker)}"
+          use:tooltip={{ text: `${t('editor.marker')} · ${formatDuration(marker)}`, side: 'top' }}
+        ></button>
+      {/each}
       {#each ticks as tick (tick.time)}
         <span class="tick" class:major={tick.label} style:left={pct(tick.time)}>
           {#if tick.label}<span class="tick-label">{formatDuration(tick.time)}</span>{/if}
@@ -786,6 +801,20 @@
     border-radius: 6px;
     color: #fff;
     background: #e5484d;
+  }
+  .marker {
+    position: absolute;
+    top: 0;
+    width: 12px;
+    height: 14px;
+    margin-left: -6px;
+    background: #ffc75a;
+    clip-path: polygon(0 0, 100% 0, 100% 60%, 50% 100%, 0 60%);
+    z-index: 3;
+    cursor: pointer;
+  }
+  .marker:hover {
+    filter: brightness(1.15);
   }
   .zone {
     position: absolute;

@@ -626,4 +626,9 @@ export const ko: Translation = {
   'tour.next': '다음',
   'tour.back': '이전',
   'tour.done': '시작해요!',
+  'settings.marker': '마커 단축키',
+  'settings.markerHint': '플레이 중 순간을 표시해요. 편집기 타임라인에 깃발로 나타나요(클립과 녹화).',
+  'overlay.marker': '마커 추가됨',
+  'overlay.markerHint': '클립 타임라인에서 확인하세요',
+  'editor.marker': '마커',
 };

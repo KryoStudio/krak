@@ -4,6 +4,7 @@ const defaults: Settings = {
   hotkey: 'F9',
   recordHotkey: 'Shift+F9',
   screenshotHotkey: 'Ctrl+F9',
+  markerHotkey: 'Ctrl+Shift+F9',
   controllerHotkey: '',
   controllerRumble: true,
   extendSeconds: 10,

@@ -67,6 +67,8 @@
   let loadedId = $state<string | null>(null);
   /** The zone selected on the ruler, for the tools. */
   let zone = $state<Range | null>(null);
+  /** Markers put while the clip was recorded (seconds into it). */
+  let markers = $state<number[]>([]);
 
   const duration = $derived(info?.duration ?? 0);
   const hasMic = $derived(!!info?.audioTracks.some((track) => track.kind === 'mic'));
@@ -124,6 +126,9 @@
     framing.x = 0.5;
     loadEffects(null);
     zone = null;
+    markers = [];
+    if (real) api.getMarkers(id).then((list) => shard.id === id && (markers = list), () => {});
+    else markers = [4.2, 13.8];
     const apply = (next: ShardInfo) => {
       if (shard.id !== id) return;
       info = { ...next, duration: next.duration || fallback.duration };
@@ -478,6 +483,7 @@
       bind:start
       bind:end
       bind:zone
+      {markers}
       {current}
       src={shard.path ? mediaSrc(shard.path) : null}
       tint={gameTint(shard.game)}
