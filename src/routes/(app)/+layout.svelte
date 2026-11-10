@@ -1,5 +1,6 @@
 <!-- The main window: sidebar, title bar, pages, and everything floating above them. -->
 <script lang="ts">
+  import { collections } from '$lib/collections.svelte';
   import { onMount } from 'svelte';
   import { fly } from 'svelte/transition';
   import { cubicOut } from 'svelte/easing';
@@ -42,6 +43,7 @@
 
   onMount(() => {
     library.load().catch(console.error);
+    collections.load().catch(console.error);
     screens.load().catch(console.error);
     const stopInvite = invite.start();
     if (!native) return stopInvite;

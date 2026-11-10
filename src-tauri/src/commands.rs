@@ -164,7 +164,8 @@ pub async fn rename_shard(app: AppHandle, id: String, title: String) -> CmdResul
             if let Some(markers) = &markers {
                 meta.markers.insert(new_id.clone(), markers.clone());
             }
-            if favorite || markers.is_some() {
+            let collected = new_id != id && meta.move_shard(&id, &new_id);
+            if favorite || markers.is_some() || collected {
                 let _ = meta.save(&state.meta_path);
             }
             meta.favorites.clone()
@@ -235,7 +236,10 @@ pub async fn delete_shards(app: AppHandle, ids: Vec<String>) -> CmdResult<()> {
         .retain(|fav| !ids.contains(fav) || library::resolve_id(&dir, fav).is_ok());
     meta.markers
         .retain(|id, _| !ids.contains(id) || library::resolve_id(&dir, id).is_ok());
-    if (meta.favorites.len(), meta.markers.len()) != before {
+    let collected = meta.forget_shards(|id| {
+        ids.iter().any(|gone| gone == id) && library::resolve_id(&dir, id).is_err()
+    });
+    if (meta.favorites.len(), meta.markers.len()) != before || collected {
         let _ = meta.save(&state.meta_path);
     }
     drop(meta);
@@ -466,6 +470,32 @@ pub async fn list_microphones() -> CmdResult<Vec<Microphone>> {
 #[tauri::command]
 pub async fn get_storage_info(app: AppHandle) -> CmdResult<StorageInfo> {
     blocking(move || Ok(storage::info(&app.state::<AppState>().clips_dir()))).await
+}
+
+/// The user's collections of shards.
+#[tauri::command]
+pub fn get_collections(app: AppHandle) -> Vec<library::Collection> {
+    let state = app.state::<AppState>();
+    lock(&state.meta).collections.clone()
+}
+
+/// Replaces the collections (the page edits them and sends them all back).
+#[tauri::command]
+pub async fn save_collections(
+    app: AppHandle,
+    collections: Vec<library::Collection>,
+) -> CmdResult<()> {
+    blocking(move || {
+        let state = app.state::<AppState>();
+        let mut meta = lock(&state.meta);
+        let before = std::mem::replace(&mut meta.collections, collections);
+        if meta.save(&state.meta_path).is_err() {
+            meta.collections = before;
+            return Err("save_failed");
+        }
+        Ok(())
+    })
+    .await
 }
 
 /// The markers put while a clip was recorded (seconds into it), for the editor's timeline.

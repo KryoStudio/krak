@@ -109,6 +109,8 @@ pub fn run() {
             commands::capture_controller_combo,
             commands::list_open_apps,
             commands::get_markers,
+            commands::get_collections,
+            commands::save_collections,
             commands::export_composition,
             commands::choose_music,
             commands::list_displays,

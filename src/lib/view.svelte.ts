@@ -1,5 +1,6 @@
 // The shards on screen: the library through the current filter, search and sort.
 import { t } from './i18n.svelte';
+import { collections } from './collections.svelte';
 import { library } from './library.svelte';
 import { displayTitle, gameName } from './shard-actions';
 import { ui } from './ui.svelte';
@@ -11,7 +12,9 @@ class View {
   shards = $derived.by(() => {
     const q = fold(ui.query.trim());
     const f = ui.filter;
+    const inCollection = f.startsWith('collection:') ? new Set(collections.find(f.slice(11))?.shards ?? []) : null;
     const list = library.shards.filter((s) => {
+      if (inCollection && !inCollection.has(s.id)) return false;
       if (f === 'favorites' && !s.favorite) return false;
       if (f === 'desktop' && s.game !== null) return false;
       if (f.startsWith('game:') && s.game !== f.slice(5)) return false;
@@ -32,8 +35,17 @@ class View {
   /** The game shown on its own, if any (undefined otherwise; null = desktop). */
   game = $derived(ui.filter === 'desktop' ? null : ui.filter.startsWith('game:') ? ui.filter.slice(5) : undefined);
 
+  /** The collection shown, if any. */
+  collection = $derived(ui.filter.startsWith('collection:') ? collections.find(ui.filter.slice(11)) : undefined);
+
   title = $derived(
-    ui.filter === 'all' ? t('nav.glacier') : ui.filter === 'favorites' ? t('nav.favorites') : (this.game ?? t('game.desktop')),
+    ui.filter === 'all'
+      ? t('nav.glacier')
+      : ui.filter === 'favorites'
+        ? t('nav.favorites')
+        : ui.filter.startsWith('collection:')
+          ? (this.collection?.name ?? t('nav.glacier'))
+          : (this.game ?? t('game.desktop')),
   );
 }
 

@@ -1,3 +1,4 @@
+import { collections } from './collections.svelte';
 import { api, errorCode, native, type Shard } from './api';
 import { demoShards } from './demo';
 import { dropEdits, moveEdit } from './edits';
@@ -73,6 +74,7 @@ class Library {
       this.#keys.set(next.id, this.key(oldId));
       this.#keys.delete(oldId);
       moveEdit(oldId, next.id);
+      collections.moved(oldId, next.id);
     }
     this.shards[i] = next;
   }
@@ -106,6 +108,7 @@ class Library {
     if (!this.demo) await api.deleteShards(ids).catch(rethrow);
     this.shards = this.shards.filter((s) => !ids.includes(s.id));
     dropEdits(ids);
+    collections.dropped(ids);
   }
 }
 

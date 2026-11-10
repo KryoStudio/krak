@@ -18,6 +18,7 @@
   import { api, errorCode, native } from '$lib/api';
   import { TITLE_SECONDS, add, bestof, clipLength, composition, move, persist, quickPick, removeAt } from '$lib/bestof.svelte';
   import { formatDuration, t } from '$lib/i18n.svelte';
+  import { collections } from '$lib/collections.svelte';
   import { library } from '$lib/library.svelte';
   import { settings } from '$lib/settings.svelte';
   import { displayTitle, showError } from '$lib/shard-actions';
@@ -174,6 +175,9 @@
         <div class="quick-buttons">
           <button class="chip" onclick={() => quick('favorites')}><Icon name="star" size={12} />{t('bestof.quickFavorites')}</button>
           <button class="chip" onclick={() => quick('week')}><Icon name="clock" size={12} />{t('bestof.quickWeek')}</button>
+          {#each collections.list.filter((c) => c.shards.length) as collection (collection.id)}
+            <button class="chip" onclick={() => add(collection.shards.filter((id) => library.find(id)))}><Icon name="folder" size={12} />{collection.name}</button>
+          {/each}
           {#if game !== undefined}
             <button class="chip" onclick={() => quick({ game: game ?? null })}><Icon name="gamepad" size={12} />{game ?? t('game.desktop')}</button>
           {/if}

@@ -2,7 +2,7 @@ import { SvelteSet } from 'svelte/reactivity';
 import type { IconName } from './components/Icon.svelte';
 
 /** 'desktop' = clips outside any game folder; `game:<name>` = one game. */
-export type Filter = 'all' | 'favorites' | 'desktop' | `game:${string}`;
+export type Filter = 'all' | 'favorites' | 'desktop' | `game:${string}` | `collection:${string}`;
 export type Sort = 'recent' | 'oldest' | 'longest' | 'largest' | 'name';
 
 export const ui = $state({

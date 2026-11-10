@@ -7,6 +7,8 @@
   import GameIcon from './GameIcon.svelte';
   import { formatHotkey, formatSize, t } from '$lib/i18n.svelte';
   import { library } from '$lib/library.svelte';
+  import { collections } from '$lib/collections.svelte';
+  import type { Collection } from '$lib/api';
   import { screens } from '$lib/screenshots.svelte';
   import { settings } from '$lib/settings.svelte';
   import { capture, formatClock } from '$lib/capture.svelte';
@@ -14,7 +16,7 @@
   import { showError } from '$lib/shard-actions';
   import { tooltip } from '$lib/tooltip';
   import { bestof } from '$lib/bestof.svelte';
-  import { filterFor, ui, type Filter } from '$lib/ui.svelte';
+  import { confirm, filterFor, openMenu, ui, type Filter } from '$lib/ui.svelte';
 
   const collapsed = $derived(settings.value.sidebarCollapsed);
   const path = $derived(page.url.pathname);
@@ -29,6 +31,52 @@
           ? ui.filter
           : 'home',
   );
+
+  /** Naming a new collection (true), or renaming one (its id). */
+  let naming = $state<true | string | null>(null);
+
+  function focus(input: HTMLInputElement) {
+    input.focus();
+    input.select();
+  }
+
+  function commitName(e: Event) {
+    const value = (e.currentTarget as HTMLInputElement).value.trim();
+    const target = naming;
+    naming = null;
+    if (target === true) {
+      if (value) show(`collection:${collections.create(value).id}`);
+    } else if (target) collections.rename(target, value);
+  }
+
+  function nameKey(e: KeyboardEvent) {
+    e.stopPropagation();
+    if (e.key === 'Enter') (e.currentTarget as HTMLInputElement).blur();
+    else if (e.key === 'Escape') {
+      naming = null;
+    }
+  }
+
+  function collectionMenu(e: MouseEvent, collection: Collection) {
+    e.preventDefault();
+    openMenu(e.clientX, e.clientY, [
+      { label: t('collections.rename'), icon: 'pencil', run: () => (naming = collection.id) },
+      {
+        label: t('collections.delete'),
+        icon: 'trash',
+        danger: true,
+        run: async () => {
+          const ok = await confirm({
+            title: t('collections.deleteTitle'),
+            body: t('collections.deleteBody', { name: collection.name }),
+            confirm: t('collections.delete'),
+            danger: true,
+          });
+          if (ok) collections.delete(collection.id);
+        },
+      },
+    ]);
+  }
 
   function show(filter: Filter) {
     ui.filter = filter;
@@ -147,6 +195,26 @@
       {@render item('favorites', t('nav.favorites'), library.favorites, starIcon, () => show('favorites'))}
       {@render item('screenshots', t('nav.screenshots'), screens.items.length, imageIcon, () => ((ui.playing = null), goto('/screenshots')))}
       {@render item('bestof', t('nav.bestof'), bestof.items.length || null, sparklesIcon, () => ((ui.playing = null), goto('/bestof')))}
+
+      <div class="section">
+        <span>{t('nav.collections')}</span>
+        <button class="section-add" onclick={() => (naming = true)} aria-label={t('collections.new')} use:tooltip={{ text: t('collections.new'), side: 'right' }}>
+          <Icon name="plus" size={13} stroke={2.4} />
+        </button>
+      </div>
+      {#if naming === true}
+        <input class="name-input" placeholder={t('collections.placeholder')} maxlength="40" use:focus onblur={commitName} onkeydown={nameKey} />
+      {/if}
+      {#each collections.list as collection (collection.id)}
+        {#if naming === collection.id}
+          <input class="name-input" value={collection.name} maxlength="40" use:focus onblur={commitName} onkeydown={nameKey} />
+        {:else}
+          {#snippet folder()}<Icon name="folder" size={16} />{/snippet}
+          <div class="collection" oncontextmenu={(e) => collectionMenu(e, collection)} ondblclick={() => (naming = collection.id)} role="presentation">
+            {@render item(`collection:${collection.id}`, collection.name, collection.shards.length, folder, () => show(`collection:${collection.id}`))}
+          </div>
+        {/if}
+      {/each}
 
       {#if library.games.length}
         <div class="section">
@@ -443,6 +511,48 @@
     color: var(--text-2);
   }
 
+  .section-add {
+    position: absolute;
+    right: 4px;
+    bottom: 4px;
+    display: grid;
+    place-items: center;
+    width: 22px;
+    height: 22px;
+    border-radius: 6px;
+    color: var(--text-3);
+    transition:
+      color var(--fast),
+      background var(--fast),
+      opacity var(--fast);
+  }
+  .section-add:hover {
+    color: var(--text);
+    background: var(--surface-3);
+  }
+  .collapsed .section-add {
+    opacity: 0;
+    pointer-events: none;
+  }
+  .name-input {
+    width: calc(100% - 4px);
+    height: 32px;
+    margin: 1px 2px 3px;
+    padding: 0 10px;
+    border-radius: 8px;
+    font-size: 13px;
+    color: var(--text);
+    background: var(--surface-2);
+    border: none;
+    box-shadow: inset 0 0 0 1.5px var(--accent);
+    outline: none;
+  }
+  .collapsed .name-input {
+    display: none;
+  }
+  .collection {
+    display: contents;
+  }
   .section {
     position: relative;
     height: 36px;

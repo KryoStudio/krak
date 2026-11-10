@@ -1,9 +1,10 @@
 // What you can do with a shard, shared by the cards, the context menu and the player.
+import { collections } from './collections.svelte';
 import { api, errorCode, type Shard } from './api';
 import { hasKey, t } from './i18n.svelte';
 import { library } from './library.svelte';
 import { shareShard } from './share.svelte';
-import { confirm, toast, ui, type MenuItem } from './ui.svelte';
+import { confirm, menu, toast, ui, type MenuItem } from './ui.svelte';
 
 export const gameName = (s: Shard) => s.game ?? t('game.desktop');
 export const displayTitle = (s: Shard) => s.title ?? gameName(s);
@@ -79,11 +80,17 @@ export async function remove(s: Shard) {
 }
 
 export function shardMenu(s: Shard): MenuItem[] {
+  const viewing = ui.filter.startsWith('collection:') ? collections.find(ui.filter.slice(11)) : undefined;
   return [
     { label: t('shard.play'), icon: 'play', shortcut: t('key.enter'), run: () => play(s) },
     { label: t('editor.edit'), icon: 'scissors', shortcut: 'E', run: () => edit(s) },
     { label: t('shard.rename'), icon: 'pencil', shortcut: 'F2', run: () => rename(s) },
     { label: t(s.favorite ? 'shard.unfavorite' : 'shard.favorite'), icon: 'star', shortcut: 'F', run: () => toggleFavorite(s) },
+    'separator',
+    { label: t('collections.addTo'), icon: 'folder', run: () => collections.menu(menu.x, menu.y, [s]) },
+    ...(viewing && viewing.shards.includes(s.id)
+      ? [{ label: t('collections.removeFrom', { name: viewing.name }), icon: 'x' as const, run: () => collections.remove(viewing.id, [s.id]) }]
+      : []),
     'separator',
     { label: t('shard.copy'), icon: 'copy', shortcut: 'Ctrl+C', run: () => copy(s) },
     { label: t('share.title'), icon: 'users', run: () => shareShard(s) },

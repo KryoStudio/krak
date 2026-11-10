@@ -77,6 +77,14 @@ export interface Settings {
   communityInviteAt: number | null;
 }
 
+/** A named group of shards (the files stay where they are). */
+export interface Collection {
+  id: string;
+  name: string;
+  /** Shard ids, in the order they were added. */
+  shards: string[];
+}
+
 /** An app picked for game-only capture. */
 export interface AppPick {
   /** Program file name without extension, lowercase. */
@@ -390,6 +398,8 @@ export const api = {
   getAudioStems: (id: string) => invoke<ArrayBuffer>('get_audio_stems', { id }),
   /** Waits (up to 10 s) for controller buttons held together then released: "LB+RB". */
   captureControllerCombo: () => invoke<string>('capture_controller_combo'),
+  getCollections: () => invoke<Collection[]>('get_collections'),
+  saveCollections: (collections: Collection[]) => invoke<void>('save_collections', { collections }),
   /** The markers put while the clip was recorded, seconds into it. */
   getMarkers: (id: string) => invoke<number[]>('get_markers', { id }),
   /** Apps with a window open, games first (game-only capture picker). */

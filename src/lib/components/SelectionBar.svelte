@@ -15,6 +15,7 @@
     onall,
     onfavorite,
     onbestof,
+    oncollection,
     ondelete,
     onclear,
   }: {
@@ -26,6 +27,8 @@
     onfavorite?: () => void;
     /** Leave out where a best-of makes no sense. */
     onbestof?: () => void;
+    /** Leave out for things that can't be in a collection. */
+    oncollection?: (e: MouseEvent) => void;
     ondelete: () => void;
     onclear: () => void;
   } = $props();
@@ -48,6 +51,11 @@
     <button class="action" class:on={allFavorite} onclick={onfavorite}>
       <Icon name="star" size={15} fill={allFavorite} />
       {t(allFavorite ? 'selection.unfavorite' : 'selection.favorite')}
+    </button>
+  {/if}
+  {#if oncollection}
+    <button class="action" onclick={oncollection}>
+      <Icon name="folder" size={15} />{t('selection.collection')}
     </button>
   {/if}
   {#if onbestof}

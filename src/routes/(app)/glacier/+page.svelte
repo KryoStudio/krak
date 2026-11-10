@@ -20,6 +20,7 @@
   import { view } from '$lib/view.svelte';
   import { goto } from '$app/navigation';
   import { add as addToBestof } from '$lib/bestof.svelte';
+  import { collections } from '$lib/collections.svelte';
 
   const motion = $derived(prefersReducedMotion.current ? 0 : 1);
   const sorts: Sort[] = ['recent', 'oldest', 'longest', 'largest', 'name'];
@@ -134,7 +135,9 @@
       ? t('empty.search', { query: ui.query.trim() })
       : ui.filter === 'favorites'
         ? t('empty.favorites')
-        : t('empty.game'),
+        : ui.filter.startsWith('collection:')
+          ? t('empty.collection')
+          : t('empty.game'),
   );
 </script>
 
@@ -237,6 +240,10 @@
     {allFavorite}
     onall={selectAll}
     onfavorite={favoriteSelected}
+    oncollection={(e) => {
+      const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
+      collections.menu(r.left, r.top - 8, selected);
+    }}
     onbestof={() => {
       addToBestof(selected.map((s) => s.id));
       selection.clear();

@@ -35,6 +35,44 @@ pub struct LibraryMeta {
     pub favorites: BTreeSet<String>,
     /// Markers put while playing (the marker hotkey), seconds into each clip.
     pub markers: std::collections::BTreeMap<String, Vec<f64>>,
+    /// The user's collections of shards (files stay where they are), in their order.
+    pub collections: Vec<Collection>,
+}
+
+/// A named group of shards, by id.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Collection {
+    pub id: String,
+    pub name: String,
+    pub shards: Vec<String>,
+}
+
+impl LibraryMeta {
+    /// A shard got another id (renamed): its collections follow. Returns whether any changed.
+    pub fn move_shard(&mut self, from: &str, to: &str) -> bool {
+        let mut changed = false;
+        for collection in &mut self.collections {
+            for id in &mut collection.shards {
+                if id == from {
+                    to.clone_into(id);
+                    changed = true;
+                }
+            }
+        }
+        changed
+    }
+
+    /// Shards that are gone leave every collection. Returns whether any changed.
+    pub fn forget_shards(&mut self, gone: impl Fn(&str) -> bool) -> bool {
+        let mut changed = false;
+        for collection in &mut self.collections {
+            let before = collection.shards.len();
+            collection.shards.retain(|id| !gone(id));
+            changed |= collection.shards.len() != before;
+        }
+        changed
+    }
 }
 
 impl LibraryMeta {
@@ -392,13 +430,47 @@ mod tests {
         let meta = LibraryMeta {
             favorites: BTreeSet::from(["a.mp4".to_string()]),
             markers: [("Valorant/b.mp4".to_string(), vec![1.5, 12.25])].into(),
+            collections: vec![Collection {
+                id: "c1".into(),
+                name: "Clutches".into(),
+                shards: vec!["a.mp4".into()],
+            }],
         };
         meta.save(&path).expect("save");
         let loaded = LibraryMeta::load(&path);
         assert_eq!(loaded.favorites, meta.favorites);
         assert_eq!(loaded.markers, meta.markers);
+        assert_eq!(loaded.collections, meta.collections);
         // A file from before markers existed still loads.
         fs::write(&path, r#"{"favorites": ["c.mp4"]}"#).expect("write");
         assert!(LibraryMeta::load(&path).markers.is_empty());
+    }
+
+    #[test]
+    fn collections_follow_renames_and_deletes() {
+        let mut meta = LibraryMeta {
+            collections: vec![
+                Collection {
+                    id: "a".into(),
+                    name: "Aces".into(),
+                    shards: vec!["Valorant/x.mp4".into(), "y.mp4".into()],
+                },
+                Collection {
+                    id: "b".into(),
+                    name: "Fails".into(),
+                    shards: vec!["y.mp4".into()],
+                },
+            ],
+            ..LibraryMeta::default()
+        };
+        assert!(meta.move_shard("Valorant/x.mp4", "Valorant/ace.mp4"));
+        assert_eq!(meta.collections[0].shards[0], "Valorant/ace.mp4");
+        assert!(!meta.move_shard("nope.mp4", "other.mp4"));
+        assert!(meta.forget_shards(|id| id == "y.mp4"));
+        assert_eq!(meta.collections[0].shards, vec!["Valorant/ace.mp4"]);
+        assert!(
+            meta.collections[1].shards.is_empty(),
+            "the collection stays, empty"
+        );
     }
 }
