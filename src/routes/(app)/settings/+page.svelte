@@ -17,10 +17,12 @@
   import {
     api,
     native,
+    on,
     type CommunityUser,
     type DisplayInfo,
     type Microphone,
     type OpenApp,
+    type RecompressCandidate,
     type Presence,
     type ResolvedVideo,
     type Settings,
@@ -34,7 +36,7 @@
   import { settings } from '$lib/settings.svelte';
   import { showError } from '$lib/shard-actions';
   import { tooltip } from '$lib/tooltip';
-  import { toast, ui, type SettingsSection } from '$lib/ui.svelte';
+  import { confirm, toast, ui, type SettingsSection } from '$lib/ui.svelte';
   import { updates } from '$lib/updates.svelte';
 
   const s = $derived(settings.value);
@@ -95,6 +97,84 @@
   });
 
   const memory = $derived(output ? memoryFor(output.bitrate, s.bufferSeconds, s.microphone) : 0);
+
+  // Making room: recompressing old shards ------------------------------------------------
+  let age = $state(90);
+  let scan = $state<RecompressCandidate[] | null>(null);
+  let scanning = $state(false);
+  /** 0..1 while recompressing. */
+  let recompressing = $state<number | null>(null);
+  const ages = $derived(([30, 90, 180] as const).map((days) => ({ value: days, label: t(`settings.recompressAge.${days}`) })));
+  const scanSize = $derived(scan?.reduce((sum, c) => sum + c.size, 0) ?? 0);
+  const scanAfter = $derived(scan?.reduce((sum, c) => sum + c.estimate, 0) ?? 0);
+  const recompressLine = $derived(
+    scan === null
+      ? t('settings.recompressIdle')
+      : scan.length === 0
+        ? t('settings.recompressNothing')
+        : t('settings.recompressResult', {
+            count: scan.length,
+            size: formatSize(scanSize),
+            after: formatSize(scanAfter),
+            saved: formatSize(scanSize - scanAfter),
+          }),
+  );
+
+  async function analyse() {
+    scanning = true;
+    try {
+      if (native && !library.demo) scan = await api.recompressScan(age);
+      else {
+        const before = Date.now() - age * 24 * 3600 * 1000;
+        scan = library.shards
+          .filter((s) => !s.favorite && s.createdAt < before)
+          .map((s) => ({ id: s.id, size: s.size, estimate: Math.round(s.size * 0.3) }));
+      }
+    } catch (e) {
+      showError(e);
+    } finally {
+      scanning = false;
+    }
+  }
+
+  async function recompress() {
+    const list = scan;
+    if (!list?.length) return;
+    const ok = await confirm({
+      title: t('settings.recompressConfirmTitle', { count: list.length }),
+      body: t('settings.recompressConfirmBody', { saved: formatSize(scanSize - scanAfter) }),
+      confirm: t('settings.recompressGo'),
+    });
+    if (!ok) return;
+    recompressing = 0;
+    const real = native && !library.demo;
+    const stop = real
+      ? on('export-progress', (p) => {
+          if (p.id === 'recompress') recompressing = p.progress;
+        })
+      : null;
+    try {
+      let result = { done: list.length, skipped: 0, saved: scanSize - scanAfter };
+      if (real) result = await api.recompressShards(list.map((c) => c.id));
+      else
+        for (let p = 0; p <= 1.001; p += 0.05) {
+          recompressing = p;
+          await new Promise((r) => setTimeout(r, 60));
+        }
+      toast({
+        kind: 'success',
+        title: t('settings.recompressDone', { count: result.done, saved: formatSize(result.saved) }),
+        ...(result.skipped ? { body: t('settings.recompressSkipped', { count: result.skipped }) } : {}),
+      });
+      scan = null;
+      storageInfo().then((info) => (storage = info));
+    } catch (e) {
+      showError(e);
+    } finally {
+      recompressing = null;
+      stop?.then((unlisten) => unlisten());
+    }
+  }
 
   /** Browser preview: a few apps to pick from. */
   const demoApps: OpenApp[] = [
@@ -682,6 +762,33 @@
             {/snippet}
             {@render row(t('settings.limit'), t('settings.limitHint'), limit)}
           </div>
+
+          <h3>{t('settings.space')}</h3>
+          <div class="card">
+            {#snippet ageChoice()}
+              <Segmented label={t('settings.recompress')} options={ages} value={age} onchange={(v) => ((age = v), (scan = null))} />
+            {/snippet}
+            {@render row(t('settings.recompress'), t('settings.recompressHint'), ageChoice)}
+            {#snippet recompressAction()}
+              {#if recompressing !== null}
+                <div class="buttons">
+                  <span class="result">{Math.round(recompressing * 100)} %</span>
+                  <button class="button" onclick={() => api.cancelExport()} disabled={!native || library.demo}>{t('common.cancel')}</button>
+                </div>
+              {:else if scan?.length}
+                <div class="buttons">
+                  <button class="button" onclick={analyse} disabled={scanning}>{t('settings.recompressScan')}</button>
+                  <button class="button accent" onclick={recompress}>{t('settings.recompressGo')}</button>
+                </div>
+              {:else}
+                <button class="button" onclick={analyse} disabled={scanning}>{t(scanning ? 'settings.recompressScanning' : 'settings.recompressScan')}</button>
+              {/if}
+            {/snippet}
+            {@render row(t('settings.recompressFound'), recompressLine, recompressAction)}
+            {#if recompressing !== null}
+              <div class="meter"><span style:transform="scaleX({recompressing})"></span></div>
+            {/if}
+          </div>
         {:else if ui.settingsSection === 'appearance'}
           <div class="card">
             {#snippet accent()}
@@ -1007,6 +1114,9 @@
     color: var(--accent-fg);
     background: var(--accent);
     box-shadow: none;
+  }
+  .button.accent:hover:not(:disabled) {
+    background: color-mix(in srgb, var(--accent) 86%, white);
   }
   .button.square {
     width: 32px;

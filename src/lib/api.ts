@@ -77,6 +77,21 @@ export interface Settings {
   communityInviteAt: number | null;
 }
 
+/** A shard that recompression would make lighter. */
+export interface RecompressCandidate {
+  id: string;
+  size: number;
+  /** Its size once recompressed, roughly. */
+  estimate: number;
+}
+
+export interface Recompressed {
+  done: number;
+  skipped: number;
+  /** Bytes the originals take in the Recycle Bin. */
+  saved: number;
+}
+
 /** A named group of shards (the files stay where they are). */
 export interface Collection {
   id: string;
@@ -398,6 +413,10 @@ export const api = {
   getAudioStems: (id: string) => invoke<ArrayBuffer>('get_audio_stems', { id }),
   /** Waits (up to 10 s) for controller buttons held together then released: "LB+RB". */
   captureControllerCombo: () => invoke<string>('capture_controller_combo'),
+  /** Shards older than `days` worth recompressing (never favorites). */
+  recompressScan: (days: number) => invoke<RecompressCandidate[]>('recompress_scan', { days }),
+  /** Recompresses them; progress as `export-progress` with the id "recompress". */
+  recompressShards: (ids: string[]) => invoke<Recompressed>('recompress_shards', { ids }),
   getCollections: () => invoke<Collection[]>('get_collections'),
   saveCollections: (collections: Collection[]) => invoke<void>('save_collections', { collections }),
   /** The markers put while the clip was recorded, seconds into it. */
