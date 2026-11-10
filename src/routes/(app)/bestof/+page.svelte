@@ -168,7 +168,7 @@
         <Icon name="search" size={14} />
         <input type="search" bind:value={query} placeholder={t('bestof.search')} aria-label={t('bestof.search')} />
       </div>
-      <Select label={t('bestof.allGames')} options={gameOptions} value={game} onchange={(v) => (game = v)} width={252} />
+      <Select label={t('bestof.allGames')} options={gameOptions} value={game} onchange={(v) => (game = v)} width={208} />
       <div class="quick" data-tour="quick">
         <span class="label">{t('bestof.quick')}</span>
         <div class="quick-buttons">
@@ -338,9 +338,15 @@
     flex: 1;
     min-height: 0;
   }
-  @container (max-width: 1080px) {
+  @container (max-width: 1180px) {
     .layout {
-      grid-template-columns: 250px minmax(0, 1fr);
+      grid-template-columns: 236px minmax(0, 1fr) 244px;
+      gap: 12px;
+    }
+  }
+  @container (max-width: 940px) {
+    .layout {
+      grid-template-columns: 236px minmax(0, 1fr);
     }
     .settings {
       grid-column: 1 / -1;
@@ -489,8 +495,9 @@
     min-height: 0;
   }
   .preview-box {
-    flex: 1;
+    flex: 1 1 auto;
     min-height: 220px;
+    max-height: min(56vh, 600px);
     padding: 12px;
     border-radius: var(--radius-lg);
     background: var(--surface);
