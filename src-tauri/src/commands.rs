@@ -472,6 +472,107 @@ pub async fn get_storage_info(app: AppHandle) -> CmdResult<StorageInfo> {
     blocking(move || Ok(storage::info(&app.state::<AppState>().clips_dir()))).await
 }
 
+/// The shards older than `days` that recompression would make lighter (Settings > Storage).
+#[tauri::command]
+pub async fn recompress_scan(
+    app: AppHandle,
+    days: u32,
+) -> CmdResult<Vec<crate::recompress::Candidate>> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
+    let before = now.saturating_sub(u64::from(days) * 24 * 3600 * 1000);
+    media_thread("kryo-recompress-scan", move || {
+        let state = app.state::<AppState>();
+        let dir = state.clips_dir();
+        let favorites = lock(&state.meta).favorites.clone();
+        let shards = library::scan(&dir, &favorites, &mut lock(&state.durations));
+        Ok(crate::recompress::candidates(&shards, before, |path| {
+            editor::probe::probe(path).ok()
+        }))
+    })
+    .await
+}
+
+/// What a recompression did.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Recompressed {
+    pub done: usize,
+    /// Left as they were (in use, unreadable, would not shrink).
+    pub skipped: usize,
+    /// Bytes the originals take in the Recycle Bin.
+    pub saved: u64,
+}
+
+/// Recompresses these shards one by one (`crate::recompress`); progress comes as
+/// `export-progress` with the id "recompress", and Cancel stops after the current one. The
+/// originals go to the Recycle Bin.
+#[tauri::command]
+pub async fn recompress_shards(app: AppHandle, ids: Vec<String>) -> CmdResult<Recompressed> {
+    let slot = ExportSlot::acquire()?;
+    let state = app.state::<AppState>();
+    let dir = state.clips_dir();
+    let paths: Vec<PathBuf> = ids
+        .iter()
+        .filter_map(|id| library::resolve_id(&dir, id).ok())
+        .collect();
+    let cancel = slot.cancel_flag();
+    let emitter = app.clone();
+    let (originals, done, skipped, saved) = media_thread("kryo-recompress", move || {
+        let total = paths.len().max(1) as f64;
+        let report = move |progress: f64| {
+            let payload = ExportProgress {
+                id: "recompress".into(),
+                progress,
+            };
+            let _ = emitter.emit(EXPORT_PROGRESS, payload);
+        };
+        let (mut originals, mut done, mut skipped, mut saved) = (Vec::new(), 0, 0, 0u64);
+        for (i, path) in paths.iter().enumerate() {
+            if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                break;
+            }
+            // Each clip its share of the bar.
+            let share = |p: f64| report((i as f64 + p) / total);
+            let progress = Progress::new(cancel, &share);
+            match crate::recompress::recompress(path, &progress) {
+                Ok(result) => {
+                    done += 1;
+                    saved += result.saved;
+                    originals.push(result.original);
+                    eprintln!(
+                        "krak: recompressed {} ({} bytes saved)",
+                        path.display(),
+                        result.saved
+                    );
+                }
+                Err(editor::CANCELLED) => break,
+                Err(code) => {
+                    skipped += 1;
+                    eprintln!("krak: recompress: {} skipped ({code})", path.display());
+                }
+            }
+        }
+        report(1.0);
+        Ok((originals, done, skipped, saved))
+    })
+    .await?;
+    if !originals.is_empty() {
+        let kept = originals.clone();
+        let trashed = shell::isolated(move || trash::delete_all(originals)).await;
+        if !matches!(trashed, Some(Ok(()))) {
+            eprintln!("krak: recompress: originals left next to their clips: {kept:?}");
+        }
+    }
+    drop(slot);
+    Ok(Recompressed {
+        done,
+        skipped,
+        saved,
+    })
+}
+
 /// The user's collections of shards.
 #[tauri::command]
 pub fn get_collections(app: AppHandle) -> Vec<library::Collection> {

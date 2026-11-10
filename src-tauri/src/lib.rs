@@ -16,6 +16,7 @@ mod names;
 mod overlay;
 mod persist;
 mod presence;
+mod recompress;
 mod recording;
 mod replay;
 mod screenshots;
@@ -110,6 +111,8 @@ pub fn run() {
             commands::list_open_apps,
             commands::get_markers,
             commands::get_collections,
+            commands::recompress_scan,
+            commands::recompress_shards,
             commands::save_collections,
             commands::export_composition,
             commands::choose_music,

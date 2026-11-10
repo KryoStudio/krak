@@ -2622,3 +2622,58 @@ fn editor_composes_clips() {
     let video = info.streams.iter().find(|s| s.width > 0).expect("video");
     assert!(video.height > video.width, "vertical");
 }
+
+#[test]
+#[ignore = "needs Media Foundation and the GPU; run with --ignored"]
+fn recompresses_a_clip_in_place() {
+    let _com = ComGuard::new();
+    let _mf = MfGuard::new().expect("media foundation");
+    let dir = std::env::var_os("KRYO_EDITOR_OUT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| std::env::temp_dir().join("kryo-editor-e2e"))
+        .join("recompress");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("dir");
+    let clip = dir.join("Old clip.mp4");
+    synthetic_clip(&clip);
+    let before = std::fs::metadata(&clip).expect("clip");
+    let info = probe::probe(&clip).expect("probe");
+    assert!(
+        crate::recompress::estimate(&info, before.len()).is_some(),
+        "an 8 Mbit/s 720p clip is worth recompressing"
+    );
+    let cancel = AtomicBool::new(false);
+    let report = |_: f64| {};
+    let progress = Progress::new(&cancel, &report);
+    let done = crate::recompress::recompress(&clip, &progress).expect("recompressed");
+    let after = std::fs::metadata(&clip).expect("clip");
+    println!(
+        "{} -> {} bytes, saved {}",
+        before.len(),
+        after.len(),
+        done.saved
+    );
+    assert!(after.len() < before.len() / 2, "{} bytes", after.len());
+    assert_eq!(done.saved, before.len() - after.len());
+    assert_eq!(after.created().ok(), before.created().ok(), "same date");
+    // The original stepped aside, intact; nothing else left behind.
+    assert_eq!(
+        std::fs::metadata(&done.original).expect("original").len(),
+        before.len()
+    );
+    let names: Vec<_> = std::fs::read_dir(&dir)
+        .expect("dir")
+        .filter_map(Result::ok)
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(names.len(), 2, "{names:?}");
+    // Same length, same frames, the sound still there.
+    let new = probe::probe(&clip).expect("probe");
+    assert!(
+        (new.duration - info.duration).abs() < 0.1,
+        "{} s",
+        new.duration
+    );
+    assert_eq!(decoded_indices(&clip).len(), SYN_FRAMES as usize);
+    assert_eq!(new.audio_tracks.len(), info.audio_tracks.len());
+}

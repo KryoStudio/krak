@@ -106,6 +106,8 @@ struct VideoJob {
     /// Vertical: the 9:16 window's position.
     crop: Option<f64>,
     options: transcode::Options,
+    /// Re-encode at this H.264 bitrate (recompressing a clip), else the source's.
+    bitrate: Option<f64>,
 }
 
 #[derive(Debug)]
@@ -344,6 +346,7 @@ pub fn export(
             gpu_scaling: request.options.gpu_scaling || stretched.is_some(),
             ..request.options
         },
+        bitrate: None,
     };
     match &request.destination {
         Destination::Copy { label } => copy(
@@ -386,6 +389,44 @@ pub fn export(
             discord(&source, start, end, gains, dir, *max_bytes, job, progress)
         }
     }
+}
+
+/// A lighter copy of the whole clip at `source`, written to `out` (replaced if it exists):
+/// its video re-encoded in H.264 at `bitrate`, every audio track kept.
+pub fn recompress(
+    source: &Path,
+    out: &Path,
+    bitrate: f64,
+    progress: &Progress,
+) -> Result<Exported, &'static str> {
+    let source = Source::open(source)?;
+    let (start, end) = range(0.0, source.duration.max(MIN_SECONDS), source.duration)?;
+    let job = VideoJob {
+        watermark: false,
+        fresh: true,
+        crop: None,
+        options: transcode::Options::default(),
+        bitrate: Some(bitrate),
+    };
+    let written = copy(
+        &source,
+        start,
+        end,
+        (1.0, 1.0),
+        Output::Part(out),
+        job,
+        progress,
+    )?;
+    drop(source);
+    if let Err(err) = fs::rename(&written.path, out) {
+        eprintln!("krak: recompress: cannot write {}: {err}", out.display());
+        let _ = fs::remove_file(&written.path);
+        return Err(WRITE_FAILED);
+    }
+    Ok(Exported {
+        path: out.to_path_buf(),
+        ..written
+    })
 }
 
 /// Every audio track of the clip at `path`, decoded over the whole clip (48 kHz, stereo or
@@ -618,7 +659,7 @@ fn copy(
         });
     }
     // HEVC/AV1 that only the badge forces to re-encode: H.264 needs more for the same picture.
-    let bitrate = source.h264_bitrate();
+    let bitrate = job.bitrate.or_else(|| source.h264_bitrate());
     let target = plan::copy_target(source.size, source.fps, bitrate);
     let encoded = reencode(source, start, end, target, job, progress.span(0.0, 0.75))?;
     let tracks = audio(
