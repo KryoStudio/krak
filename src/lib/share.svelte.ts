@@ -1,6 +1,7 @@
 // "Share to the Krak community": which clip the share sheet is open for, and how to export it.
 import type { Shard } from './api';
 import { getEdit } from './edits';
+import { hasEffects, type Effects } from './fx.svelte';
 
 export interface ShareRequest {
   shard: Shard;
@@ -10,6 +11,8 @@ export interface ShareRequest {
   gains: { game: number; mic: number };
   vertical: boolean;
   cropX: number;
+  /** Cuts, mutes, slow motion, blurs, captions: exported through a composition. */
+  effects?: Effects | null;
 }
 
 export const share = $state({ request: null as ShareRequest | null });
@@ -25,6 +28,7 @@ export function shareShard(shard: Shard) {
     gains: edit ? { ...edit.gains } : { game: 1, mic: 1 },
     vertical: !!edit?.vertical,
     cropX: edit?.cropX ?? 0.5,
+    effects: hasEffects(edit?.fx) ? edit?.fx : null,
   };
 }
 

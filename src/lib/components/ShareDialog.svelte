@@ -161,23 +161,32 @@
     phase = 'export';
     progress = 0;
     const stopExport = on('export-progress', (p) => {
-      if (p.id === shard.id && phase === 'export') progress = p.progress * 0.5;
+      if ((p.id === shard.id || p.id === 'composition') && phase === 'export') progress = p.progress * 0.5;
     });
     const stopUpload = on('community-upload-progress', (p) => {
       if (phase === 'upload' && p.total) progress = 0.5 + 0.5 * (p.sent / p.total);
     });
     try {
-      const exported = await api.exportShard({
-        id: shard.id,
-        start: request.start,
-        end: request.end,
-        gains: { ...request.gains },
-        target: 'share',
-        maxBytes: limit,
-        watermark: settings.value.watermark,
-        vertical: request.vertical,
-        cropX: request.cropX,
-      });
+      const effects = request.effects;
+      const exported = effects
+        ? await api.exportComposition({
+            clips: [{ id: shard.id, start: request.start, end: request.end, gains: { ...request.gains }, ...effects, cropX: request.cropX }],
+            vertical: request.vertical,
+            watermark: settings.value.watermark,
+            target: 'share',
+            maxBytes: limit,
+          })
+        : await api.exportShard({
+            id: shard.id,
+            start: request.start,
+            end: request.end,
+            gains: { ...request.gains },
+            target: 'share',
+            maxBytes: limit,
+            watermark: settings.value.watermark,
+            vertical: request.vertical,
+            cropX: request.cropX,
+          });
       if (!alive) return;
       phase = 'upload';
       progress = 0.5;

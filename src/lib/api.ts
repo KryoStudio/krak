@@ -2,6 +2,7 @@
 // and the stores fall back to demo data.
 import { convertFileSrc, invoke, isTauri } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
+import type { Effects } from './fx.svelte';
 
 export const native = isTauri();
 
@@ -98,6 +99,39 @@ export interface DisplayInfo {
   width: number;
   height: number;
   primary: boolean;
+}
+
+/** One clip of a composition, with what the editor did to it (see `fx.svelte.ts`). */
+export interface CompositionClip {
+  id: string;
+  start: number;
+  end: number;
+  gains: { game: number; mic: number };
+  cuts?: Effects['cuts'];
+  slow?: Effects['slow'];
+  mutes?: Effects['mutes'];
+  blurs?: Effects['blurs'];
+  texts?: Effects['texts'];
+  /** Vertical: where the 9:16 window is (0 left, 1 right). */
+  cropX?: number;
+}
+
+/** Clips one after another (the backend's `editor::compose::Composition`). */
+export interface Composition {
+  clips: CompositionClip[];
+  transition?: 'cut' | 'fade' | 'flash';
+  title?: string | null;
+  music?: { path: string; volume: number; offset: number; duck: boolean } | null;
+  vertical?: boolean;
+  watermark?: boolean;
+}
+
+export interface CompositionRequest extends Composition {
+  target: 'copy' | 'file' | 'discord' | 'share' | 'glacier';
+  maxBytes?: number | null;
+  path?: string | null;
+  /** Glacier: the new shard's name. */
+  name?: string | null;
 }
 
 /** What the engine would record with given settings. */
@@ -357,6 +391,11 @@ export const api = {
   /** Apps with a window open, games first (game-only capture picker). */
   listOpenApps: () => invoke<OpenApp[]>('list_open_apps'),
   listDisplays: () => invoke<DisplayInfo[]>('list_displays'),
+  /** Renders clips with their edits (one clip's cuts and captions, or a best-of); progress
+   *  comes as `export-progress` with the id "composition". */
+  exportComposition: (request: CompositionRequest) => invoke<ExportResult>('export_composition', { request }),
+  /** Native "Open" dialog for a song; null when cancelled. */
+  chooseMusic: () => invoke<string | null>('choose_music'),
   /** Native "Save as" dialog; null when cancelled. */
   chooseExportPath: (suggestedName: string) => invoke<string | null>('choose_export_path', { suggestedName }),
   /** Shows a file made by an export (this session) in Explorer. */

@@ -41,6 +41,26 @@ function decode(ctx: AudioContext, data: ArrayBuffer): AudioBuffer[] {
   return buffers;
 }
 
+let beeper: { oscillator: OscillatorNode; gain: GainNode } | null = null;
+
+/** The editor's bleep (a muted range set to bleep), heard while the playhead is in it: a 1 kHz
+ *  tone at `level` (0 silent, 1 on), like the export's. */
+export function setBeep(level: number) {
+  if (!level && !beeper) return;
+  const ctx = audio();
+  if (!beeper) {
+    const oscillator = ctx.createOscillator();
+    oscillator.frequency.value = 1000;
+    const gain = ctx.createGain();
+    gain.gain.value = 0;
+    oscillator.connect(gain).connect(ctx.destination);
+    oscillator.start();
+    beeper = { oscillator, gain };
+  }
+  if (level && ctx.state !== 'running') ctx.resume().catch(() => {});
+  beeper.gain.gain.setTargetAtTime(level * 0.2, ctx.currentTime, 0.008);
+}
+
 export class LiveMix {
   /** 'active': the tracks play, the video's own sound is left out. */
   state = $state<'idle' | 'loading' | 'active' | 'unavailable'>('idle');

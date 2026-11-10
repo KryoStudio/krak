@@ -1,6 +1,9 @@
 <!-- Multi-track timeline: ruler, video filmstrip and one lane per audio source (waveform, volume,
-     mute). The kept range and the playhead span every lane: drag the handles to trim, drag
-     anywhere else to scrub. -->
+     mute), then the effects (captions, blurs). The kept range and the playhead span every lane:
+     drag the handles to trim, drag anywhere else to scrub. Dragging on the ruler (or anywhere
+     with Shift) selects a zone for the editor's tools; the effects show where they apply (cuts
+     across every lane, slow motion on the video, mutes on their track) and are picked with a
+     click, their edges dragged to resize them. -->
 <script lang="ts" module>
   import type { IconName } from './Icon.svelte';
 
@@ -16,6 +19,7 @@
 
 <script lang="ts">
   import Icon from './Icon.svelte';
+  import { fx, type Kind, type Range } from '$lib/fx.svelte';
   import { formatDuration, t } from '$lib/i18n.svelte';
   import { tooltip } from '$lib/tooltip';
 
@@ -27,6 +31,7 @@
     src,
     tint,
     lanes,
+    zone = $bindable(null),
     onseek,
     ongain,
   }: {
@@ -37,6 +42,8 @@
     src: string | null;
     tint: [string, string];
     lanes: Lane[];
+    /** The zone selected for the tools, null when none. */
+    zone?: Range | null;
     onseek: (time: number) => void;
     ongain: (key: Lane['key'], gain: number) => void;
   } = $props();
@@ -195,6 +202,79 @@
     };
   }
 
+  /** Drag on the ruler (or Shift-drag anywhere): select a zone. A click without dragging seeks. */
+  function selectZone(e: PointerEvent) {
+    if (e.button !== 0) return;
+    e.preventDefault();
+    e.stopPropagation();
+    const el = e.currentTarget as HTMLElement;
+    el.setPointerCapture(e.pointerId);
+    const from = timeAt(e.clientX);
+    fx.selected = null;
+    let moved = false;
+    const move = (ev: PointerEvent) => {
+      const to = timeAt(ev.clientX);
+      if (!moved && Math.abs(ev.clientX - e.clientX) < 4) return;
+      moved = true;
+      zone = { start: Math.min(from, to), end: Math.max(from, to) };
+    };
+    const up = () => {
+      el.removeEventListener('pointermove', move);
+      if (!moved || (zone && zone.end - zone.start < 0.05)) {
+        zone = null;
+        onseek(from);
+      }
+    };
+    el.addEventListener('pointermove', move);
+    el.addEventListener('pointerup', up, { once: true });
+  }
+
+  function areaDown(e: PointerEvent) {
+    if (e.shiftKey) selectZone(e);
+    else {
+      fx.selected = null;
+      drag('head')(e);
+    }
+  }
+
+  /** Picks an effect (and moves the playhead into it). */
+  function pick(kind: Kind, index: number, at: number) {
+    return (e: PointerEvent) => {
+      if (e.button !== 0) return;
+      e.preventDefault();
+      e.stopPropagation();
+      fx.selected = { kind, index };
+      zone = null;
+      onseek(Math.max(at, timeAt(e.clientX)));
+    };
+  }
+
+  /** Drags an edge of the selected effect's range. */
+  function resize(item: { start?: number; end?: number }, edge: 'start' | 'end') {
+    return (e: PointerEvent) => {
+      if (e.button !== 0) return;
+      e.preventDefault();
+      e.stopPropagation();
+      const el = e.currentTarget as HTMLElement;
+      el.setPointerCapture(e.pointerId);
+      const move = (ev: PointerEvent) => {
+        const time = timeAt(ev.clientX);
+        const startAt = item.start ?? start;
+        const endAt = item.end ?? end;
+        if (edge === 'start') item.start = Math.min(time, endAt - 0.1);
+        else item.end = Math.max(time, startAt + 0.1);
+        onseek(edge === 'start' ? (item.start ?? start) : (item.end ?? end));
+      };
+      el.addEventListener('pointermove', move);
+      el.addEventListener('pointerup', () => el.removeEventListener('pointermove', move), { once: true });
+    };
+  }
+
+  const isSelected = (kind: Kind, index: number) => fx.selected?.kind === kind && fx.selected.index === index;
+  const mutesOf = (key: Lane['key']) =>
+    fx.mutes.map((m, index) => ({ m, index })).filter(({ m }) => m.track === 'all' || m.track === key);
+  const effectsLane = $derived(fx.texts.length > 0 || fx.blurs.length > 0);
+
   function toggleMute(lane: Lane) {
     if (lane.gain > 0) {
       beforeMute[lane.key] = lane.gain;
@@ -240,11 +320,17 @@
         </div>
       </div>
     {/each}
+    {#if effectsLane}
+      <div class="head fx-head">
+        <span class="badge"><Icon name="sparkles" size={14} /></span>
+        <span class="name">{t('editor.effects')}</span>
+      </div>
+    {/if}
   </div>
 
   <!-- svelte-ignore a11y_no_static_element_interactions -->
-  <div class="area" bind:this={area} onpointerdown={drag('head')}>
-    <div class="ruler">
+  <div class="area" bind:this={area} onpointerdown={areaDown}>
+    <div class="ruler" onpointerdown={selectZone} use:tooltip={{ text: t('editor.zoneHint'), side: 'top' }}>
       {#each ticks as tick (tick.time)}
         <span class="tick" class:major={tick.label} style:left={pct(tick.time)}>
           {#if tick.label}<span class="tick-label">{formatDuration(tick.time)}</span>{/if}
@@ -252,19 +338,107 @@
       {/each}
     </div>
 
+    {#snippet edges(item: { start?: number; end?: number }, on: boolean)}
+      {#if on}
+        <span class="edge left" onpointerdown={resize(item, 'start')} role="presentation"></span>
+        <span class="edge right" onpointerdown={resize(item, 'end')} role="presentation"></span>
+      {/if}
+    {/snippet}
+
     <div class="lane video-lane">
       <div class="strip">
         {#each { length: FRAMES } as _, i (i)}
           <canvas bind:this={canvases[i]} class:on={i < painted} width="160" height="90"></canvas>
         {/each}
       </div>
+      {#each fx.slow as zone, i (i)}
+        <button
+          class="seg slow"
+          class:on={isSelected('slow', i)}
+          style:left={pct(zone.start)}
+          style:width={pct(zone.end - zone.start)}
+          onpointerdown={pick('slow', i, zone.start)}
+          aria-label="{t('editor.slow')} ×{zone.rate}"
+        >
+          <span>×{zone.rate}</span>
+          {@render edges(zone, isSelected('slow', i))}
+        </button>
+      {/each}
     </div>
 
     {#each lanes as lane (lane.key)}
       <div class="lane audio-lane" class:mic={lane.key === 'mic'} class:muted={lane.gain === 0}>
         <canvas class="wave" use:wave={{ peaks: lane.peaks, gain: lane.gain }}></canvas>
+        {#each mutesOf(lane.key) as { m, index } (index)}
+          <button
+            class="seg mute"
+            class:beep={m.beep}
+            class:on={isSelected('mute', index)}
+            style:left={pct(m.start)}
+            style:width={pct(m.end - m.start)}
+            onpointerdown={pick('mute', index, m.start)}
+            aria-label={t(m.beep ? 'editor.beep' : 'editor.muted')}
+          >
+            <span><Icon name={m.beep ? 'zap' : 'mute'} size={11} />{t(m.beep ? 'editor.beep' : 'editor.muted')}</span>
+            {@render edges(m, isSelected('mute', index))}
+          </button>
+        {/each}
       </div>
     {/each}
+
+    {#if effectsLane}
+      <div class="lane fx-lane">
+        {#each fx.blurs as blur, i (i)}
+          {@const from = blur.start ?? start}
+          {@const to = blur.end ?? end}
+          <button
+            class="seg chip blur"
+            class:on={isSelected('blur', i)}
+            style:left={pct(from)}
+            style:width={pct(to - from)}
+            onpointerdown={pick('blur', i, from)}
+            aria-label={t('editor.blur')}
+          >
+            <span><Icon name="grid" size={11} />{t('editor.blur')}</span>
+            {@render edges(blur, isSelected('blur', i))}
+          </button>
+        {/each}
+        {#each fx.texts as caption, i (i)}
+          <button
+            class="seg chip text"
+            class:on={isSelected('text', i)}
+            style:left={pct(caption.start)}
+            style:width={pct(caption.end - caption.start)}
+            onpointerdown={pick('text', i, caption.start)}
+            aria-label="{t('editor.text')} · {caption.text}"
+          >
+            <span><b>T</b>{caption.text}</span>
+            {@render edges(caption, isSelected('text', i))}
+          </button>
+        {/each}
+      </div>
+    {/if}
+
+    {#each fx.cuts as cut, i (i)}
+      <button
+        class="cut"
+        class:on={isSelected('cut', i)}
+        style:left={pct(cut.start)}
+        style:width={pct(cut.end - cut.start)}
+        onpointerdown={pick('cut', i, cut.start)}
+        aria-label={t('editor.cutLabel')}
+        use:tooltip={{ text: t('editor.cutLabel'), side: 'top' }}
+      >
+        <span class="cut-icon"><Icon name="scissors" size={13} /></span>
+        {@render edges(cut, isSelected('cut', i))}
+      </button>
+    {/each}
+
+    {#if zone}
+      <div class="zone" style:left={pct(zone.start)} style:width={pct(zone.end - zone.start)}>
+        <span class="zone-length">{(zone.end - zone.start).toFixed(1)} s</span>
+      </div>
+    {/if}
 
     <div class="dim" style:left="0" style:width={pct(start)}></div>
     <div class="dim" style:left={pct(end)} style:right="0"></div>
@@ -494,6 +668,150 @@
     opacity: 0.3;
   }
 
+  /* Effects ---------------------------------------------------------------------------- */
+  .fx-head {
+    height: 30px;
+  }
+  .fx-head .badge {
+    width: 22px;
+    height: 22px;
+    color: #ffc75a;
+    background: color-mix(in srgb, #ffc75a 14%, transparent);
+  }
+  .fx-lane {
+    height: 30px;
+  }
+  .ruler {
+    cursor: crosshair;
+  }
+  .seg {
+    position: absolute;
+    top: 3px;
+    bottom: 3px;
+    display: flex;
+    align-items: center;
+    min-width: 6px;
+    padding: 0 6px;
+    border-radius: 6px;
+    overflow: hidden;
+    font-size: 10.5px;
+    font-weight: 700;
+    white-space: nowrap;
+    z-index: 2;
+    transition:
+      box-shadow var(--fast),
+      filter var(--fast);
+  }
+  .seg span {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .seg:hover {
+    filter: brightness(1.12);
+  }
+  .seg.on {
+    box-shadow:
+      0 0 0 2px #fff,
+      0 2px 10px rgba(0, 0, 0, 0.5);
+    overflow: visible;
+  }
+  .seg.slow {
+    top: auto;
+    bottom: 4px;
+    height: 18px;
+    color: #0b1220;
+    background: #7fc6db;
+  }
+  .seg.mute {
+    color: #fff;
+    background: repeating-linear-gradient(-45deg, rgba(10, 11, 13, 0.82) 0 6px, rgba(10, 11, 13, 0.62) 6px 12px);
+    box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.18);
+  }
+  .seg.mute.beep {
+    color: #1a1200;
+    background: repeating-linear-gradient(-45deg, #ffc75a 0 6px, #f5b23a 6px 12px);
+  }
+  .seg.chip.blur {
+    color: #fff;
+    background: color-mix(in srgb, #a89cff 55%, var(--surface-3));
+  }
+  .seg.chip.text {
+    color: #1a1200;
+    background: #ffc75a;
+  }
+  .seg.chip.text b {
+    font-weight: 800;
+  }
+  .edge {
+    position: absolute;
+    top: -3px;
+    bottom: -3px;
+    width: 8px;
+    border-radius: 3px;
+    background: #fff;
+    cursor: ew-resize;
+    z-index: 3;
+  }
+  .edge.left {
+    left: -4px;
+  }
+  .edge.right {
+    right: -4px;
+  }
+  .cut {
+    position: absolute;
+    top: calc(var(--ruler) + var(--gap));
+    bottom: 0;
+    display: grid;
+    place-items: start center;
+    padding-top: 6px;
+    border-radius: 6px;
+    background: repeating-linear-gradient(45deg, rgba(8, 9, 11, 0.86) 0 7px, rgba(255, 85, 85, 0.2) 7px 14px);
+    box-shadow: inset 0 0 0 1px rgba(255, 110, 110, 0.55);
+    z-index: 4;
+  }
+  .cut.on {
+    box-shadow:
+      inset 0 0 0 2px #fff,
+      0 2px 12px rgba(0, 0, 0, 0.5);
+  }
+  .cut-icon {
+    display: grid;
+    place-items: center;
+    width: 22px;
+    height: 22px;
+    border-radius: 6px;
+    color: #fff;
+    background: #e5484d;
+  }
+  .zone {
+    position: absolute;
+    top: 0;
+    bottom: -2px;
+    border-radius: 6px;
+    background: color-mix(in srgb, var(--accent) 16%, transparent);
+    box-shadow: inset 0 0 0 1.5px var(--accent);
+    pointer-events: none;
+    z-index: 5;
+  }
+  .zone-length {
+    position: absolute;
+    top: 3px;
+    left: 50%;
+    transform: translateX(-50%);
+    padding: 1px 6px;
+    border-radius: 5px;
+    font-size: 10.5px;
+    font-weight: 700;
+    color: var(--accent-fg);
+    background: var(--accent);
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+  }
+
   /* Range, handles, playhead -------------------------------------------------------------- */
   .dim {
     position: absolute;
@@ -511,6 +829,7 @@
     pointer-events: none;
   }
   .handle {
+    z-index: 7;
     position: absolute;
     top: calc(var(--ruler) + var(--gap) - 2px);
     bottom: -2px;
@@ -541,6 +860,7 @@
     border-radius: 0 7px 7px 0;
   }
   .playhead {
+    z-index: 6;
     position: absolute;
     top: 4px;
     bottom: -4px;

@@ -1,13 +1,37 @@
 <!-- Editing tools under the player: a multi-track timeline (video, game sound, microphone) with
      trim handles and per-track volume, heard live (`LiveMix`), then save a copy or export for
-     Discord. Keys: Space play/pause, I/O set the start/end at the playhead, ←/→ seek (Shift: 5 s). -->
+     Discord. A zone selected on the timeline's ruler can be cut out, muted or bleeped, slowed
+     down; captions and blurred zones go on the picture (moved on the player). All of it is
+     previewed live: cut passages are skipped, mutes and bleeps heard, slow motion played.
+     Keys: Space play/pause, I/O set the start/end at the playhead, ←/→ seek (Shift: 5 s),
+     X cut the zone, Delete remove the selected effect, Escape let go of the zone. -->
 <script lang="ts">
   import { onDestroy, onMount, untrack } from 'svelte';
   import Icon from './Icon.svelte';
   import Timeline, { type Lane } from './Timeline.svelte';
   import ExportDialog from './ExportDialog.svelte';
+  import Segmented from './Segmented.svelte';
+  import Toggle from './Toggle.svelte';
   import { api, mediaSrc, native, type Shard, type ShardInfo, type Waveform } from '$lib/api';
   import { getEdit, saveEdit, type Edit } from '$lib/edits';
+  import {
+    CAPTION_SIZES,
+    add,
+    cutAt,
+    fx,
+    hasEffects,
+    loadEffects,
+    muteAt,
+    playedLength,
+    rateAt,
+    remove,
+    snapshot,
+    type CaptionStyle,
+    type MuteTrack,
+    type Range,
+  } from '$lib/fx.svelte';
+  import { setBeep } from '$lib/live-mix.svelte';
+  import { openMenu } from '$lib/ui.svelte';
   import { canFrame, framing } from '$lib/framing.svelte';
   import { gameTint } from '$lib/games';
   import { t } from '$lib/i18n.svelte';
@@ -41,6 +65,8 @@
   let exporting = $state(false);
   /** The clip whose saved edit is applied: edits are only saved once it is. */
   let loadedId = $state<string | null>(null);
+  /** The zone selected on the ruler, for the tools. */
+  let zone = $state<Range | null>(null);
 
   const duration = $derived(info?.duration ?? 0);
   const hasMic = $derived(!!info?.audioTracks.some((track) => track.kind === 'mic'));
@@ -96,6 +122,8 @@
     loadedId = null;
     framing.vertical = false;
     framing.x = 0.5;
+    loadEffects(null);
+    zone = null;
     const apply = (next: ShardInfo) => {
       if (shard.id !== id) return;
       info = { ...next, duration: next.duration || fallback.duration };
@@ -107,6 +135,7 @@
       gains = saved ? { ...saved.gains } : { game: 1, mic: 1 };
       framing.vertical = !!saved?.vertical;
       framing.x = typeof saved?.cropX === 'number' ? Math.min(1, Math.max(0, saved.cropX)) : 0.5;
+      loadEffects(saved?.fx);
       if (saved) seek(start);
       loadedId = id;
     };
@@ -147,7 +176,7 @@
   // editor closes before that).
   let unsaved: (() => void) | null = null;
   $effect(() => {
-    const edit: Edit = { start, end, gains: { ...gains }, vertical: framing.vertical, cropX: framing.x };
+    const edit: Edit = { start, end, gains: { ...gains }, vertical: framing.vertical, cropX: framing.x, fx: snapshot() };
     const id = loadedId;
     const d = duration;
     if (!id || id !== shard.id || !d) return;
@@ -160,16 +189,43 @@
     const timer = setTimeout(save, 300);
     return () => clearTimeout(timer);
   });
-  onDestroy(() => unsaved?.());
+  onDestroy(() => {
+    unsaved?.();
+    setBeep(0);
+    if (video) video.playbackRate = 1;
+    fx.selected = null;
+  });
 
-  // Playhead follows the video smoothly; playback loops inside the kept range.
+  // Playhead follows the video smoothly; playback loops inside the kept range, skips the cut
+  // passages, plays slow zones slowly (and lower, like the export), and the mutes and bleeps are
+  // heard where they are.
+  let heard = '';
   onMount(() => {
     let frame = requestAnimationFrame(function tick() {
       if (video) {
         current = video.currentTime;
+        fx.current = current;
         playing = !video.paused;
         if (playing && end > 0 && current >= end - 0.02) video.currentTime = start;
         else if (playing && current < start - 0.05) video.currentTime = start;
+        else if (playing) {
+          const cut = cutAt(fx, current);
+          if (cut) video.currentTime = Math.min(end, cut.end);
+        }
+        const rate = rateAt(fx, current);
+        if (video.playbackRate !== rate) {
+          video.preservesPitch = false;
+          video.playbackRate = rate;
+        }
+        const muted = muteAt(fx, current);
+        const levels = { game: gains.game * muted.game, mic: gains.mic * muted.mic };
+        const key = `${levels.game}|${levels.mic}|${playing ? muted.beep : 0}`;
+        if (key !== heard) {
+          heard = key;
+          mix?.setGains(levels);
+          if (!live) video.volume = Math.min(1, hasMic ? Math.min(levels.game, levels.mic) : levels.game);
+          setBeep(playing ? muted.beep : 0);
+        }
       }
       frame = requestAnimationFrame(tick);
     });
@@ -183,11 +239,10 @@
     const target = mix;
     untrack(() => target?.load());
   });
+  // A change of volume is applied by the next frame (with the mutes).
   $effect(() => {
-    mix?.setGains(gains);
-  });
-  $effect(() => {
-    if (video && !hasMic && !live) video.volume = Math.min(1, gains.game);
+    void [gains.game, gains.mic, mix, live];
+    heard = '';
   });
 
   function seek(time: number) {
@@ -203,11 +258,69 @@
     } else video.pause();
   }
 
+  // Tools ------------------------------------------------------------------------------
+
+  const clampZone = (z: Range): Range => ({ start: Math.max(0, z.start), end: Math.min(duration, z.end) });
+
+  function cutZone() {
+    if (!zone) return;
+    add('cut', clampZone(zone));
+    zone = null;
+  }
+
+  function muteZone(track: MuteTrack, beep: boolean) {
+    if (!zone) return;
+    add('mute', { ...clampZone(zone), track, beep });
+    zone = null;
+  }
+
+  function slowZone(rate: number) {
+    if (!zone) return;
+    add('slow', { ...clampZone(zone), rate });
+    zone = null;
+  }
+
+  function addText() {
+    const range = zone ? clampZone(zone) : { start: current, end: Math.min(end, current + 3) };
+    if (range.end - range.start < 0.3) range.end = Math.min(duration, range.start + 3);
+    add('text', { ...range, text: t('editor.textDefault'), x: 0.5, y: 0.82, size: CAPTION_SIZES.m, style: 'shadow' });
+    zone = null;
+  }
+
+  function addBlur() {
+    add('blur', { x: 0.36, y: 0.36, w: 0.28, h: 0.28, ...(zone ? clampZone(zone) : {}) });
+    zone = null;
+  }
+
+  function menuAt(e: MouseEvent, items: { label: string; run: () => void }[]) {
+    const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
+    openMenu(r.left, r.bottom + 6, items);
+  }
+
+  const tracks = $derived(
+    (hasMic ? (['mic', 'game', 'all'] as const) : (['game'] as const)).map((value) => ({ value: value as MuteTrack, label: t(`editor.track.${value}`) })),
+  );
+  const rates = [0.5, 0.25].map((value) => ({ value, label: `×${value}` }));
+  const sizes = $derived(
+    (Object.entries(CAPTION_SIZES) as [keyof typeof CAPTION_SIZES, number][]).map(([key, value]) => ({ value, label: t(`editor.textSize.${key}`) })),
+  );
+  const styles = $derived((['shadow', 'outline', 'box'] as CaptionStyle[]).map((value) => ({ value, label: t(`editor.textStyle.${value}`) })));
+
+  const selected = $derived(fx.selected);
+  const zoneLength = $derived(zone ? zone.end - zone.start : 0);
+  /** What the export lasts: the kept range, cut and slowed. */
+  const played = $derived(playedLength(start, end, fx));
+
   function onkeydown(e: KeyboardEvent) {
     const tag = (e.target as HTMLElement).tagName;
-    if (tag === 'INPUT' || e.ctrlKey || e.altKey) return;
+    if (tag === 'INPUT' || tag === 'TEXTAREA' || e.ctrlKey || e.altKey) return;
     const key = e.key.toLowerCase();
-    if (key === ' ' && tag !== 'BUTTON') toggle();
+    if (key === 'x' && zone) cutZone();
+    else if ((key === 'delete' || key === 'backspace') && fx.selected) remove(fx.selected.kind, fx.selected.index);
+    else if (key === 'escape' && (zone || fx.selected)) {
+      zone = null;
+      fx.selected = null;
+    } else if (key === ' ' && tag !== 'BUTTON') toggle();
     else if (key === 'i') start = Math.min(current, end - 0.5);
     else if (key === 'o') end = Math.max(current, start + 0.5);
     else if (key === 'arrowleft') seek(Math.max(start, current - (e.shiftKey ? 5 : 1)));
@@ -246,7 +359,7 @@
           <Icon name="undo" size={13} />
         </button>
       {/if}
-      <span class="selection" class:trimmed>{t('editor.selection', { duration: `${selection.toFixed(1)} s` })}</span>
+      <span class="selection" class:trimmed={trimmed || hasEffects(fx)}>{t('editor.selection', { duration: `${(hasEffects(fx) ? played : selection).toFixed(1)} s` })}</span>
     </div>
 
     {#if frameable}
@@ -269,11 +382,102 @@
     </div>
   </div>
 
+  <div class="tools">
+    {#if selected}
+      {@const kind = selected.kind}
+      {@const i = selected.index}
+      <span class="tools-label strong">{t(`editor.kind.${kind}`)}</span>
+      {#if kind === 'cut'}
+        <span class="tools-label">{t('editor.cutHint')}</span>
+        <button class="tool" onclick={() => remove('cut', i)}><Icon name="undo" size={13} />{t('editor.restore')}</button>
+      {:else if kind === 'slow' && fx.slow[i]}
+        <Segmented label={t('editor.slow')} options={rates} value={fx.slow[i].rate} onchange={(v) => (fx.slow[i].rate = v)} />
+      {:else if kind === 'mute' && fx.mutes[i]}
+        <Segmented label={t('editor.muteZone')} options={tracks} value={fx.mutes[i].track} onchange={(v) => (fx.mutes[i].track = v)} />
+        <label class="inline-toggle">
+          <Toggle label={t('editor.beep')} checked={fx.mutes[i].beep} onchange={(v) => (fx.mutes[i].beep = v)} />
+          {t('editor.beep')}
+        </label>
+      {:else if kind === 'blur' && fx.blurs[i]}
+        <Segmented
+          label={t('editor.blur')}
+          options={[
+            { value: 'all', label: t('editor.blurWhole') },
+            { value: 'zone', label: t('editor.blurZone') },
+          ]}
+          value={fx.blurs[i].start === undefined ? 'all' : 'zone'}
+          onchange={(v) => {
+            const blur = fx.blurs[i];
+            if (v === 'all') {
+              delete blur.start;
+              delete blur.end;
+            } else {
+              blur.start = Math.max(start, current - 1.5);
+              blur.end = Math.min(end, blur.start + 3);
+            }
+          }}
+        />
+        <span class="tools-label">{t('editor.blurHint')}</span>
+      {:else if kind === 'text' && fx.texts[i]}
+        <input class="text-input" type="text" maxlength="80" bind:value={fx.texts[i].text} placeholder={t('editor.textDefault')} aria-label={t('editor.text')} />
+        <Segmented label={t('editor.textSize.label')} options={sizes} value={fx.texts[i].size} onchange={(v) => (fx.texts[i].size = v)} />
+        <Segmented label={t('editor.textStyle.label')} options={styles} value={fx.texts[i].style} onchange={(v) => (fx.texts[i].style = v)} />
+      {/if}
+      <div class="tools-end">
+        {#if kind !== 'cut'}
+          <button class="tool danger" onclick={() => remove(kind, i)} use:tooltip={{ text: `${t('editor.remove')} · Suppr`, side: 'top' }}>
+            <Icon name="trash" size={13} />{t('editor.remove')}
+          </button>
+        {/if}
+        <button class="tool" onclick={() => (fx.selected = null)}><Icon name="check" size={13} />{t('editor.done')}</button>
+      </div>
+    {:else}
+      <span class="tools-label" class:strong={!!zone}>
+        {zone ? t('editor.zone', { duration: `${zoneLength.toFixed(1)} s` }) : t('editor.toolsHint')}
+      </span>
+      <button class="tool" disabled={!zone} onclick={cutZone} use:tooltip={{ text: `${t('editor.cutTip')} · X`, side: 'top' }}>
+        <Icon name="scissors" size={13} />{t('editor.cut')}
+      </button>
+      <button
+        class="tool"
+        disabled={!zone}
+        onclick={(e) => menuAt(e, tracks.map((tr) => ({ label: tr.label, run: () => muteZone(tr.value, false) })))}
+        use:tooltip={{ text: t('editor.muteTip'), side: 'top' }}
+      >
+        <Icon name="mute" size={13} />{t('editor.muteZone')}<Icon name="chevronDown" size={11} />
+      </button>
+      <button
+        class="tool"
+        disabled={!zone}
+        onclick={(e) => menuAt(e, tracks.map((tr) => ({ label: tr.label, run: () => muteZone(tr.value, true) })))}
+        use:tooltip={{ text: t('editor.beepTip'), side: 'top' }}
+      >
+        <Icon name="zap" size={13} />{t('editor.beep')}<Icon name="chevronDown" size={11} />
+      </button>
+      <button
+        class="tool"
+        disabled={!zone}
+        onclick={(e) => menuAt(e, rates.map((r) => ({ label: r.label, run: () => slowZone(r.value) })))}
+        use:tooltip={{ text: t('editor.slowTip'), side: 'top' }}
+      >
+        <Icon name="clock" size={13} />{t('editor.slow')}<Icon name="chevronDown" size={11} />
+      </button>
+      <button class="tool" onclick={addText} use:tooltip={{ text: t('editor.textTip'), side: 'top' }}><b class="t">T</b>{t('editor.text')}</button>
+      <button class="tool" onclick={addBlur} use:tooltip={{ text: t('editor.blurTip'), side: 'top' }}><Icon name="grid" size={13} />{t('editor.blur')}</button>
+      {#if zone}
+        <button class="tool ghost" onclick={() => (zone = null)} aria-label={t('editor.clearZone')} use:tooltip={{ text: `${t('editor.clearZone')} · Échap`, side: 'top' }}>
+          <Icon name="x" size={13} />
+        </button>
+      {/if}
+    {/if}
+  </div>
+
   {#if info}
     <Timeline
       {duration}
       bind:start
       bind:end
+      bind:zone
       {current}
       src={shard.path ? mediaSrc(shard.path) : null}
       tint={gameTint(shard.game)}
@@ -289,7 +493,15 @@
 </div>
 
 {#if exporting}
-  <ExportDialog {shard} {start} {end} gains={{ ...gains }} size={info ? [info.width, info.height] : null} onclose={() => (exporting = false)} />
+  <ExportDialog
+    {shard}
+    {start}
+    {end}
+    gains={{ ...gains }}
+    effects={hasEffects(fx) ? snapshot() : null}
+    size={info ? [info.width, info.height] : null}
+    onclose={() => (exporting = false)}
+  />
 {/if}
 
 <style>
@@ -396,6 +608,92 @@
     margin: -4px 0 0 212px;
     font-size: 12px;
     color: var(--text-3);
+  }
+
+  .tools {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px;
+    min-height: 34px;
+    padding: 4px 6px 4px 12px;
+    border-radius: 10px;
+    background: var(--surface-2);
+    box-shadow: inset 0 0 0 1px var(--border);
+  }
+  .tools-label {
+    margin-right: 6px;
+    font-size: 12.5px;
+    color: var(--text-3);
+  }
+  .tools-label.strong {
+    font-weight: 600;
+    color: var(--text);
+  }
+  .tool {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    height: 28px;
+    padding: 0 10px;
+    border-radius: 7px;
+    font-size: 12.5px;
+    font-weight: 600;
+    color: var(--text-2);
+    background: var(--surface-3);
+    white-space: nowrap;
+    transition:
+      background var(--fast),
+      color var(--fast),
+      opacity var(--fast);
+  }
+  .tool:hover:not(:disabled) {
+    color: var(--text);
+    background: var(--surface-4);
+  }
+  .tool:disabled {
+    opacity: 0.45;
+    cursor: default;
+  }
+  .tool.ghost {
+    padding: 0 8px;
+    background: none;
+  }
+  .tool.danger:hover {
+    color: #ff6b6b;
+  }
+  .tool .t {
+    font-weight: 800;
+    font-size: 13px;
+  }
+  .tools-end {
+    display: flex;
+    gap: 6px;
+    margin-left: auto;
+  }
+  .inline-toggle {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    margin-left: 6px;
+    font-size: 12.5px;
+    font-weight: 600;
+    color: var(--text-2);
+  }
+  .text-input {
+    width: 220px;
+    height: 28px;
+    padding: 0 10px;
+    border-radius: 7px;
+    font-size: 13px;
+    color: var(--text);
+    background: var(--surface-3);
+    border: none;
+    box-shadow: inset 0 0 0 1px var(--border-strong);
+  }
+  .text-input:focus {
+    outline: none;
+    box-shadow: inset 0 0 0 1.5px var(--accent);
   }
 
   .actions {

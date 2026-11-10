@@ -9,6 +9,7 @@
   import { api, errorCode, native, on, type ExportRequest, type Shard } from '$lib/api';
   import { CLIPS_CHANNEL, openLink } from '$lib/community';
   import { canFrame, framing } from '$lib/framing.svelte';
+  import { playedLength, type Effects } from '$lib/fx.svelte';
   import { share } from '$lib/share.svelte';
   import { MB, formatDuration, formatSize, hasKey, t } from '$lib/i18n.svelte';
   import { library } from '$lib/library.svelte';
@@ -24,6 +25,7 @@
     start,
     end,
     gains,
+    effects = null,
     size = null,
     onclose,
   }: {
@@ -31,6 +33,8 @@
     start: number;
     end: number;
     gains: { game: number; mic: number };
+    /** The editor's cuts, mutes, slow motion, blurs and captions: rendered by a composition. */
+    effects?: Effects | null;
     /** The clip's picture size, when known. */
     size?: [number, number] | null;
     onclose: () => void;
@@ -55,7 +59,7 @@
   onMount(() => dialog.focus());
   const real = $derived(native && !library.demo);
 
-  const selection = $derived(Math.max(0, end - start));
+  const selection = $derived(effects ? playedLength(start, end, effects) : Math.max(0, end - start));
   /** The trimmed clip at its current quality, roughly. */
   const estimate = $derived(shard.size * (shard.duration ? selection / shard.duration : 1));
 
@@ -116,7 +120,7 @@
   async function go() {
     if (target === 'community') {
       // Sized for the server and uploaded by the share sheet, with these edits.
-      share.request = { shard, start, end, gains: { ...gains }, vertical, cropX: framing.x };
+      share.request = { shard, start, end, gains: { ...gains }, vertical, cropX: framing.x, effects };
       onclose();
       return;
     }
@@ -148,10 +152,19 @@
     }
 
     const stop = on('export-progress', (p) => {
-      if (p.id === shard.id) progress = p.progress;
+      if (p.id === shard.id || p.id === 'composition') progress = p.progress;
     });
     try {
-      const done = await api.exportShard({
+      const done = effects
+        ? await api.exportComposition({
+            clips: [{ id: shard.id, start, end, gains: { ...gains }, ...effects, cropX: framing.x }],
+            vertical,
+            watermark: settings.value.watermark,
+            target,
+            maxBytes: target === 'discord' ? limit * 1_000_000 : null,
+            path,
+          })
+        : await api.exportShard({
         id: shard.id,
         start,
         end,

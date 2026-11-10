@@ -9,6 +9,7 @@
   import RenameInput from './RenameInput.svelte';
   import Editor from './Editor.svelte';
   import CropFrame from './CropFrame.svelte';
+  import EffectsOverlay from './EffectsOverlay.svelte';
   import { canFrame, framing } from '$lib/framing.svelte';
   import { mediaSrc } from '$lib/api';
   import { getEdit, type Edit } from '$lib/edits';
@@ -208,6 +209,11 @@
             {#if framed && natural}
               <div class="overlay" transition:fade={{ duration: 160 * motion }}>
                 <CropFrame width={natural[0]} height={natural[1]} />
+              </div>
+            {/if}
+            {#if ui.editing && natural}
+              <div class="overlay">
+                <EffectsOverlay width={natural[0]} height={natural[1]} />
               </div>
             {/if}
           {:else}
