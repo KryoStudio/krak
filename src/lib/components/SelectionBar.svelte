@@ -14,6 +14,7 @@
     allFavorite = false,
     onall,
     onfavorite,
+    onbestof,
     ondelete,
     onclear,
   }: {
@@ -23,6 +24,8 @@
     onall: () => void;
     /** Leave out for things that can't be favorites. */
     onfavorite?: () => void;
+    /** Leave out where a best-of makes no sense. */
+    onbestof?: () => void;
     ondelete: () => void;
     onclear: () => void;
   } = $props();
@@ -45,6 +48,11 @@
     <button class="action" class:on={allFavorite} onclick={onfavorite}>
       <Icon name="star" size={15} fill={allFavorite} />
       {t(allFavorite ? 'selection.unfavorite' : 'selection.favorite')}
+    </button>
+  {/if}
+  {#if onbestof}
+    <button class="action" onclick={onbestof}>
+      <Icon name="sparkles" size={15} />{t('selection.bestof')}
     </button>
   {/if}
   <button class="action danger" onclick={ondelete} use:tooltip={{ text: t('key.delete'), side: 'top' }}>

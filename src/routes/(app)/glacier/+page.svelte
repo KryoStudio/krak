@@ -18,6 +18,8 @@
   import { displayTitle, showError } from '$lib/shard-actions';
   import type { Shard } from '$lib/api';
   import { view } from '$lib/view.svelte';
+  import { goto } from '$app/navigation';
+  import { add as addToBestof } from '$lib/bestof.svelte';
 
   const motion = $derived(prefersReducedMotion.current ? 0 : 1);
   const sorts: Sort[] = ['recent', 'oldest', 'longest', 'largest', 'name'];
@@ -235,6 +237,11 @@
     {allFavorite}
     onall={selectAll}
     onfavorite={favoriteSelected}
+    onbestof={() => {
+      addToBestof(selected.map((s) => s.id));
+      selection.clear();
+      goto('/bestof');
+    }}
     ondelete={deleteSelected}
     onclear={() => selection.clear()}
   />

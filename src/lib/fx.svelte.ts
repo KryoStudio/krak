@@ -167,3 +167,39 @@ export function add<K extends Kind>(kind: K, item: K extends 'cut' ? Range : K e
   list.push(item);
   fx.selected = { kind, index: list.length - 1 };
 }
+
+/** What plays of `start..end`: each part of the clip (`from..to` at `rate`) and where it starts
+ *  in the played time (`at`), in order. */
+export function pieces(start: number, end: number, e: Effects): { from: number; to: number; rate: number; at: number }[] {
+  const out: { from: number; to: number; rate: number; at: number }[] = [];
+  let at = 0;
+  for (const [from, to] of kept(start, end, e.cuts)) {
+    const edges = [from, to];
+    for (const zone of e.slow) for (const edge of [zone.start, zone.end]) if (edge > from && edge < to) edges.push(edge);
+    edges.sort((a, b) => a - b);
+    for (let i = 0; i + 1 < edges.length; i++) {
+      const rate = rateAt(e, (edges[i] + edges[i + 1]) / 2);
+      out.push({ from: edges[i], to: edges[i + 1], rate, at });
+      at += (edges[i + 1] - edges[i]) / rate;
+    }
+  }
+  return out;
+}
+
+/** The clip time shown `offset` seconds into what plays of `start..end`. */
+export function sourceAt(start: number, end: number, e: Effects, offset: number): number {
+  const parts = pieces(start, end, e);
+  for (const p of parts) if (offset < p.at + (p.to - p.from) / p.rate) return p.from + Math.max(0, offset - p.at) * p.rate;
+  return parts.at(-1)?.to ?? end;
+}
+
+/** How far into what plays of `start..end` clip time `s` is (a cut passage: where it was). */
+export function playedAt(start: number, end: number, e: Effects, s: number): number {
+  let last = 0;
+  for (const p of pieces(start, end, e)) {
+    if (s < p.from) return p.at;
+    if (s < p.to) return p.at + (s - p.from) / p.rate;
+    last = p.at + (p.to - p.from) / p.rate;
+  }
+  return last;
+}

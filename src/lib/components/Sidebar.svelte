@@ -13,6 +13,7 @@
   import { discordInvite, openLink } from '$lib/community';
   import { showError } from '$lib/shard-actions';
   import { tooltip } from '$lib/tooltip';
+  import { bestof } from '$lib/bestof.svelte';
   import { filterFor, ui, type Filter } from '$lib/ui.svelte';
 
   const collapsed = $derived(settings.value.sidebarCollapsed);
@@ -20,7 +21,9 @@
   const active = $derived(
     path.startsWith('/settings')
       ? 'settings'
-      : path.startsWith('/screenshots')
+      : path.startsWith('/bestof')
+        ? 'bestof'
+        : path.startsWith('/screenshots')
         ? 'screenshots'
         : path.startsWith('/glacier')
           ? ui.filter
@@ -102,6 +105,7 @@
 {#snippet gridIcon()}<Icon name="grid" size={16} />{/snippet}
 {#snippet starIcon()}<Icon name="star" size={16} />{/snippet}
 {#snippet gearIcon()}<Icon name="settings" size={16} />{/snippet}
+{#snippet sparklesIcon()}<Icon name="sparkles" size={16} />{/snippet}
 {#snippet discordIcon()}<Icon name="users" size={16} />{/snippet}
 
 <aside class:collapsed>
@@ -142,6 +146,7 @@
       {@render item('all', t('nav.glacier'), library.shards.length, gridIcon, () => show('all'))}
       {@render item('favorites', t('nav.favorites'), library.favorites, starIcon, () => show('favorites'))}
       {@render item('screenshots', t('nav.screenshots'), screens.items.length, imageIcon, () => ((ui.playing = null), goto('/screenshots')))}
+      {@render item('bestof', t('nav.bestof'), bestof.items.length || null, sparklesIcon, () => ((ui.playing = null), goto('/bestof')))}
 
       {#if library.games.length}
         <div class="section">
