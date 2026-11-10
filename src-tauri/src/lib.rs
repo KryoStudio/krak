@@ -107,6 +107,8 @@ pub fn run() {
             commands::get_waveforms,
             commands::get_audio_stems,
             commands::capture_controller_combo,
+            commands::list_open_apps,
+            commands::list_displays,
             recording::start_recording,
             recording::stop_recording,
             screenshots::take_screenshot,

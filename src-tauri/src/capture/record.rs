@@ -999,6 +999,7 @@ mod tests {
             buffer_seconds: 30,
             microphone: false,
             microphone_device: None,
+            source: Default::default(),
         };
         let seen = Arc::new(Seen::default());
         let shared = Arc::new(Shared::new(config, seen.clone()));

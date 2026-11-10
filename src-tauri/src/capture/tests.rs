@@ -135,6 +135,7 @@ fn run(label: &str, video: VideoSettings, microphone: bool, software: bool) -> P
         buffer_seconds: 5,
         microphone,
         microphone_device: None,
+        source: Default::default(),
     };
     let cpu_before = process_cpu();
     // This process's use of each GPU engine (3D is the one games need; the video encoder and
@@ -316,6 +317,7 @@ fn engine_extends_the_previous_clip() {
         buffer_seconds: 5,
         microphone: false,
         microphone_device: None,
+        source: Default::default(),
     };
     let started = Instant::now();
     let engine = Engine::start(config, recorder.clone());
@@ -499,6 +501,7 @@ fn engine_slows_down_evenly() {
         buffer_seconds: 5,
         microphone: false,
         microphone_device: None,
+        source: Default::default(),
     };
     video::tests::SLOW_DOWN_AT.store(180, Ordering::Relaxed);
     let engine = Engine::start(config, recorder.clone());
@@ -614,6 +617,7 @@ fn engine_captures_every_display_frame() {
             buffer_seconds: 30,
             microphone: false,
             microphone_device: None,
+            source: Default::default(),
         },
         recorder.clone(),
     );
@@ -784,6 +788,7 @@ fn record_under_load(quality: Quality, fps: u32, seconds: u64) -> (CaptureStatus
         buffer_seconds: 10,
         microphone: false,
         microphone_device: None,
+        source: Default::default(),
     };
     let mut gpu = testing::GpuUsage::start();
     let engine = Engine::start(config, recorder.clone());
@@ -886,6 +891,7 @@ fn engine_records_continuously() {
         buffer_seconds: 10,
         microphone: false,
         microphone_device: None,
+        source: Default::default(),
     };
     let engine = Engine::start(config, recorder.clone());
     recorder
@@ -1217,6 +1223,7 @@ fn engine_keeps_the_replay_through_a_mode_change() {
         buffer_seconds: 30,
         microphone: false,
         microphone_device: None,
+        source: Default::default(),
     };
     let engine = Engine::start(config, recorder.clone());
     recorder
@@ -1289,4 +1296,164 @@ fn engine_keeps_the_replay_through_a_mode_change() {
         "clip {duration:.2} s of {elapsed:.1}"
     );
     println!("clip: {}", path.display());
+}
+
+/// A window of another process for game-only capture to film: a PowerShell form whose colour
+/// changes every frame (so pictures keep coming), killed with the child.
+struct TestGame(std::process::Child);
+
+impl TestGame {
+    const TITLE: &str = "Krak test game";
+
+    fn start() -> Self {
+        let script = format!(
+            "Add-Type -AssemblyName System.Windows.Forms; Add-Type -AssemblyName System.Drawing; \
+             $f = New-Object Windows.Forms.Form; $f.Text = '{}'; $f.Width = 960; $f.Height = 540; \
+             $f.StartPosition = 'CenterScreen'; $t = New-Object Windows.Forms.Timer; $t.Interval = 16; \
+             $t.add_Tick({{ $f.BackColor = [Drawing.Color]::FromArgb((Get-Random 256), (Get-Random 256), (Get-Random 256)) }}); \
+             $t.Start(); [Windows.Forms.Application]::Run($f)",
+            Self::TITLE
+        );
+        let child = std::process::Command::new("powershell")
+            .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+            .spawn()
+            .expect("powershell");
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !target::open_apps()
+            .iter()
+            .any(|app| app.exe == "powershell" && app.title == Self::TITLE)
+        {
+            assert!(Instant::now() < deadline, "the test window never opened");
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        Self(child)
+    }
+}
+
+impl Drop for TestGame {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// Game only, on a window of another process: it is found and filmed into a clip; once it is
+/// gone, the engine says so and records nothing at all; with no game, a save says "no_game".
+#[test]
+#[ignore = "opens a window and records it (silently); run with --ignored"]
+fn engine_films_only_the_game_window() {
+    let _com = ComGuard::new();
+    let _mf = MfGuard::new().expect("media foundation");
+    let dir = out_dir().join("game-only");
+    let _ = std::fs::remove_dir_all(&dir);
+    let config = |game: &str| EngineConfig {
+        screen_fit: crate::settings::ScreenFit::Screen,
+        video: video(Quality::High, 60),
+        audio_bitrate: 192_000,
+        buffer_seconds: 5,
+        microphone: false,
+        microphone_device: None,
+        source: SourceConfig {
+            game_only: true,
+            game: Some(target::AppPick {
+                exe: game.into(),
+                name: String::new(),
+            }),
+            monitor: None,
+            cursor: false,
+        },
+    };
+    let request = || SaveRequest {
+        clips_dir: dir.clone(),
+        game: None,
+        desktop_label: "Game only".into(),
+        stamp: Stamp::now(),
+    };
+
+    // No such game: ready, nothing filmed, a save says why.
+    let recorder = Arc::new(Recorder::default());
+    let engine = Engine::start(config("kryo-no-such-game"), recorder.clone());
+    recorder
+        .wait(Duration::from_secs(10), |seen| {
+            seen.statuses
+                .iter()
+                .any(|s| s.state == CaptureState::Ready && s.game_only && s.filming.is_none())
+                .then_some(())
+        })
+        .expect("ready while waiting for a game");
+    std::thread::sleep(Duration::from_secs(1));
+    assert_eq!(engine.save(request(), Duration::ZERO).err(), Some(NO_GAME));
+    drop(engine);
+
+    let game = TestGame::start();
+    let recorder = Arc::new(Recorder::default());
+    let engine = Engine::start(config("powershell"), recorder.clone());
+    let filming = recorder
+        .wait(Duration::from_secs(10), |seen| {
+            seen.statuses.iter().find_map(|s| s.filming.clone())
+        })
+        .expect("the window is filmed");
+    println!("filming {filming}");
+    assert_eq!(engine.filming().as_deref(), Some(filming.as_str()));
+    std::thread::sleep(Duration::from_secs(5));
+    let status = engine.status();
+    assert_eq!(status.state, CaptureState::Ready);
+    engine
+        .save(request(), Duration::ZERO)
+        .expect("save accepted");
+    let path = recorder
+        .wait(Duration::from_secs(20), |seen| seen.saved.clone())
+        .expect("clip saved");
+    let info = testing::probe(&path);
+    let size = info
+        .streams
+        .iter()
+        .find(|s| s.width > 0)
+        .map(|s| (s.width, s.height))
+        .expect("a video stream");
+    println!(
+        "game clip: {} ({:.2} s, {}x{})",
+        path.display(),
+        info.duration,
+        size.0,
+        size.1
+    );
+    assert!(info.duration > 4.0, "{info:?}");
+    assert_eq!(size, (status.width, status.height));
+    let frames = testing::decode_video_timestamps(&path, false);
+    assert!(
+        frames.len() as f64 > info.duration * 50.0,
+        "{} frames",
+        frames.len()
+    );
+
+    // The game closes: nothing is filmed any more.
+    drop(game);
+    let gone = Instant::now();
+    recorder
+        .wait(Duration::from_secs(5), |seen| {
+            seen.statuses
+                .last()
+                .filter(|s| s.filming.is_none())
+                .map(|_| ())
+        })
+        .expect("the engine saw the game go");
+    assert_eq!(engine.filming(), None);
+    std::thread::sleep(Duration::from_secs(4).saturating_sub(gone.elapsed()));
+    lock(&recorder.events).saved = None;
+    engine
+        .save(request(), Duration::ZERO)
+        .expect("what was filmed is still there");
+    let path = recorder
+        .wait(Duration::from_secs(20), |seen| seen.saved.clone())
+        .expect("clip saved");
+    let info = testing::probe(&path);
+    println!("after the game: {:.2} s", info.duration);
+    // The window covers 5 s back from the press; only about 1 s before the game closed, plus
+    // the one-second hold, has pictures (a GOP more at most).
+    assert!(
+        info.duration < 4.0,
+        "pictures kept coming without the game: {info:?}"
+    );
+    drop(engine);
 }

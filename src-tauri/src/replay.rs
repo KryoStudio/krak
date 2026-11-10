@@ -22,10 +22,10 @@ use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager};
 
 use crate::capture::{
-    self, CaptureState, CaptureStatus, Engine, EngineConfig, EngineEvents, SaveRequest, Stamp,
-    VideoSettings,
+    self, CaptureState, CaptureStatus, Engine, EngineConfig, EngineEvents, SaveRequest,
+    SourceConfig, Stamp, VideoSettings,
 };
-use crate::settings::Settings;
+use crate::settings::{CaptureSource, Settings};
 use crate::state::{AppState, lock};
 use crate::{i18n, library, recording, storage, tray};
 
@@ -101,6 +101,12 @@ fn engine_config(settings: &Settings) -> EngineConfig {
         buffer_seconds: settings.buffer_seconds,
         microphone: settings.microphone,
         microphone_device: settings.microphone_device.clone(),
+        source: SourceConfig {
+            game_only: settings.capture_source == CaptureSource::Game,
+            game: settings.capture_game.clone(),
+            monitor: settings.monitor.clone(),
+            cursor: settings.show_cursor,
+        },
     }
 }
 
@@ -220,8 +226,10 @@ pub fn request_save(app: &AppHandle) -> Press {
         *last = Some(now);
     }
     let settings = app.state::<AppState>().settings();
-    // The game is whatever is in front at the moment of the press.
-    let game = capture::game::foreground_game();
+    // The game filmed in game-only capture, else whatever is in front at the moment of the
+    // press.
+    let filming = lock(&replay.engine).as_ref().and_then(Engine::filming);
+    let game = filming.or_else(capture::game::foreground_game);
     let request = SaveRequest {
         clips_dir: settings.clips_dir.clone().into(),
         game: game.clone(),

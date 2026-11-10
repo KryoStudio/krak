@@ -83,6 +83,19 @@ pub enum ScreenFit {
     Original,
 }
 
+/// What the video records.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CaptureSource {
+    /// The whole screen (Desktop Duplication).
+    #[default]
+    Screen,
+    /// Only the game's window ("stream-proof": nothing over it or around it is recorded).
+    Game,
+}
+
+pub use crate::capture::target::AppPick;
+
 /// Where the one-time invitation to the Krak Discord stands (shown and answered by the page).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -128,6 +141,14 @@ pub struct Settings {
     pub ten_bit: bool,
     /// How a game's own resolution is recorded.
     pub screen_fit: ScreenFit,
+    /// The whole screen, or only the game's window.
+    pub capture_source: CaptureSource,
+    /// The app filmed in game-only capture; `None` = the game in front, found by Krak.
+    pub capture_game: Option<AppPick>,
+    /// GDI name of the display to record ("\\.\DISPLAY2"); `None` = the main one.
+    pub monitor: Option<String>,
+    /// Draw the mouse cursor in clips.
+    pub show_cursor: bool,
     /// AAC kbit/s of the Game and Mix tracks (the microphone stays mono 96).
     pub audio_bitrate: u32,
     /// Absolute path of the clips folder.
@@ -182,6 +203,14 @@ pub struct SettingsPatch {
     pub bitrate: Option<f64>,
     pub ten_bit: Option<bool>,
     pub screen_fit: Option<ScreenFit>,
+    pub capture_source: Option<CaptureSource>,
+    /// Outer `None` = absent, `Some(None)` = explicit `null` (automatic).
+    #[serde(default, deserialize_with = "present")]
+    pub capture_game: Option<Option<AppPick>>,
+    /// Outer `None` = absent, `Some(None)` = explicit `null` (the main display).
+    #[serde(default, deserialize_with = "present")]
+    pub monitor: Option<Option<String>>,
+    pub show_cursor: Option<bool>,
     pub audio_bitrate: Option<f64>,
     pub clips_dir: Option<String>,
     /// Outer `None` = field absent, `Some(None)` = explicit `null` (follow system).
@@ -232,6 +261,10 @@ impl Settings {
             bitrate: DEFAULT_BITRATE,
             ten_bit: true,
             screen_fit: ScreenFit::Screen,
+            capture_source: CaptureSource::Screen,
+            capture_game: None,
+            monitor: None,
+            show_cursor: false,
             audio_bitrate: DEFAULT_AUDIO_BITRATE,
             clips_dir,
             language: None,
@@ -301,6 +334,25 @@ impl Settings {
         }
         if let Some(fit) = patch.screen_fit {
             next.screen_fit = fit;
+        }
+        if let Some(source) = patch.capture_source {
+            next.capture_source = source;
+        }
+        if let Some(pick) = patch.capture_game {
+            next.capture_game = pick
+                .map(|pick| AppPick {
+                    exe: pick.exe.trim().to_lowercase(),
+                    name: pick.name.trim().to_string(),
+                })
+                .filter(|pick| !pick.exe.is_empty());
+        }
+        if let Some(monitor) = patch.monitor {
+            next.monitor = monitor
+                .map(|name| name.trim().to_string())
+                .filter(|name| !name.is_empty());
+        }
+        if let Some(cursor) = patch.show_cursor {
+            next.show_cursor = cursor;
         }
         if let Some(kbps) = patch.audio_bitrate {
             next.audio_bitrate = snap_audio_bitrate(kbps);
@@ -523,6 +575,37 @@ mod tests {
             ),
             ("", true, 10)
         );
+    }
+
+    #[test]
+    fn merges_what_is_captured() {
+        let s = defaults();
+        assert_eq!(
+            (s.capture_source, &s.capture_game, &s.monitor, s.show_cursor),
+            (CaptureSource::Screen, &None, &None, false)
+        );
+        let s = s.merge(patch(
+            r#"{"captureSource": "game", "captureGame": {"exe": " FiveM_GTAProcess ", "name": "FiveM"}, "monitor": "\\\\.\\DISPLAY2", "showCursor": true}"#,
+        ));
+        assert_eq!(s.capture_source, CaptureSource::Game);
+        assert_eq!(
+            s.capture_game,
+            Some(AppPick {
+                exe: "fivem_gtaprocess".into(),
+                name: "FiveM".into()
+            })
+        );
+        assert_eq!(s.monitor.as_deref(), Some(r"\\.\DISPLAY2"));
+        assert!(s.show_cursor);
+        // null goes back to automatic and the main display; an empty pick is none.
+        let back = s.merge(patch(r#"{"captureGame": null, "monitor": null}"#));
+        assert_eq!((back.capture_game, back.monitor), (None, None));
+        let empty = s.merge(patch(r#"{"captureGame": {"exe": " ", "name": "x"}}"#));
+        assert_eq!(empty.capture_game, None);
+        let json = serde_json::to_value(&s).expect("serializable");
+        assert_eq!(json["captureSource"], "game");
+        assert_eq!(json["captureGame"]["exe"], "fivem_gtaprocess");
+        assert_eq!(json["showCursor"], true);
     }
 
     #[test]

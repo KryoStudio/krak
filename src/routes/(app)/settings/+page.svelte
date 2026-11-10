@@ -14,7 +14,18 @@
   import HotkeyInput from '$lib/components/HotkeyInput.svelte';
   import ControllerInput from '$lib/components/ControllerInput.svelte';
   import QualityPicker from '$lib/components/QualityPicker.svelte';
-  import { api, native, type CommunityUser, type Microphone, type Presence, type ResolvedVideo, type Settings, type StorageInfo } from '$lib/api';
+  import {
+    api,
+    native,
+    type CommunityUser,
+    type DisplayInfo,
+    type Microphone,
+    type OpenApp,
+    type Presence,
+    type ResolvedVideo,
+    type Settings,
+    type StorageInfo,
+  } from '$lib/api';
   import { discordInvite, openLink } from '$lib/community';
   import { capture, codecName, listMicrophones, memoryFor, resolveVideo, storageInfo, videoLabel } from '$lib/capture.svelte';
   import { GB, formatSize, hasKey, t } from '$lib/i18n.svelte';
@@ -44,6 +55,10 @@
 
   let version = $state('');
   let microphones = $state<Microphone[]>([]);
+  /** Apps with a window open, for the game-only picker. */
+  let openApps = $state<OpenApp[]>([]);
+  let displays = $state<DisplayInfo[]>([]);
+  let loadingApps = $state(false);
   let storage = $state<StorageInfo | null>(null);
   let output = $state<ResolvedVideo | null>(null);
   let hotkeyError = $state('');
@@ -59,6 +74,10 @@
   // Data that only some sections need, refreshed when they open.
   $effect(() => {
     if (ui.settingsSection === 'audio') listMicrophones().then((list) => (microphones = list));
+    if (ui.settingsSection === 'capture') {
+      void loadApps();
+      if (native) api.listDisplays().then((list) => (displays = list)).catch(() => (displays = []));
+    }
     if (ui.settingsSection === 'storage') {
       void library.shards.length;
       storageInfo().then((info) => (storage = info));
@@ -76,6 +95,65 @@
   });
 
   const memory = $derived(output ? memoryFor(output.bitrate, s.bufferSeconds, s.microphone) : 0);
+
+  /** Browser preview: a few apps to pick from. */
+  const demoApps: OpenApp[] = [
+    { exe: 'fivem_b3095_gtaprocess', name: 'FiveM', title: 'FiveM® by Cfx.re', game: true },
+    { exe: 'valorant-win64-shipping', name: 'VALORANT', title: 'VALORANT', game: true },
+    { exe: 'discord', name: 'Discord', title: '#general | Krak', game: false },
+  ];
+
+  async function loadApps() {
+    loadingApps = true;
+    try {
+      openApps = native ? await api.listOpenApps() : demoApps;
+    } catch {
+      openApps = [];
+    } finally {
+      loadingApps = false;
+    }
+  }
+
+  /** Long window titles shortened for the menu. */
+  const short = (text: string) => (text.length > 30 ? `${text.slice(0, 29)}…` : text);
+
+  const sources = $derived(
+    (['screen', 'game'] as const).map((v) => ({ value: v, label: t(`settings.source.${v}`) })),
+  );
+  // "Automatic", then the open apps (games first); the picked app stays listed while closed.
+  const gameOptions = $derived.by(() => {
+    const options = [{ value: '', label: t('settings.game.auto') }];
+    const picked = s.captureGame;
+    if (picked && !openApps.some((app) => app.exe === picked.exe)) options.push({ value: picked.exe, label: picked.name });
+    for (const app of openApps) {
+      options.push({
+        value: app.exe,
+        label: app.name,
+        ...(app.title && app.title !== app.name ? { detail: short(app.title) } : {}),
+        ...(app.game ? { tag: t('settings.game.tag') } : {}),
+      });
+    }
+    return options;
+  });
+  function pickGame(exe: string) {
+    const app = openApps.find((a) => a.exe === exe);
+    set({ captureGame: exe ? { exe, name: app?.name ?? s.captureGame?.name ?? exe } : null });
+  }
+  const gameHint = $derived(
+    s.captureGame
+      ? t('settings.gameHint.picked', { game: s.captureGame.name })
+      : status.filming
+        ? t('settings.gameHint.filming', { game: status.filming })
+        : t('settings.gameHint.auto'),
+  );
+  const displayOptions = $derived(
+    displays.map((d, i) => ({
+      value: d.primary ? null : (d.id as string | null),
+      label: d.name || `${t('settings.monitor')} ${i + 1}`,
+      detail: `${d.width}×${d.height}`,
+      ...(d.primary ? { tag: t('settings.monitor.primary') } : {}),
+    })),
+  );
 
   let recordError = $state('');
   let screenshotError = $state('');
@@ -394,6 +472,41 @@
               buffer,
               memory > 1.5e9 ? 'warn' : '',
             )}
+          </div>
+
+          <h3>{t('settings.filmed')}</h3>
+          <div class="card">
+            {#snippet source()}
+              <Segmented label={t('settings.filmed')} options={sources} value={s.captureSource} onchange={(v) => set({ captureSource: v })} />
+            {/snippet}
+            {@render row(t('settings.filmed'), t(`settings.sourceHint.${s.captureSource}`), source)}
+            {#if s.captureSource === 'game'}
+              {#snippet game()}
+                <div class="buttons">
+                  <Select label={t('settings.game')} options={gameOptions} value={s.captureGame?.exe ?? ''} onchange={pickGame} width={220} />
+                  <button
+                    class="button square"
+                    onclick={loadApps}
+                    disabled={loadingApps}
+                    aria-label={t('settings.game.refresh')}
+                    use:tooltip={{ text: t('settings.game.refresh'), side: 'top' }}
+                  >
+                    <Icon name="refresh" size={14} />
+                  </button>
+                </div>
+              {/snippet}
+              {@render row(t('settings.game'), gameHint, game)}
+            {/if}
+            {#if displays.length > 1}
+              {#snippet monitor()}
+                <Select label={t('settings.monitor')} options={displayOptions} value={s.monitor} onchange={(v) => set({ monitor: v })} width={220} />
+              {/snippet}
+              {@render row(t('settings.monitor'), t('settings.monitorHint'), monitor)}
+            {/if}
+            {#snippet cursor()}
+              <Toggle label={t('settings.cursor')} checked={s.showCursor} onchange={(v) => set({ showCursor: v })} />
+            {/snippet}
+            {@render row(t('settings.cursor'), t('settings.cursorHint'), cursor)}
           </div>
 
           <h3>{t('settings.recording')}</h3>

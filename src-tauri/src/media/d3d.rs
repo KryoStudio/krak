@@ -40,6 +40,7 @@ use windows::Win32::Graphics::Dxgi::{
     DXGI_MEMORY_SEGMENT_GROUP_LOCAL, DXGI_QUERY_VIDEO_MEMORY_INFO, IDXGIAdapter1, IDXGIAdapter3,
     IDXGIDevice, IDXGIFactory1, IDXGIOutput1,
 };
+use windows::Win32::Graphics::Gdi::HMONITOR;
 use windows::Win32::Media::MediaFoundation::{IMFDXGIDeviceManager, MFCreateDXGIDeviceManager};
 use windows::Win32::System::Threading::GetCurrentProcess;
 use windows::core::Interface;
@@ -68,16 +69,72 @@ pub struct Display {
     pub vendor_id: u32,
     /// GDI name of the output ("\\.\DISPLAY1"), NUL-terminated UTF-16.
     pub device_name: [u16; 32],
+    /// The monitor's handle (Windows Graphics Capture of the whole screen).
+    pub monitor: HMONITOR,
     /// Desktop size as shown (already rotated), in pixels.
     pub width: u32,
     pub height: u32,
     pub rotation: DXGI_MODE_ROTATION,
+    /// The Windows main display (its desktop starts at (0, 0)).
+    pub primary: bool,
+}
+
+impl Display {
+    /// GDI name of the output ("\\.\DISPLAY1").
+    pub fn name(&self) -> String {
+        utf16(&self.device_name)
+    }
+}
+
+/// A display as the settings list it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DisplayInfo {
+    /// GDI name, what the setting stores.
+    pub id: String,
+    /// The monitor's own name ("LG ULTRAGEAR"), else empty.
+    pub name: String,
+    pub width: u32,
+    pub height: u32,
+    pub primary: bool,
 }
 
 /// The primary display: the attached output whose desktop starts at (0, 0). Its adapter is
 /// the one that owns the output, which is what Desktop Duplication requires (on hybrid systems
 /// it may not be the most powerful GPU).
 pub fn primary_display() -> MediaResult<Display> {
+    display(None)
+}
+
+/// The display named `name` (a GDI name from [`displays`]), else the primary one (the monitor
+/// was unplugged, or none was chosen).
+pub fn display(name: Option<&str>) -> MediaResult<Display> {
+    let all = attached_displays()?;
+    name.and_then(|name| all.iter().find(|d| d.name().eq_ignore_ascii_case(name)))
+        .or_else(|| all.iter().find(|d| d.primary))
+        .or_else(|| all.first())
+        .cloned()
+        .ok_or_else(|| MediaError::new(NO_DISPLAY))
+}
+
+/// Every display attached to the desktop, for the settings.
+pub fn displays() -> Vec<DisplayInfo> {
+    attached_displays()
+        .unwrap_or_default()
+        .iter()
+        .map(|display| DisplayInfo {
+            id: display.name(),
+            name: monitor_name(display).unwrap_or_default(),
+            width: display.width,
+            height: display.height,
+            primary: display.primary,
+        })
+        .collect()
+}
+
+/// The outputs attached to the desktop, on hardware adapters, in DXGI's order.
+fn attached_displays() -> MediaResult<Vec<Display>> {
+    let mut found = Vec::new();
     // SAFETY: DXGI enumeration; every out value is checked.
     unsafe {
         let factory: IDXGIFactory1 = CreateDXGIFactory1().code(NO_DISPLAY)?;
@@ -101,27 +158,50 @@ pub fn primary_display() -> MediaResult<Display> {
                     continue;
                 };
                 let r = out_desc.DesktopCoordinates;
-                if !out_desc.AttachedToDesktop.as_bool() || r.left != 0 || r.top != 0 {
+                if !out_desc.AttachedToDesktop.as_bool() {
                     continue;
                 }
                 let Ok(output) = output.cast::<IDXGIOutput1>() else {
                     continue;
                 };
-                return Ok(Display {
+                found.push(Display {
                     adapter: adapter.clone(),
                     output,
                     adapter_luid: desc.AdapterLuid,
                     adapter_name: utf16(&desc.Description),
                     vendor_id: desc.VendorId,
                     device_name: out_desc.DeviceName,
+                    monitor: out_desc.Monitor,
                     width: u32::try_from(r.right - r.left).unwrap_or(0),
                     height: u32::try_from(r.bottom - r.top).unwrap_or(0),
                     rotation: out_desc.Rotation,
+                    primary: r.left == 0 && r.top == 0,
                 });
             }
         }
     }
-    Err(MediaError::new(NO_DISPLAY))
+    Ok(found)
+}
+
+/// The monitor's own name (from its EDID), through the display configuration.
+fn monitor_name(display: &Display) -> Option<String> {
+    use windows::Win32::Devices::Display::{
+        DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME, DISPLAYCONFIG_TARGET_DEVICE_NAME,
+        DisplayConfigGetDeviceInfo,
+    };
+    let path = display_path(display)?;
+    let mut target = DISPLAYCONFIG_TARGET_DEVICE_NAME::default();
+    target.header.r#type = DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME;
+    target.header.size =
+        u32::try_from(std::mem::size_of::<DISPLAYCONFIG_TARGET_DEVICE_NAME>()).unwrap_or(0);
+    target.header.adapterId = path.targetInfo.adapterId;
+    target.header.id = path.targetInfo.id;
+    // SAFETY: the request carries its own size in its header.
+    if unsafe { DisplayConfigGetDeviceInfo(&mut target.header) } != 0 {
+        return None;
+    }
+    let name = utf16(&target.monitorFriendlyDeviceName);
+    (!name.trim().is_empty()).then(|| name.trim().to_string())
 }
 
 /// The active display configuration path of `display` (matched by its GDI name).

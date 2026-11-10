@@ -33,6 +33,8 @@ const preview: CaptureStatus = {
   bitrate: 40_000_000,
   backend: 'nvenc',
   recording: null,
+  gameOnly: false,
+  filming: null,
 };
 
 const previewEncoder: EncoderInfo = {

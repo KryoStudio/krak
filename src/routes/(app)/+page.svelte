@@ -25,8 +25,12 @@
   const hour = new Date().getHours();
   const greeting = $derived(t(hour >= 18 || hour < 5 ? 'home.evening' : 'home.morning'));
 
+  // Game-only capture with no game yet: nothing is being kept.
+  const waiting = $derived(status.state === 'ready' && status.gameOnly && !status.filming && status.bufferedSeconds < 1);
   const title = $derived(
-    status.state === 'ready'
+    waiting
+      ? t('home.waitingGame')
+      : status.state === 'ready'
       ? t('home.ready', { seconds: Math.round(Math.min(status.bufferedSeconds, settings.value.bufferSeconds)) || settings.value.bufferSeconds })
       : status.state === 'paused'
         ? t('home.paused')
@@ -56,6 +60,7 @@
           format.codec ? `${codecName(format.codec)}${format.tenBit ? ` ${t('settings.tenBitShort')}` : ''}` : '',
           format.height ? `${format.height}p` : '',
           format.fps ? `${format.fps} ${t('settings.fpsUnit')}` : '',
+          status.gameOnly ? (status.filming ?? t('home.waitingGame')) : '',
         ].filter(Boolean)
       : [],
   );

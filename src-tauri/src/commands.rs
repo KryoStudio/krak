@@ -455,6 +455,18 @@ pub async fn get_storage_info(app: AppHandle) -> CmdResult<StorageInfo> {
     blocking(move || Ok(storage::info(&app.state::<AppState>().clips_dir()))).await
 }
 
+/// The apps with a window open, for the game-only capture picker (games first).
+#[tauri::command]
+pub async fn list_open_apps() -> CmdResult<Vec<crate::capture::target::OpenApp>> {
+    blocking(|| Ok(crate::capture::target::open_apps())).await
+}
+
+/// The displays that can be recorded (settings "Screen").
+#[tauri::command]
+pub async fn list_displays() -> CmdResult<Vec<d3d::DisplayInfo>> {
+    blocking(|| Ok(d3d::displays())).await
+}
+
 /// Waits (up to 10 s) for controller buttons held together then released, for the controller
 /// shortcut: "no_controller" | "combo_timeout" | "combo_short".
 #[tauri::command]

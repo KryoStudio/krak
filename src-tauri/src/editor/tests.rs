@@ -97,6 +97,7 @@ fn record(dir: &Path, seconds: u32) -> (PathBuf, CaptureStatus) {
         buffer_seconds: seconds,
         microphone: true,
         microphone_device: None,
+        source: Default::default(),
     };
     let started = Instant::now();
     let engine = Engine::start(config, events.clone());

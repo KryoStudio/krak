@@ -360,6 +360,7 @@ mod tests {
             buffer_seconds,
             microphone: false,
             microphone_device: None,
+            source: Default::default(),
         };
         Arc::new(Shared::new(config, Arc::new(Quiet)))
     }

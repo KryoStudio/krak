@@ -6,7 +6,7 @@ use std::path::Path;
 use crate::names;
 
 /// Executables (lowercase stems) that are the desktop, not a game.
-const DESKTOP_PROCESSES: [&str; 16] = [
+pub(super) const DESKTOP_PROCESSES: [&str; 16] = [
     "explorer",
     "krak",
     "kryo-shard",
@@ -107,18 +107,32 @@ fn strip_unreal_suffix(name: &str) -> Option<String> {
 
 #[cfg(windows)]
 fn foreground_exe() -> Option<std::path::PathBuf> {
+    use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
+    // SAFETY: plain query.
+    let hwnd = unsafe { GetForegroundWindow() };
+    window_process(hwnd).map(|(exe, _)| exe)
+}
+
+/// The display name of the program `exe` (see [`game_name`]), `None` for desktop processes.
+#[cfg(windows)]
+pub fn name_of(exe: &Path) -> Option<String> {
+    game_name(exe, &version_names(exe))
+}
+
+/// The program and process id of the window `hwnd`; `None` for none, or a window of ours.
+#[cfg(windows)]
+pub fn window_process(hwnd: windows::Win32::Foundation::HWND) -> Option<(std::path::PathBuf, u32)> {
     use std::os::windows::ffi::OsStringExt;
     use windows::Win32::Foundation::CloseHandle;
     use windows::Win32::System::Threading::{
         GetCurrentProcessId, OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
         QueryFullProcessImageNameW,
     };
-    use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
+    use windows::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId;
     use windows::core::PWSTR;
 
     // SAFETY: plain queries; the process handle is closed before returning.
     unsafe {
-        let hwnd = GetForegroundWindow();
         if hwnd.is_invalid() {
             return None;
         }
@@ -139,7 +153,7 @@ fn foreground_exe() -> Option<std::path::PathBuf> {
         let _ = CloseHandle(process);
         result.ok()?;
         buf.truncate(len as usize);
-        Some(std::ffi::OsString::from_wide(&buf).into())
+        Some((std::ffi::OsString::from_wide(&buf).into(), pid))
     }
 }
 

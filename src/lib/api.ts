@@ -38,6 +38,14 @@ export interface Settings {
   /** A game in its own resolution (stretched 4:3...): as the screen shows it, always stretched,
    *  or as it is. */
   screenFit: 'screen' | 'stretch' | 'original';
+  /** The whole screen, or only the game's window ("stream-proof"). */
+  captureSource: 'screen' | 'game';
+  /** The app filmed in game-only capture; null = the game in front, found by Krak. */
+  captureGame: AppPick | null;
+  /** GDI name of the display to record; null = the main one. */
+  monitor: string | null;
+  /** Draw the mouse cursor in clips. */
+  showCursor: boolean;
   /** Mbit/s, custom quality only. */
   bitrate: number;
   /** Custom quality only, HEVC/AV1. */
@@ -64,6 +72,32 @@ export interface Settings {
   communityInvite: 'pending' | 'later' | 'joined' | 'never';
   /** When it was put off ("Not now"), in ms since 1970. */
   communityInviteAt: number | null;
+}
+
+/** An app picked for game-only capture. */
+export interface AppPick {
+  /** Program file name without extension, lowercase. */
+  exe: string;
+  name: string;
+}
+
+/** An app with a window open, for the game-only capture picker. */
+export interface OpenApp extends AppPick {
+  /** Its main window's title. */
+  title: string;
+  /** Krak would pick it by itself. */
+  game: boolean;
+}
+
+/** A display that can be recorded. */
+export interface DisplayInfo {
+  /** GDI name ("\.\DISPLAY1"), what the setting stores. */
+  id: string;
+  /** The monitor's own name, or empty. */
+  name: string;
+  width: number;
+  height: number;
+  primary: boolean;
 }
 
 /** What the engine would record with given settings. */
@@ -156,6 +190,10 @@ export interface CaptureStatus {
   backend: Backend | null;
   /** Continuous recording in progress (the replay keeps working meanwhile). */
   recording: { seconds: number; bytes: number } | null;
+  /** Only the game's window is recorded. */
+  gameOnly: boolean;
+  /** In game-only capture, the game being filmed (null: waiting for one). */
+  filming: string | null;
 }
 
 /** What the editor needs to know about a clip. */
@@ -316,6 +354,9 @@ export const api = {
   getAudioStems: (id: string) => invoke<ArrayBuffer>('get_audio_stems', { id }),
   /** Waits (up to 10 s) for controller buttons held together then released: "LB+RB". */
   captureControllerCombo: () => invoke<string>('capture_controller_combo'),
+  /** Apps with a window open, games first (game-only capture picker). */
+  listOpenApps: () => invoke<OpenApp[]>('list_open_apps'),
+  listDisplays: () => invoke<DisplayInfo[]>('list_displays'),
   /** Native "Save as" dialog; null when cancelled. */
   chooseExportPath: (suggestedName: string) => invoke<string | null>('choose_export_path', { suggestedName }),
   /** Shows a file made by an export (this session) in Explorer. */

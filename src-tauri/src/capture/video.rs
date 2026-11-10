@@ -1,4 +1,11 @@
-//! Video thread: constant frame rate capture of the primary display.
+//! Video thread: constant frame rate capture of the chosen display, or of the game's window.
+//!
+//! The source is Desktop Duplication of the display, or Windows Graphics Capture (`window`):
+//! of the display when the mouse cursor is wanted, of the game's window in "game only" capture.
+//! In game only, the window is followed (`target`): looked for twice a second, kept while it
+//! exists, and when there is none for a second, nothing is encoded at all (a hole in the
+//! stream, which the ring and recordings handle): neither the desktop nor anything else is
+//! ever recorded in its place.
 //!
 //! Every tick of a high-resolution waitable timer: poll Desktop Duplication (zero timeout);
 //! if the image changed, copy it into our own BGRA texture and release the frame at once; then
@@ -36,14 +43,14 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use windows::Win32::Foundation::{CloseHandle, E_ACCESSDENIED, HANDLE};
+use windows::Win32::Foundation::{CloseHandle, E_ACCESSDENIED, HANDLE, RECT};
 use windows::Win32::Graphics::Direct3D11::{
     D3D11_ASYNC_GETDATA_DONOTFLUSH, D3D11_BIND_RENDER_TARGET, D3D11_QUERY_DESC, D3D11_QUERY_EVENT,
     D3D11_VIDEO_PROCESSOR_ROTATION, ID3D11Query, ID3D11Texture2D,
 };
 use windows::Win32::Graphics::Dxgi::Common::{
-    DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_NV12, DXGI_FORMAT_P010, DXGI_MODE_ROTATION_ROTATE90,
-    DXGI_MODE_ROTATION_ROTATE270,
+    DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_NV12, DXGI_FORMAT_P010, DXGI_MODE_ROTATION,
+    DXGI_MODE_ROTATION_IDENTITY, DXGI_MODE_ROTATION_ROTATE90, DXGI_MODE_ROTATION_ROTATE270,
 };
 use windows::Win32::System::Threading::{
     CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, CreateWaitableTimerExW, GetCurrentThread,
@@ -59,10 +66,11 @@ use super::encoders;
 use super::quality::{self, Backend, Capabilities, EncoderPlan, Plan, Tier};
 use super::ring::StreamParams;
 use super::screen;
-use super::screenshot::Source;
+use super::target::{self, AppPick, Target};
+use super::window::{self, What, WindowCapture};
 use super::{CaptureState, Shared, clock};
 use crate::media::codec::{CodecConfig, VideoPacket};
-use crate::media::d3d::{self, Display, Gpu, Nv12Converter, Nv12Readback};
+use crate::media::d3d::{self, Display, Gpu, Nv12Converter, Nv12Readback, Scaling};
 use crate::media::h264::{self, Frame, H264Encoder, Vendor};
 use crate::media::nvenc::{EncodeStats, NvencEncoder};
 use crate::media::{ComGuard, MediaError, MediaResult, MfGuard, TICKS_PER_SECOND};
@@ -81,6 +89,67 @@ const DUPLICATION_GIVE_UP: i64 = 3 * TICKS_PER_SECOND;
 const MIN_PACED_FPS: i64 = 30;
 /// How often the pipeline writes its health to the log.
 const HEALTH_LOG: i64 = 10 * TICKS_PER_SECOND;
+/// Game only: how often the game's window is looked for.
+const GAME_LOOKUP: i64 = TICKS_PER_SECOND / 2;
+/// Game only: how long the last picture holds once the game is gone (the encoder hands out
+/// what it still holds), before nothing is encoded at all.
+const GAME_GONE_HOLD: i64 = TICKS_PER_SECOND;
+
+/// Where the pictures come from.
+enum Source {
+    /// Desktop Duplication of the display.
+    Screen(Duplication),
+    /// Windows Graphics Capture of the display (with the cursor) or of the game's window.
+    Capture(WindowCapture),
+}
+
+impl Source {
+    fn acquire(&mut self, gpu: &Gpu, target: &ID3D11Texture2D) -> Acquire {
+        match self {
+            Self::Screen(dup) => dup.acquire(gpu, target),
+            Self::Capture(capture) => capture.acquire(gpu, target),
+        }
+    }
+
+    fn size(&self) -> (u32, u32) {
+        match self {
+            Self::Screen(dup) => dup.size(),
+            Self::Capture(capture) => capture.size(),
+        }
+    }
+
+    fn take_presented(&mut self) -> Option<i64> {
+        match self {
+            Self::Screen(dup) => dup.take_presented(),
+            Self::Capture(capture) => capture.take_presented(),
+        }
+    }
+
+    /// The display's refresh rate if the source knows it (0: ask the display).
+    fn refresh(&self) -> f64 {
+        match self {
+            Self::Screen(dup) => dup.refresh(),
+            Self::Capture(_) => 0.0,
+        }
+    }
+
+    fn describe(&self) -> &'static str {
+        match self {
+            Self::Screen(dup) if dup.modern => "DuplicateOutput1",
+            Self::Screen(_) => "DuplicateOutput",
+            Self::Capture(_) => "Windows.Graphics.Capture",
+        }
+    }
+}
+
+/// What the pipeline records, fixed for its life.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Mode {
+    /// The display; through Windows Graphics Capture when the cursor is wanted.
+    Screen { cursor: bool },
+    /// The game's window (`pick`: the app chosen, `None` = the game in front).
+    Game { pick: Option<AppPick>, cursor: bool },
+}
 
 /// Time spent in one part of the tick.
 #[derive(Debug, Default, Clone, Copy)]
@@ -160,7 +229,7 @@ pub(super) fn run(shared: &Arc<Shared>) {
         let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
     }
     // How busy the 3D engine of the captured display's GPU is (`contention`).
-    if let Ok(display) = d3d::primary_display()
+    if let Ok(display) = d3d::display(shared.config.source.monitor.as_deref())
         // SAFETY: plain descriptor read.
         && let Ok(desc) = unsafe { display.adapter.GetDesc1() }
     {
@@ -476,11 +545,21 @@ struct Pipeline {
     target: ID3D11Texture2D,
     /// Our copy of the last desktop image.
     desktop: ID3D11Texture2D,
-    dup: Option<Duplication>,
+    source: Option<Source>,
+    mode: Mode,
+    /// Game only: the window being filmed.
+    game: Option<Target>,
+    /// Game only: when to look for the game's window again.
+    next_lookup: i64,
+    /// Game only: since when there has been no window to film (`None`: filming one).
+    gone_since: Option<i64>,
     retry_at: i64,
     lost_since: i64,
-    /// Size of the duplicated image.
+    /// Size of the captured image.
     input: (u32, u32),
+    /// How the source's images are turned: the display's for Desktop Duplication, none for
+    /// Windows Graphics Capture (its images come as shown).
+    source_rotation: DXGI_MODE_ROTATION,
     /// What the video is recorded in (`screen::frame`), fixed for the pipeline's life.
     frame: (u32, u32),
     /// Converter settings, to make another one for a new input size.
@@ -505,18 +584,76 @@ struct Pipeline {
 
 impl Pipeline {
     fn new(shared: &Shared) -> MediaResult<Self> {
-        let display = d3d::primary_display()?;
+        let config = &shared.config.source;
+        let display = d3d::display(config.monitor.as_deref())?;
         let gpu = Gpu::new(&display.adapter)?;
-        let dup = Duplication::new(&display, &gpu).map_err(|err| MediaError {
-            code: CAPTURE_FAILED,
-            hresult: err.code().0,
-        })?;
-        let input = dup.size();
-        let shown = shown(input, &display);
-        let shape = d3d::screen_shape(&display);
+        let capture_ok = window::supported();
+        let mode = if config.game_only && capture_ok {
+            Mode::Game {
+                pick: config.game.clone(),
+                cursor: config.cursor,
+            }
+        } else {
+            if config.game_only {
+                eprintln!(
+                    "krak: game-only capture needs Windows 10 1903 or later: recording the screen"
+                );
+            }
+            Mode::Screen {
+                cursor: config.cursor && capture_ok,
+            }
+        };
         let fit = shared.config.screen_fit;
-        let frame = screen::frame(shown, &shape, fit);
-        let refresh = match dup.refresh() {
+        let shape = d3d::screen_shape(&display);
+        // The display as shown (already turned): the frame of every mode but "original".
+        let screen = (display.width, display.height);
+        let (source, game, input, source_rotation) = match &mode {
+            Mode::Screen { cursor } => {
+                let source = open_screen(&display, &gpu, *cursor).map_err(|err| MediaError {
+                    code: CAPTURE_FAILED,
+                    hresult: err.code().0,
+                })?;
+                let rotation = match source {
+                    Source::Screen(_) => display.rotation,
+                    Source::Capture(_) => DXGI_MODE_ROTATION_IDENTITY,
+                };
+                let input = source.size();
+                (Some(source), None, input, rotation)
+            }
+            Mode::Game { pick, cursor } => {
+                let kept = lock(&shared.game_window).clone();
+                let found = target::find(pick.as_ref(), kept.as_ref());
+                let opened = found.and_then(|found| {
+                    match WindowCapture::new(What::Window(found.hwnd), &gpu, *cursor) {
+                        Ok(capture) => Some((capture, found)),
+                        Err(err) => {
+                            eprintln!("krak: cannot capture {}: {err}", found.exe.display());
+                            None
+                        }
+                    }
+                });
+                match opened {
+                    Some((capture, found)) => {
+                        let input = capture.size();
+                        (
+                            Some(Source::Capture(capture)),
+                            Some(found),
+                            input,
+                            DXGI_MODE_ROTATION_IDENTITY,
+                        )
+                    }
+                    // No game yet: a blank picture of the display's size until one comes.
+                    None => (None, None, screen, DXGI_MODE_ROTATION_IDENTITY),
+                }
+            }
+        };
+        let crop = game.as_ref().and_then(|g| target::content(g, input));
+        let shown = crop.map_or_else(|| turned(input, source_rotation), size_of);
+        let frame = match &mode {
+            Mode::Game { .. } if fit != ScreenFit::Original => screen::frame(screen, &shape, fit),
+            _ => screen::frame(shown, &shape, fit),
+        };
+        let refresh = match source.as_ref().map_or(0.0, Source::refresh) {
             r if r > 0.0 => r,
             _ => d3d::refresh_rate(&display),
         };
@@ -528,7 +665,7 @@ impl Pipeline {
         ));
         let plan = quality::plan(&shared.config.video, frame, refresh, &caps, tier);
         let ceiling = quality::plan(&shared.config.video, frame, refresh, &caps, Tier::Best).tier;
-        let rotation = d3d::display_rotation(display.rotation);
+        let rotation = d3d::display_rotation(source_rotation);
         let (encoder, plan, mut converter, target) = open_encoder(
             &gpu,
             plan,
@@ -540,10 +677,36 @@ impl Pipeline {
             rotation,
         )?;
         let output = (plan.resolved.width, plan.resolved.height);
-        let scaling = screen::scaling(fit, shape.scaling);
+        let scaling = placement_scaling(&mode, game.as_ref(), fit, shape.scaling);
         converter.set_dest_rect(&gpu, screen::placement(shown, frame, output, scaling));
+        if let Some(crop) = crop {
+            converter.set_source_rect(&gpu, crop);
+        }
         let ten_bit_input = matches!(plan.encoder, EncoderPlan::Nvenc(s) if s.input_ten_bit);
-        log_pipeline(&display, &dup, &encoder, &plan, refresh);
+        let described = source
+            .as_ref()
+            .map_or("Windows.Graphics.Capture", Source::describe);
+        log_pipeline(&display, described, &encoder, &plan, refresh);
+        if let Some(found) = &game {
+            eprintln!(
+                "krak: filming {} ({}x{})",
+                found.exe.display(),
+                input.0,
+                input.1
+            );
+        } else if matches!(mode, Mode::Game { .. }) {
+            eprintln!("krak: game only: waiting for a game");
+        }
+        let filming = game.as_ref().map(filming_name);
+        let waiting = matches!(mode, Mode::Game { .. }) && game.is_none();
+        shared.update(|s| {
+            s.filming = filming;
+            if waiting {
+                // Nothing to film, but the engine works: a game will be filmed as it comes.
+                s.state = CaptureState::Ready;
+                s.error = None;
+            }
+        });
         if frame != shown {
             eprintln!(
                 "krak: the {}x{} display mode goes into the {}x{} frame ({scaling:?})",
@@ -566,10 +729,16 @@ impl Pipeline {
                 _ => None,
             };
         let fence = GpuFence::new(&gpu);
+        let now = clock::now();
         Ok(Self {
             display,
             gpu,
-            dup: Some(dup),
+            source,
+            mode,
+            game,
+            next_lookup: now + GAME_LOOKUP,
+            gone_since: waiting.then_some(now - GAME_GONE_HOLD),
+            source_rotation,
             retry_at: 0,
             lost_since: 0,
             input,
@@ -660,12 +829,17 @@ impl Pipeline {
             }
             let polled = clock::now();
             self.timings.desktop.add(polled - now);
-            if let Some(presented) = self.dup.as_mut().and_then(Duplication::take_presented) {
+            if let Some(presented) = self.source.as_mut().and_then(Source::take_presented) {
                 let shift = phase.correct(now, presented);
                 start += shift;
                 self.timings.updates += 1;
                 self.timings.corrections += u64::from(shift != 0);
                 self.timings.shift += shift;
+            }
+            if self.nothing_to_film(now) {
+                // Game only, and no game for a while: nothing at all is recorded.
+                self.publish(shared, &mut packets);
+                continue;
             }
             if self.blank {
                 // No desktop image yet in a new copy (pipeline start, display mode change):
@@ -677,11 +851,11 @@ impl Pipeline {
                 }
             } else if !self.screen_published {
                 // Our desktop copy holds an image now: screenshots can read it.
-                shared.set_screen(Some(Source::new(
+                shared.set_screen(Some(super::screenshot::Source::new(
                     &self.gpu,
                     &self.desktop,
                     self.input,
-                    self.display.rotation,
+                    self.source_rotation,
                 )));
                 self.screen_published = true;
             }
@@ -1094,31 +1268,50 @@ impl Pipeline {
 
     /// Takes the latest desktop image if there is one, and manages duplication loss.
     fn poll_desktop(&mut self, shared: &Shared, now: i64) -> Option<Exit> {
-        if let Some(dup) = &mut self.dup {
-            match dup.acquire(&self.gpu, &self.desktop) {
+        if matches!(self.mode, Mode::Game { .. }) && now >= self.next_lookup {
+            self.next_lookup = now + GAME_LOOKUP;
+            if let Some(exit) = self.follow_game(shared, now) {
+                return Some(exit);
+            }
+        }
+        if let Some(source) = &mut self.source {
+            match source.acquire(&self.gpu, &self.desktop) {
                 Acquire::Updated => self.blank = false,
                 Acquire::Unchanged => {}
-                // Another size: a new duplication says which, right away.
-                Acquire::Resized => {
-                    self.dup = None;
-                    self.retry_at = now;
-                    self.lost_since = now;
-                }
+                // A window or the display in another size.
+                Acquire::Resized => match self.source.take() {
+                    Some(Source::Capture(capture)) => {
+                        return self.adopt(shared, Source::Capture(capture));
+                    }
+                    // Another duplication says which size, right away.
+                    _ => {
+                        self.retry_at = now;
+                        self.lost_since = now;
+                    }
+                },
                 Acquire::Lost(code) => {
-                    eprintln!("krak: desktop duplication lost ({code}), retrying");
-                    self.dup = None;
+                    eprintln!("krak: capture lost ({code}), retrying");
+                    self.source = None;
                     self.retry_at = now;
                     self.lost_since = now;
+                    if matches!(self.mode, Mode::Game { .. }) {
+                        // The game closed: look for it (or another one) at once.
+                        self.lose_game(shared, now);
+                    }
                 }
             }
             return None;
         }
+        // Game only: a window comes from `follow_game`.
+        let Mode::Screen { cursor } = self.mode else {
+            return None;
+        };
         if now < self.retry_at {
             return None;
         }
-        match Duplication::new(&self.display, &self.gpu) {
-            Ok(dup) if dup.size() == self.input => self.dup = Some(dup),
-            Ok(dup) => return self.adopt(shared, dup),
+        match open_screen(&self.display, &self.gpu, cursor) {
+            Ok(source) if source.size() == self.input => self.source = Some(source),
+            Ok(source) => return self.adopt(shared, source),
             Err(err) => {
                 self.retry_at = now + DUPLICATION_RETRY;
                 if err.code() != E_ACCESSDENIED && now - self.lost_since > DUPLICATION_GIVE_UP {
@@ -1129,51 +1322,140 @@ impl Pipeline {
         None
     }
 
-    /// A duplication of another size (a game's own display mode, or back to the desktop): its
-    /// image goes into the same frame and the stream goes on, unless the frame itself changed
-    /// or each mode is recorded as it is ("original"): then the pipeline is rebuilt.
-    fn adopt(&mut self, shared: &Shared, dup: Duplication) -> Option<Exit> {
-        let input = dup.size();
-        let shown = shown(input, &self.display);
+    /// Game only: follows the game's window (`target::find`), starting a capture of a new one.
+    fn follow_game(&mut self, shared: &Shared, now: i64) -> Option<Exit> {
+        let Mode::Game { pick, cursor } = &self.mode else {
+            return None;
+        };
+        let cursor = *cursor;
+        let found = target::find(pick.as_ref(), self.game.as_ref());
+        match found {
+            Some(found) if self.game.as_ref().is_some_and(|g| g.hwnd == found.hwnd) => {
+                if self.source.is_none() {
+                    // Kept, but its capture was lost: open it again.
+                    return self.film(shared, found, cursor, now);
+                }
+                None
+            }
+            Some(found) => self.film(shared, found, cursor, now),
+            None => {
+                if self.game.is_some() || self.source.is_some() {
+                    self.source = None;
+                    self.lose_game(shared, now);
+                }
+                None
+            }
+        }
+    }
+
+    /// Starts filming `found` (its pictures go into the same frame and stream).
+    fn film(&mut self, shared: &Shared, found: Target, cursor: bool, now: i64) -> Option<Exit> {
+        match WindowCapture::new(What::Window(found.hwnd), &self.gpu, cursor) {
+            Ok(capture) => {
+                eprintln!(
+                    "krak: filming {} ({}x{})",
+                    found.exe.display(),
+                    capture.size().0,
+                    capture.size().1
+                );
+                let name = filming_name(&found);
+                *lock(&shared.game_window) = Some(found.clone());
+                self.game = Some(found);
+                self.gone_since = None;
+                shared.update(|s| s.filming = Some(name));
+                self.adopt(shared, Source::Capture(capture))
+            }
+            Err(err) => {
+                // A window that refuses capture (closing, elevated): try again a bit later.
+                eprintln!("krak: cannot capture {}: {err}", found.exe.display());
+                self.next_lookup = now + 4 * GAME_LOOKUP;
+                None
+            }
+        }
+    }
+
+    /// Game only: the game's window is gone; the last picture holds a moment
+    /// (`GAME_GONE_HOLD`), then nothing is recorded until a game comes.
+    fn lose_game(&mut self, shared: &Shared, now: i64) {
+        if let Some(game) = self.game.take() {
+            eprintln!("krak: {} is gone, waiting for a game", game.exe.display());
+        }
+        self.gone_since.get_or_insert(now);
+        self.next_lookup = now;
+        lock(&shared.game_window).take();
+        shared.update(|s| s.filming = None);
+    }
+
+    /// Game only, with no game for long enough: encode nothing.
+    fn nothing_to_film(&self, now: i64) -> bool {
+        self.source.is_none()
+            && self
+                .gone_since
+                .is_some_and(|since| now - since >= GAME_GONE_HOLD)
+    }
+
+    /// A source of another size (a game's own display mode, back to the desktop, a window
+    /// resized or a new game): its image goes into the same frame and the stream goes on,
+    /// unless the frame itself changed or each size is recorded as it is ("original"): then
+    /// the pipeline is rebuilt.
+    fn adopt(&mut self, shared: &Shared, source: Source) -> Option<Exit> {
+        let input = source.size();
+        // A game in a window: only its content, not its title bar and borders.
+        let crop = self.game.as_ref().and_then(|g| target::content(g, input));
+        let shown = crop.map_or_else(|| turned(input, self.source_rotation), size_of);
         let shape = d3d::screen_shape(&self.display);
         let fit = shared.config.screen_fit;
-        if fit == ScreenFit::Original || screen::frame(shown, &shape, fit) != self.frame {
+        let frame = match self.mode {
+            Mode::Game { .. } if fit != ScreenFit::Original => self.frame,
+            _ => screen::frame(shown, &shape, fit),
+        };
+        if frame != self.frame {
             return Some(Exit::Rebuild);
         }
-        let scaling = screen::scaling(fit, shape.scaling);
+        let scaling = placement_scaling(&self.mode, self.game.as_ref(), fit, shape.scaling);
         let output = (self.plan.resolved.width, self.plan.resolved.height);
-        let converter = Nv12Converter::with_output(
-            &self.gpu,
-            input,
-            output,
-            self.rotation,
-            self.plan.resolved.fps,
-            self.ten_bit_input,
-        );
-        let desktop = self.gpu.texture(
-            input.0,
-            input.1,
-            DXGI_FORMAT_B8G8R8A8_UNORM,
-            D3D11_BIND_RENDER_TARGET,
-            true,
-        );
-        let (Ok(mut converter), Ok(desktop)) = (converter, desktop) else {
-            return Some(Exit::Rebuild);
-        };
-        converter.set_dest_rect(
+        if input != self.input {
+            let converter = Nv12Converter::with_output(
+                &self.gpu,
+                input,
+                output,
+                self.rotation,
+                self.plan.resolved.fps,
+                self.ten_bit_input,
+            );
+            let desktop = self.gpu.texture(
+                input.0,
+                input.1,
+                DXGI_FORMAT_B8G8R8A8_UNORM,
+                D3D11_BIND_RENDER_TARGET,
+                true,
+            );
+            let (Ok(converter), Ok(desktop)) = (converter, desktop) else {
+                return Some(Exit::Rebuild);
+            };
+            self.converter = converter;
+            self.desktop = desktop;
+            self.input = input;
+            // The new copy is black until the source's first image: keep the last picture
+            // until then (`run_ticks`), and screenshots on the old copy.
+            self.blank = true;
+            self.screen_published = false;
+        }
+        self.converter.set_dest_rect(
             &self.gpu,
             screen::placement(shown, self.frame, output, scaling),
         );
-        self.converter = converter;
-        self.desktop = desktop;
-        self.input = input;
-        self.dup = Some(dup);
-        // The new copy is black until the new duplication's first image: keep the last
-        // picture until then (`run_ticks`), and screenshots on the old copy.
-        self.blank = true;
-        self.screen_published = false;
+        let whole = RECT {
+            left: 0,
+            top: 0,
+            right: i32::try_from(input.0).unwrap_or(i32::MAX),
+            bottom: i32::try_from(input.1).unwrap_or(i32::MAX),
+        };
+        self.converter
+            .set_source_rect(&self.gpu, crop.unwrap_or(whole));
+        self.source = Some(source);
         eprintln!(
-            "krak: display mode {}x{}, kept in the {}x{} frame ({scaling:?}): the stream goes on",
+            "krak: {}x{} source, kept in the {}x{} frame ({scaling:?}): the stream goes on",
             shown.0, shown.1, self.frame.0, self.frame.1
         );
         None
@@ -1221,13 +1503,59 @@ impl Pipeline {
     }
 }
 
-/// The duplicated image's size as the monitor shows it (rotated displays turn it).
-fn shown(input: (u32, u32), display: &Display) -> (u32, u32) {
+/// The captured image's size as the monitor shows it (rotated displays turn duplicated images).
+fn turned(input: (u32, u32), rotation: DXGI_MODE_ROTATION) -> (u32, u32) {
     let rotated = matches!(
-        display.rotation,
+        rotation,
         DXGI_MODE_ROTATION_ROTATE90 | DXGI_MODE_ROTATION_ROTATE270
     );
     if rotated { (input.1, input.0) } else { input }
+}
+
+/// The display's pictures: Desktop Duplication, or Windows Graphics Capture of the monitor when
+/// the cursor is wanted (falling back to duplication, without it, if that fails).
+fn open_screen(display: &Display, gpu: &Gpu, cursor: bool) -> windows::core::Result<Source> {
+    if cursor {
+        match WindowCapture::new(What::Monitor(display.monitor), gpu, true) {
+            Ok(capture) => return Ok(Source::Capture(capture)),
+            Err(err) => eprintln!("krak: cannot capture the screen with its cursor: {err}"),
+        }
+    }
+    Duplication::new(display, gpu).map(Source::Screen)
+}
+
+/// How the source's image is placed in the frame: the screen's way (or always stretched) for
+/// the display and for a game covering its monitor; a game in a window keeps its shape, as
+/// large as the frame allows.
+fn placement_scaling(
+    mode: &Mode,
+    game: Option<&Target>,
+    fit: ScreenFit,
+    screen_scaling: Scaling,
+) -> Scaling {
+    let windowed = matches!(mode, Mode::Game { .. }) && !game.is_some_and(target::fullscreen);
+    if windowed && fit != ScreenFit::Stretch {
+        Scaling::Aspect
+    } else {
+        screen::scaling(fit, screen_scaling)
+    }
+}
+
+fn size_of(rect: RECT) -> (u32, u32) {
+    (
+        u32::try_from(rect.right - rect.left).unwrap_or(2),
+        u32::try_from(rect.bottom - rect.top).unwrap_or(2),
+    )
+}
+
+/// What the status and clip names call the filmed game.
+fn filming_name(game: &Target) -> String {
+    game.name.clone().unwrap_or_else(|| {
+        game.exe
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    })
 }
 
 fn tier_from(value: u8) -> Tier {
@@ -1369,7 +1697,7 @@ fn nv12_target(gpu: &Gpu, plan: &Plan) -> MediaResult<ID3D11Texture2D> {
 
 fn log_pipeline(
     display: &Display,
-    dup: &Duplication,
+    source: &str,
     encoder: &VideoEncoder,
     plan: &Plan,
     refresh: f64,
@@ -1380,11 +1708,7 @@ fn log_pipeline(
         display.width,
         display.height,
         display.adapter_name,
-        if dup.modern {
-            "DuplicateOutput1"
-        } else {
-            "DuplicateOutput"
-        },
+        source,
         encoder.name(),
         video.backend,
         video.codec,

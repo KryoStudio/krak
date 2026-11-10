@@ -1,7 +1,9 @@
 //! Replay-buffer capture engine (no Tauri dependency: `crate::replay` connects it to the app).
 //!
 //! Threads:
-//! - video: Desktop Duplication of the primary display at a constant frame rate, BGRA → NV12
+//! - video: Desktop Duplication of the chosen display (or, for "game only" or the mouse cursor,
+//!   Windows Graphics Capture of the game's window or of the display) at a constant frame
+//!   rate, BGRA → NV12
 //!   (or P010 for 10-bit) on the GPU, then NVENC (H.264/HEVC/AV1, see `quality`) or the
 //!   adapter's Media Foundation H.264 encoder, else the software one, into a ring of whole GOPs;
 //! - audio: WASAPI loopback of the default output (and the chosen or default microphone when
@@ -34,10 +36,12 @@ mod save;
 pub mod screen;
 pub mod screenshot;
 pub mod sound;
+pub mod target;
 #[cfg(test)]
 mod tests;
 mod timeline;
 mod video;
+mod window;
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU8, AtomicU32, Ordering};
@@ -64,6 +68,8 @@ use timeline::AudioTimeline;
 
 pub const NOT_READY: &str = "not_ready";
 pub const EMPTY: &str = "empty";
+/// Game-only capture with no game to film (and nothing filmed before in the window).
+pub const NO_GAME: &str = "no_game";
 pub const WRITE_FAILED: &str = "write_failed";
 pub const ENCODE_FAILED: &str = "encode_failed";
 
@@ -87,6 +93,21 @@ pub struct EngineConfig {
     pub microphone: bool,
     /// WASAPI endpoint id; `None` = the default capture device.
     pub microphone_device: Option<String>,
+    /// What the video records.
+    pub source: SourceConfig,
+}
+
+/// What the video records (settings "Capture").
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SourceConfig {
+    /// Only the game's window ("stream-proof"), else the whole display.
+    pub game_only: bool,
+    /// The app filmed in game-only capture; `None` = the game in front (`target`).
+    pub game: Option<target::AppPick>,
+    /// GDI name of the display; `None` = the main one.
+    pub monitor: Option<String>,
+    /// Draw the mouse cursor.
+    pub cursor: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
@@ -127,6 +148,11 @@ pub struct CaptureStatus {
     pub backend: Option<Backend>,
     /// A continuous recording in progress (the replay keeps running meanwhile).
     pub recording: Option<RecordingStatus>,
+    /// Only the game's window is recorded.
+    pub game_only: bool,
+    /// In game-only capture, the game being filmed (`None`: waiting for one, nothing is
+    /// recorded).
+    pub filming: Option<String>,
 }
 
 /// `CaptureStatus::recording`.
@@ -182,6 +208,7 @@ struct Status {
     loopback_error: Option<&'static str>,
     mic_error: Option<&'static str>,
     mic_active: bool,
+    filming: Option<String>,
 }
 
 struct Shared {
@@ -206,6 +233,9 @@ struct Shared {
     recording: AtomicBool,
     /// The video pipeline's desktop copy while it runs (`screenshot`).
     screen: Mutex<Option<screenshot::Source>>,
+    /// Game only: the window being filmed, kept across pipeline rebuilds (it may be behind
+    /// another window then, where it would not be found again).
+    game_window: Mutex<Option<target::Target>>,
     /// The last clip, while a press can still extend it.
     last_clip: Mutex<Option<LastClip>>,
     /// Engine clock time after which `last_clip` can go (0: none), read on every frame.
@@ -293,6 +323,7 @@ impl Shared {
             recorder: Mutex::default(),
             recording: AtomicBool::new(false),
             screen: Mutex::default(),
+            game_window: Mutex::default(),
             last_clip: Mutex::default(),
             last_clip_until: AtomicI64::new(0),
         }
@@ -384,7 +415,14 @@ impl Shared {
             bitrate: status.bitrate,
             backend: status.backend,
             recording: lock(&self.recorder).as_ref().map(record::Tee::status),
+            game_only: self.config.source.game_only,
+            filming: status.filming,
         }
+    }
+
+    /// In game-only capture, the game being filmed: its display name (`None` = none).
+    fn filming(&self) -> Option<String> {
+        lock(&self.status).filming.clone()
     }
 }
 
@@ -432,6 +470,12 @@ impl Engine {
         self.shared.status()
     }
 
+    /// In game-only capture, the name of the game being filmed (a clip belongs to it, whatever
+    /// is in front at the press); `None` otherwise.
+    pub fn filming(&self) -> Option<String> {
+        self.shared.filming()
+    }
+
     /// Changes the replay length without restarting (older data is trimmed as capture goes).
     pub fn set_buffer_seconds(&self, seconds: u32) {
         self.shared.buffer_seconds.store(seconds, Ordering::Relaxed);
@@ -461,7 +505,8 @@ impl Engine {
             (ring.params(), ring.pending(now, shared.window()))
         };
         let (Some(params), Some(pending)) = (params, pending) else {
-            return Err(EMPTY);
+            let waiting = shared.config.source.game_only && shared.filming().is_none();
+            return Err(if waiting { NO_GAME } else { EMPTY });
         };
         let frame = TICKS_PER_SECOND / i64::from(params.fps.max(1));
         let end = pending.until() + frame;
@@ -632,6 +677,8 @@ mod contract_tests {
                 seconds: 12.5,
                 bytes: 4096,
             }),
+            game_only: true,
+            filming: Some("FiveM".into()),
         };
         assert_eq!(
             serde_json::to_value(&status).unwrap(),
@@ -650,7 +697,9 @@ mod contract_tests {
                 "tenBit": true,
                 "bitrate": 50_000_000,
                 "backend": "nvenc",
-                "recording": {"seconds": 12.5, "bytes": 4096}
+                "recording": {"seconds": 12.5, "bytes": 4096},
+                "gameOnly": true,
+                "filming": "FiveM"
             })
         );
         let paused = serde_json::to_value(CaptureStatus::with_state(CaptureState::Paused)).unwrap();
