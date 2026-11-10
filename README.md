@@ -52,6 +52,8 @@ A clip is called a **shard**. Your library is the **Glacier**.
 - [x] Editor tools: cut a passage out, mute or bleep the mic or the game over a zone, slow motion, blurred zones, captions, all previewed live
 - [x] Best-of: shards one after another as edited, cut, fade or flash transitions, an intro title, your music lowered under voices and action, 16:9 or 9:16, with a guided tour
 - [x] Markers: a shortcut marks a moment while you play, found again on the editor's timeline
+- [x] Collections: shards grouped by hand (a session, a tournament, a montage to come), the files staying where they are
+- [x] Making room: old heavy shards recompressed in Standard quality after a confirmation, the originals in the Recycle Bin, favorites never touched
 - [x] Installer and signed automatic updates
 - [ ] Windows code signing (no SmartScreen warning)
 - [ ] Native AMD and Intel encoders, separate Discord voice track
