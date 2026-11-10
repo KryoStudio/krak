@@ -1,9 +1,10 @@
 <!-- Best-of: put shards together into one video. The shards on the left (search, game, quick
      fills), the montage in the middle (preview, then the clips in order: drag to reorder, edit a
      clip in the editor, remove it), the settings on the right (format, transitions, title,
-     music). Each clip plays as edited. A guide walks through it the first time (and on "?"). -->
+     music). Each clip plays as edited. A guide walks through it the first time (and on "?").
+     Ctrl+Z / Ctrl+Y undo and redo adding, removing and moving clips and the settings. -->
 <script lang="ts">
-  import { onMount } from 'svelte';
+  import { onMount, untrack } from 'svelte';
   import { flip } from 'svelte/animate';
   import { fly } from 'svelte/transition';
   import { prefersReducedMotion } from 'svelte/motion';
@@ -17,6 +18,7 @@
   import Tour, { type TourStep } from '$lib/components/Tour.svelte';
   import { api, errorCode, native } from '$lib/api';
   import { TITLE_SECONDS, add, bestof, clipLength, composition, move, persist, quickPick, removeAt } from '$lib/bestof.svelte';
+  import { History } from '$lib/history.svelte';
   import { formatDuration, t } from '$lib/i18n.svelte';
   import { collections } from '$lib/collections.svelte';
   import { library } from '$lib/library.svelte';
@@ -36,16 +38,50 @@
   let dragging = $state<number | null>(null);
   let over = $state<number | null>(null);
 
-  // Clips that left the library (deleted, renamed) leave the best-of too.
+  // Ctrl+Z / Ctrl+Y over the clips and the settings.
+  type Snapshot = Pick<typeof bestof, 'items' | 'transition' | 'titleOn' | 'title' | 'music' | 'vertical'>;
+  const history = new History<Snapshot>(
+    () => ({
+      items: [...bestof.items],
+      transition: bestof.transition,
+      titleOn: bestof.titleOn,
+      title: bestof.title,
+      music: bestof.music ? { ...bestof.music } : null,
+      vertical: bestof.vertical,
+    }),
+    (state) => Object.assign(bestof, state),
+  );
+  onMount(() => {
+    history.reset();
+    return () => history.dispose();
+  });
+
+  // Clips that left the library (deleted, renamed) leave the best-of too (and the history, which
+  // would bring them back).
   const shards = $derived(bestof.items.map((id) => library.find(id)).filter((s) => !!s));
   $effect(() => {
-    if (library.shards.length && shards.length !== bestof.items.length) bestof.items = shards.map((s) => s.id);
+    if (library.shards.length && shards.length !== bestof.items.length) {
+      bestof.items = shards.map((s) => s.id);
+      untrack(() => history.reset());
+    }
   });
   // Every change is kept for next time.
   $effect(() => {
     void [bestof.items.length, ...bestof.items, bestof.transition, bestof.titleOn, bestof.title, bestof.vertical, JSON.stringify(bestof.music)];
     persist();
+    untrack(() => history.changed());
   });
+
+  function onkeydown(e: KeyboardEvent) {
+    const target = e.target as HTMLElement;
+    if (!(e.ctrlKey || e.metaKey) || e.altKey || exporting || guiding || e.defaultPrevented) return;
+    if (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.isContentEditable) return;
+    const key = e.key.toLowerCase();
+    if (key === 'z' && !e.shiftKey) history.undo();
+    else if (key === 'y' || (key === 'z' && e.shiftKey)) history.redo();
+    else return;
+    e.preventDefault();
+  }
 
   const games = $derived([...new Set(library.shards.map((s) => s.game))].sort((a, b) => (a ?? '').localeCompare(b ?? '')));
   const gameOptions = $derived([
@@ -149,12 +185,26 @@
   const transitions = $derived((['cut', 'fade', 'flash'] as const).map((value) => ({ value, label: t(`bestof.transition.${value}`) })));
 </script>
 
+<svelte:window
+  {onkeydown}
+  onpointerdown={() => history.hold(true)}
+  onpointerup={() => history.hold(false)}
+  onpointercancel={() => history.hold(false)}
+  onblur={() => history.hold(false)}
+/>
+
 <div class="bestof">
   <header>
     <div class="heading">
       <h1>{t('bestof.title')}</h1>
       <p>{t('bestof.subtitle')}</p>
     </div>
+    <button class="icon-button" onclick={() => history.undo()} disabled={!history.canUndo} aria-label={t('editor.undo')} use:tooltip={{ text: `${t('editor.undo')} · Ctrl+Z`, side: 'bottom' }}>
+      <Icon name="undo" size={16} />
+    </button>
+    <button class="icon-button" onclick={() => history.redo()} disabled={!history.canRedo} aria-label={t('editor.redo')} use:tooltip={{ text: `${t('editor.redo')} · Ctrl+Y`, side: 'bottom' }}>
+      <Icon name="redo" size={16} />
+    </button>
     <button class="icon-button" onclick={() => (guiding = true)} aria-label={t('bestof.guide.open')} use:tooltip={{ text: t('bestof.guide.open'), side: 'bottom' }}>
       <Icon name="info" size={16} />
     </button>
@@ -710,8 +760,12 @@
     background: var(--surface-2);
     box-shadow: inset 0 0 0 1px var(--border);
   }
-  .icon-button:hover {
+  .icon-button:hover:not(:disabled) {
     color: var(--text);
+  }
+  .icon-button:disabled {
+    opacity: 0.4;
+    cursor: default;
   }
   .button {
     display: inline-flex;
