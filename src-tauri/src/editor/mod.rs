@@ -15,6 +15,8 @@
 //! checks the cancel flag and partial outputs are deleted on cancel or failure.
 
 #[cfg(windows)]
+pub mod compose;
+#[cfg(windows)]
 pub mod decode;
 pub mod demux;
 #[cfg(windows)]

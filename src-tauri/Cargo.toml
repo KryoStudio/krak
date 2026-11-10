@@ -44,6 +44,8 @@ futures-util = { version = "0.3", default-features = false, features = ["std"] }
 
 [target.'cfg(windows)'.dependencies]
 clipboard-win = "5.4.3"
+# Points and sizes of Direct2D (text drawn into compositions); the version the windows crate uses.
+windows-numerics = "0.3.1"
 # Same version as Tauri's own (already in Cargo.lock): capture engine (D3D11, DXGI duplication,
 # Windows Graphics Capture of a window or a display,
 # Media Foundation, WASAPI) and the few Win32 calls around it.
@@ -58,9 +60,12 @@ windows = { version = "0.62", features = [
     "Win32_Devices_Display",
     "Win32_Devices_FunctionDiscovery",
     "Win32_Foundation",
+    "Win32_Graphics_Direct2D",
+    "Win32_Graphics_Direct2D_Common",
     "Win32_Graphics_Direct3D",
     "Win32_Graphics_Direct3D10",
     "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_DirectWrite",
     "Win32_Graphics_Dwm",
     "Win32_Graphics_Dxgi",
     "Win32_Graphics_Dxgi_Common",

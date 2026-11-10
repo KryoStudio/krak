@@ -130,7 +130,17 @@ pub struct ReaderAudio {
     pub channels: u16,
 }
 
+/// What Media Foundation finds in a video file (`unsupported` without a video stream).
 pub fn reader_info(path: &Path) -> Result<ReaderInfo, &'static str> {
+    let info = media_info(path)?;
+    if info.video.is_none() {
+        return Err(UNSUPPORTED);
+    }
+    Ok(info)
+}
+
+/// What Media Foundation finds in any media file, a song included.
+pub fn media_info(path: &Path) -> Result<ReaderInfo, &'static str> {
     // SAFETY: Source Reader queries on an object we own.
     unsafe {
         let reader: IMFSourceReader =
@@ -189,9 +199,6 @@ pub fn reader_info(path: &Path) -> Result<ReaderInfo, &'static str> {
                         .unwrap_or(2),
                 });
             }
-        }
-        if info.video.is_none() {
-            return Err(UNSUPPORTED);
         }
         Ok(info)
     }

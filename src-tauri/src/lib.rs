@@ -108,6 +108,8 @@ pub fn run() {
             commands::get_audio_stems,
             commands::capture_controller_combo,
             commands::list_open_apps,
+            commands::export_composition,
+            commands::choose_music,
             commands::list_displays,
             recording::start_recording,
             recording::stop_recording,

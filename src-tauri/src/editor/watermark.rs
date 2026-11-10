@@ -139,24 +139,7 @@ impl Badge {
 
     /// From premultiplied BGRA pixels of `rect`'s size.
     fn from_pbgra(rect: Rect, pixels: &[u8]) -> Self {
-        let (w, h) = (rect.width as usize, rect.height as usize);
-        let mut luma = vec![[0.0; 4]; w * h];
-        let mut chroma = vec![[0.0; 4]; (w / 2) * (h / 2)];
-        for row in 0..h {
-            for col in 0..w {
-                let at = (row * w + col) * 4;
-                let a = f32::from(pixels[at + 3]) / 255.0;
-                // Premultiplied: a colour channel above alpha is cubic-filter overshoot.
-                let channel = |i: usize| (f32::from(pixels[at + i]) / 255.0).min(a);
-                let (b, g, r) = (channel(0), channel(1), channel(2));
-                let (y, cb, cr) = studio_ycbcr(r, g, b, a);
-                luma[row * w + col] = [y, 0.0, 0.0, a];
-                let block = &mut chroma[(row / 2) * (w / 2) + col / 2];
-                block[0] += cb / 4.0;
-                block[1] += cr / 4.0;
-                block[3] += a / 4.0;
-            }
-        }
+        let (luma, chroma) = planes(pixels, rect.width, rect.height);
         Self { rect, luma, chroma }
     }
 
@@ -199,9 +182,35 @@ impl Badge {
     }
 }
 
+/// Premultiplied BGRA pixels (`width` × `height`, even) as the two textures the NV12 blend
+/// draws: per pixel Y'·a, 0, 0, a; per 2×2 block Cb'·a, Cr'·a, 0, a (code values / 255).
+#[allow(clippy::type_complexity, reason = "two texel arrays")]
+pub fn planes(pixels: &[u8], width: u32, height: u32) -> (Vec<[f32; 4]>, Vec<[f32; 4]>) {
+    let (w, h) = (width as usize, height as usize);
+    let mut luma = vec![[0.0; 4]; w * h];
+    let mut chroma = vec![[0.0; 4]; (w / 2) * (h / 2)];
+    for row in 0..h {
+        for col in 0..w {
+            let at = (row * w + col) * 4;
+            let a = f32::from(pixels[at + 3]) / 255.0;
+            // Premultiplied: a colour channel above alpha is cubic-filter overshoot.
+            let channel = |i: usize| (f32::from(pixels[at + i]) / 255.0).min(a);
+            let (b, g, r) = (channel(0), channel(1), channel(2));
+            let (y, cb, cr) = studio_ycbcr(r, g, b, a);
+            luma[row * w + col] = [y, 0.0, 0.0, a];
+            if let Some(block) = chroma.get_mut((row / 2) * (w / 2) + col / 2) {
+                block[0] += cb / 4.0;
+                block[1] += cr / 4.0;
+                block[3] += a / 4.0;
+            }
+        }
+    }
+    (luma, chroma)
+}
+
 /// Premultiplied R'G'B' (0..1, gamma-encoded like the capture's sRGB) and alpha →
 /// premultiplied studio-range BT.709 Y', Cb', Cr' as code values / 255.
-fn studio_ycbcr(r: f32, g: f32, b: f32, a: f32) -> (f32, f32, f32) {
+pub fn studio_ycbcr(r: f32, g: f32, b: f32, a: f32) -> (f32, f32, f32) {
     let y = 0.2126 * r + 0.7152 * g + 0.0722 * b;
     let cb = (b - y) / 1.8556;
     let cr = (r - y) / 1.5748;
@@ -509,7 +518,7 @@ impl Draw {
 }
 
 /// A render-target view of one plane of an NV12 texture (R8: luma, R8G8: chroma).
-fn plane_view(
+pub(super) fn plane_view(
     gpu: &Gpu,
     texture: &ID3D11Texture2D,
     format: DXGI_FORMAT,
@@ -532,7 +541,7 @@ fn plane_view(
 }
 
 /// An immutable RGBA float texture holding `texels`, as a shader resource.
-fn float_texture(
+pub(super) fn float_texture(
     gpu: &Gpu,
     width: u32,
     height: u32,

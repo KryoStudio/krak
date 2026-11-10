@@ -287,13 +287,13 @@ pub fn export_settings(config: H264Config, b_ref_middle: bool, lookahead: bool) 
 }
 
 /// The export's H.264 encoder.
-enum ExportEncoder {
+pub(super) enum ExportEncoder {
     Nvenc(Box<NvencEncoder>),
     MediaFoundation(H264Encoder),
 }
 
 impl ExportEncoder {
-    fn open(gpu: &Gpu, config: H264Config, options: Options) -> MediaResult<Self> {
+    pub(super) fn open(gpu: &Gpu, config: H264Config, options: Options) -> MediaResult<Self> {
         if options.software_encoder {
             return H264Encoder::software(config).map(Self::MediaFoundation);
         }
@@ -314,35 +314,35 @@ impl ExportEncoder {
             .map(Self::MediaFoundation)
     }
 
-    fn wants_textures(&self) -> bool {
+    pub(super) fn wants_textures(&self) -> bool {
         match self {
             Self::Nvenc(_) => true,
             Self::MediaFoundation(encoder) => encoder.wants_textures(),
         }
     }
 
-    fn drain(&mut self, out: &mut Vec<VideoPacket>) -> MediaResult<()> {
+    pub(super) fn drain(&mut self, out: &mut Vec<VideoPacket>) -> MediaResult<()> {
         match self {
             Self::Nvenc(encoder) => encoder.finish(out),
             Self::MediaFoundation(encoder) => encoder.drain(out),
         }
     }
 
-    fn config(&self) -> Option<CodecConfig> {
+    pub(super) fn config(&self) -> Option<CodecConfig> {
         match self {
             Self::Nvenc(encoder) => Some(encoder.config().clone()),
             Self::MediaFoundation(encoder) => encoder.codec_config(),
         }
     }
 
-    fn name(&self) -> String {
+    pub(super) fn name(&self) -> String {
         match self {
             Self::Nvenc(_) => "NVENC H.264 (P7, 2-pass)".to_string(),
             Self::MediaFoundation(encoder) => encoder.name().to_string(),
         }
     }
 
-    fn vendor(&self) -> Vendor {
+    pub(super) fn vendor(&self) -> Vendor {
         match self {
             Self::Nvenc(_) => Vendor::Nvidia,
             Self::MediaFoundation(encoder) => encoder.vendor(),
@@ -391,7 +391,7 @@ impl Slots {
 }
 
 /// Feeds one frame, waiting while an asynchronous encoder is busy (never drops frames).
-fn submit(
+pub(super) fn submit(
     encoder: &mut ExportEncoder,
     frame: Frame,
     pts: i64,
@@ -430,7 +430,7 @@ fn submit(
 }
 
 /// Source Reader on the first video stream.
-struct Reader {
+pub(super) struct Reader {
     reader: IMFSourceReader,
     /// Current output: buffer size (may include padding rows), visible size, stride.
     size: (u32, u32),
@@ -441,7 +441,7 @@ struct Reader {
 }
 
 impl Reader {
-    fn open(source: &Path, gpu: &Gpu, options: Options) -> MediaResult<Self> {
+    pub(super) fn open(source: &Path, gpu: &Gpu, options: Options) -> MediaResult<Self> {
         // SAFETY: attribute store and reader we own; the D3D manager outlives the reader
         // (the reader takes its own reference).
         unsafe {
@@ -486,7 +486,7 @@ impl Reader {
     }
 
     /// Timestamp of the first compressed sample (before any output type is set).
-    fn first_timestamp(&self) -> Option<i64> {
+    pub(super) fn first_timestamp(&self) -> Option<i64> {
         let (mut flags, mut time) = (0u32, 0i64);
         let mut sample = None;
         // SAFETY: plain synchronous read.
@@ -507,7 +507,7 @@ impl Reader {
 
     /// NV12 at `size` (the reader scales), or NV12 at the native size when it cannot (or
     /// `native_only`).
-    fn select_output(&mut self, size: (u32, u32), native_only: bool) -> MediaResult<()> {
+    pub(super) fn select_output(&mut self, size: (u32, u32), native_only: bool) -> MediaResult<()> {
         // SAFETY: media types we own, set on the selected stream.
         unsafe {
             let native = self
@@ -587,7 +587,7 @@ impl Reader {
         Ok(())
     }
 
-    fn seek(&self, position: i64) -> MediaResult<()> {
+    pub(super) fn seek(&self, position: i64) -> MediaResult<()> {
         // SAFETY: VT_I8 position in 100 ns, the default time format.
         unsafe {
             self.reader
@@ -598,7 +598,7 @@ impl Reader {
 
     /// `Ok(None)` at the end of the stream, `Ok(Some(None))` for a gap.
     #[allow(clippy::type_complexity, reason = "local to this module")]
-    fn read(&mut self) -> MediaResult<Option<Option<(i64, IMFSample)>>> {
+    pub(super) fn read(&mut self) -> MediaResult<Option<Option<(i64, IMFSample)>>> {
         let (mut flags, mut time) = (0u32, 0i64);
         let mut sample = None;
         // SAFETY: plain synchronous read.
@@ -649,7 +649,7 @@ impl Prepared {
 }
 
 /// Turns reader samples into encoder input of the target size.
-struct FramePipeline<'g> {
+pub(super) struct FramePipeline<'g> {
     gpu: &'g Gpu,
     size: (u32, u32),
     target: Option<ID3D11Texture2D>,
@@ -668,7 +668,12 @@ struct FramePipeline<'g> {
 }
 
 impl<'g> FramePipeline<'g> {
-    fn new(gpu: &'g Gpu, size: (u32, u32), stamp: Option<Stamp<'g>>, crop: Option<f64>) -> Self {
+    pub(super) fn new(
+        gpu: &'g Gpu,
+        size: (u32, u32),
+        stamp: Option<Stamp<'g>>,
+        crop: Option<f64>,
+    ) -> Self {
         Self {
             gpu,
             size,
@@ -772,6 +777,31 @@ impl<'g> FramePipeline<'g> {
         self.finish(textures)
     }
 
+    /// The frame of `sample` at the output size in our own target texture (never the
+    /// decoder's), for drawing over it before encoding (`compose`).
+    pub(super) fn render(
+        &mut self,
+        sample: &IMFSample,
+        reader: &Reader,
+    ) -> MediaResult<ID3D11Texture2D> {
+        let stamp = self.stamp.take();
+        let prepared = self.prepare(sample, reader, true);
+        self.stamp = stamp;
+        match prepared? {
+            Prepared::Direct(texture) => {
+                let target = self.target()?;
+                copy(self.gpu, &target, &texture, 0, (0, 0), self.size);
+                Ok(target)
+            }
+            Prepared::Target | Prepared::Memory => self.target(),
+        }
+    }
+
+    /// Vertical: where the 9:16 window is.
+    pub(super) fn crop(&self) -> Option<f64> {
+        self.crop
+    }
+
     /// The target texture holds the frame: the badge, then the encoder's input.
     fn finish(&mut self, textures: bool) -> MediaResult<Prepared> {
         if self.stamp.is_some() {
@@ -793,7 +823,7 @@ impl<'g> FramePipeline<'g> {
         Ok(Prepared::Memory)
     }
 
-    fn target(&mut self) -> MediaResult<ID3D11Texture2D> {
+    pub(super) fn target(&mut self) -> MediaResult<ID3D11Texture2D> {
         if self.target.is_none() {
             self.target = Some(self.gpu.texture(
                 self.size.0,

@@ -507,6 +507,191 @@ pub async fn cancel_export() -> CmdResult<()> {
     Ok(())
 }
 
+/// Where a composition goes (`export_composition`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CompositionTarget {
+    /// Next to the first clip: "<stem> (edited).mp4".
+    Copy,
+    /// A file the user picked.
+    File,
+    /// Under `maxBytes`, on the clipboard.
+    Discord,
+    /// Under `maxBytes`, for the Krak community's bot.
+    Share,
+    /// A new shard in the Glacier's "Best-of" folder.
+    Glacier,
+}
+
+/// A composition to render, and where it goes.
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CompositionRequest {
+    #[serde(flatten)]
+    pub composition: editor::compose::Composition,
+    pub target: CompositionTarget,
+    pub max_bytes: Option<f64>,
+    pub path: Option<String>,
+    /// Glacier: the new shard's name (without ".mp4").
+    pub name: Option<String>,
+}
+
+/// The Glacier folder best-ofs are saved in.
+const BEST_OF_FOLDER: &str = "Best-of";
+
+/// Renders a composition (one clip with the editor's cuts, mutes, slow motion, blurs and
+/// captions, or a best-of of many) and puts it where `target` says; progress comes as
+/// `export-progress` with the id "composition".
+#[tauri::command]
+pub async fn export_composition(
+    app: AppHandle,
+    request: CompositionRequest,
+) -> CmdResult<ExportResult> {
+    let slot = ExportSlot::acquire()?;
+    let state = app.state::<AppState>();
+    let clips_dir = state.clips_dir();
+    let paths = request
+        .composition
+        .clips
+        .iter()
+        .map(|clip| library::resolve_id(&clips_dir, &clip.id))
+        .collect::<Result<Vec<_>, _>>()?;
+    let first_id = request
+        .composition
+        .clips
+        .first()
+        .map(|clip| clip.id.clone())
+        .ok_or(INVALID_REQUEST)?;
+    let output = match request.target {
+        CompositionTarget::Copy => editor::compose::Output::Copy {
+            label: i18n::labels(state.settings().language.as_deref())
+                .edited
+                .to_string(),
+        },
+        CompositionTarget::File => editor::compose::Output::File {
+            path: naming::export_file(request.path.as_deref().ok_or(INVALID_REQUEST)?)?,
+        },
+        CompositionTarget::Discord | CompositionTarget::Share => {
+            let max_bytes = request
+                .max_bytes
+                .filter(|m| m.is_finite() && *m >= 1.0)
+                .ok_or(INVALID_REQUEST)?;
+            editor::compose::Output::Discord {
+                dir: app
+                    .path()
+                    .app_cache_dir()
+                    .map_err(|_| WRITE_FAILED)?
+                    .join("exports"),
+                max_bytes: max_bytes as u64,
+            }
+        }
+        CompositionTarget::Glacier => {
+            let stem = request
+                .name
+                .as_deref()
+                .map(naming::export_stem)
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or_else(|| "Best-of".into());
+            editor::compose::Output::Folder {
+                dir: clips_dir.join(BEST_OF_FOLDER),
+                stem,
+            }
+        }
+    };
+    let cancel = slot.cancel_flag();
+    let emitter = app.clone();
+    let composition = request.composition.clone();
+    let exported = media_thread("kryo-compose", move || {
+        let report = move |progress: f64| {
+            let payload = ExportProgress {
+                id: "composition".into(),
+                progress,
+            };
+            let _ = emitter.emit(EXPORT_PROGRESS, payload);
+        };
+        let progress = Progress::new(cancel, &report);
+        let started = std::time::Instant::now();
+        let exported = editor::compose::compose(&paths, &composition, &output, &progress)?;
+        eprintln!(
+            "krak: composed {} ({} bytes, {}) in {:.1} s",
+            exported.path.display(),
+            exported.size,
+            exported.detail,
+            started.elapsed().as_secs_f64()
+        );
+        Ok(exported)
+    })
+    .await?;
+
+    let shard = match request.target {
+        CompositionTarget::Copy | CompositionTarget::File | CompositionTarget::Glacier => {
+            let (app, path) = (app.clone(), exported.path.clone());
+            let sibling = (request.target == CompositionTarget::Copy).then(|| {
+                let name = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or_default()
+                    .to_string();
+                library::sibling_id(&first_id, &name)
+            });
+            blocking(move || {
+                let state = app.state::<AppState>();
+                let Some(id) = sibling.or_else(|| shard_id_of(&clips_dir, &path)) else {
+                    return Ok(None);
+                };
+                let favorites = lock(&state.meta).favorites.clone();
+                Ok(library::shard(&clips_dir, &id, &favorites, &mut lock(&state.durations)).ok())
+            })
+            .await?
+        }
+        CompositionTarget::Discord => {
+            let path = exported.path.clone();
+            shell::isolated(move || clipboard::copy_file(&path))
+                .await
+                .ok_or(INTERNAL)?
+                .map_err(String::from)?;
+            None
+        }
+        CompositionTarget::Share => None,
+    };
+    lock(&state.exports).files.insert(exported.path.clone());
+    drop(slot);
+    Ok(ExportResult {
+        path: exported.path.to_string_lossy().into_owned(),
+        size: exported.size,
+        shard,
+        reencoded: true,
+    })
+}
+
+/// Native "Open" dialog for a song (MP3, WAV, M4A, FLAC...); `None` when cancelled.
+#[tauri::command]
+pub async fn choose_music(app: AppHandle) -> CmdResult<Option<String>> {
+    let (tx, mut rx) = tauri::async_runtime::channel(1);
+    let mut dialog = app.dialog().file().add_filter(
+        "Audio",
+        &["mp3", "wav", "m4a", "aac", "flac", "wma", "ogg", "opus"],
+    );
+    if let Ok(dir) = app.path().audio_dir()
+        && dir.is_dir()
+    {
+        dialog = dialog.set_directory(dir);
+    }
+    if let Some(main) = app.get_webview_window(window::MAIN) {
+        dialog = dialog.set_parent(&main);
+    }
+    dialog.pick_file(move |picked| {
+        let _ = tx.try_send(picked);
+    });
+    let Some(Some(picked)) = rx.recv().await else {
+        return Ok(None);
+    };
+    let path = picked
+        .into_path()
+        .map_err(|_| editor::INVALID_DIR.to_string())?;
+    Ok(Some(path.to_string_lossy().into_owned()))
+}
+
 /// Native "Save as" for a file export (MP4), opening where the last one was saved this
 /// session, else in Videos. The dialog asks before overwriting. `None` when cancelled.
 #[tauri::command]

@@ -89,7 +89,7 @@ pub struct Request {
 
 /// Where a copy or file export writes.
 #[derive(Clone, Copy)]
-enum Output<'a> {
+pub(super) enum Output<'a> {
     /// A free "<stem> (<label>).mp4" next to the source.
     Next(&'a str),
     /// `<path>.part`, left for the caller to rename.
@@ -125,28 +125,28 @@ enum Decoder {
     Reader { stream: u32, shift: i64 },
 }
 
-struct AudioSource {
-    track: SourceTrack,
+pub(super) struct AudioSource {
+    pub(super) track: SourceTrack,
     decoder: Decoder,
 }
 
 /// Everything we know about the source.
-struct Source {
-    path: PathBuf,
+pub(super) struct Source {
+    pub(super) path: PathBuf,
     movie: Option<Movie>,
     file: Option<MappedFile>,
     /// Seconds, 0 when unknown.
-    duration: f64,
-    size: (u32, u32),
-    fps: f64,
+    pub(super) duration: f64,
+    pub(super) size: (u32, u32),
+    pub(super) fps: f64,
     /// Average video bitrate (bits/s), when known.
     bitrate: Option<f64>,
-    audio: Vec<AudioSource>,
-    timing: Timing,
+    pub(super) audio: Vec<AudioSource>,
+    pub(super) timing: Timing,
 }
 
 impl Source {
-    fn open(path: &Path) -> Result<Self, &'static str> {
+    pub(super) fn open(path: &Path) -> Result<Self, &'static str> {
         match demux::open(path).filter(|m| m.video().is_some_and(|v| !v.samples.is_empty())) {
             Some(movie) => Self::from_movie(path, movie),
             None => Self::from_reader(path, probe::reader_info(path)?),
@@ -432,6 +432,36 @@ pub fn decode_audio(
 }
 
 /// Validated `start..end` in 100 ns.
+/// The audio tracks of `source` that `wanted` keeps, decoded over `from..to` (100 ns on its
+/// timeline): 48 kHz, stereo or mono.
+pub(super) fn decode_range(
+    source: &Source,
+    wanted: impl Fn(&SourceTrack) -> bool,
+    from: i64,
+    to: i64,
+    progress: &Span,
+) -> Result<Vec<(SourceTrack, Pcm)>, &'static str> {
+    let tracks: Vec<_> = source.audio.iter().filter(|t| wanted(&t.track)).collect();
+    let count = tracks.len().max(1) as f64;
+    let mut out = Vec::with_capacity(tracks.len());
+    for (n, track) in tracks.into_iter().enumerate() {
+        progress.check()?;
+        let span = progress.sub(n as f64 / count, (n + 1) as f64 / count);
+        let pcm = match &track.decoder {
+            Decoder::Aac(index) => {
+                let movie = source.movie.as_ref().ok_or(EXPORT_FAILED)?;
+                let file = source.file.as_ref().ok_or(EXPORT_FAILED)?;
+                decode::aac_track(file, &movie.tracks[*index], from, to, &span)?
+            }
+            Decoder::Reader { stream, shift } => {
+                decode::reader_track(&source.path, *stream, *shift, from, to, &span)?
+            }
+        };
+        out.push((track.track.clone(), pcm));
+    }
+    Ok(out)
+}
+
 fn range(start: f64, end: f64, duration: f64) -> Result<(i64, i64), &'static str> {
     if !start.is_finite() || !end.is_finite() {
         return Err(INVALID_RANGE);
@@ -784,7 +814,7 @@ fn reencode(
     transcode::transcode(job, &gpu, &progress)
 }
 
-fn encoded_track(encoded: &Encoded) -> VideoTrack<'_> {
+pub(super) fn encoded_track(encoded: &Encoded) -> VideoTrack<'_> {
     VideoTrack {
         config: &encoded.config,
         colour: Some(Colour::BT709),
@@ -805,17 +835,17 @@ fn encoded_track(encoded: &Encoded) -> VideoTrack<'_> {
 impl Encoded {
     /// How long the first decode time comes before the first picture (B-frame reordering):
     /// the output's audio must start that much earlier (module docs).
-    fn lead_in(&self) -> i64 {
+    pub(super) fn lead_in(&self) -> i64 {
         self.packets.first().map_or(0, |p| (p.pts - p.dts).max(0))
     }
 }
 
 /// An encoded output audio track.
-struct EncodedAudio {
-    name: String,
-    channels: u16,
-    bitrate: u32,
-    stream: AacStream,
+pub(super) struct EncodedAudio {
+    pub(super) name: String,
+    pub(super) channels: u16,
+    pub(super) bitrate: u32,
+    pub(super) stream: AacStream,
 }
 
 /// Decodes what `plan` needs over `from..to`, mixes the output tracks and encodes them (for
@@ -941,7 +971,7 @@ fn bitrate(channels: u16, discord: Option<u32>) -> u32 {
     }
 }
 
-fn muxer_tracks(audio: &[EncodedAudio]) -> Vec<AudioTrack<'_>> {
+pub(super) fn muxer_tracks(audio: &[EncodedAudio]) -> Vec<AudioTrack<'_>> {
     audio
         .iter()
         .map(|a| AudioTrack {
@@ -956,7 +986,7 @@ fn muxer_tracks(audio: &[EncodedAudio]) -> Vec<AudioTrack<'_>> {
 }
 
 /// Exact output size, without writing anything.
-fn measure(
+pub(super) fn measure(
     video: &VideoTrack,
     audio: &[EncodedAudio],
     options: &Options,
@@ -968,7 +998,7 @@ fn measure(
 }
 
 /// Writes a copy or file export: returns the copy, or the part file of the file export.
-fn write_output(
+pub(super) fn write_output(
     source: &Path,
     output: Output,
     video: &VideoTrack,
@@ -999,7 +1029,7 @@ fn write_output(
     Err(WRITE_FAILED)
 }
 
-fn write_discord(
+pub(super) fn write_discord(
     dir: &Path,
     stem: &str,
     video: &VideoTrack,
@@ -1026,7 +1056,11 @@ fn write_discord(
 }
 
 /// A cancel that arrived during the final flush still wins: the file goes away.
-fn finish(path: PathBuf, size: u64, progress: &Span) -> Result<(PathBuf, u64), &'static str> {
+pub(super) fn finish(
+    path: PathBuf,
+    size: u64,
+    progress: &Span,
+) -> Result<(PathBuf, u64), &'static str> {
     if progress.check().is_err() {
         let _ = fs::remove_file(&path);
         return Err(CANCELLED);
@@ -1035,7 +1069,7 @@ fn finish(path: PathBuf, size: u64, progress: &Span) -> Result<(PathBuf, u64), &
     Ok((path, size))
 }
 
-fn write_error(path: &Path, err: &io::Error, progress: &Span) -> &'static str {
+pub(super) fn write_error(path: &Path, err: &io::Error, progress: &Span) -> &'static str {
     if progress.check().is_err() {
         return CANCELLED;
     }
@@ -1045,7 +1079,7 @@ fn write_error(path: &Path, err: &io::Error, progress: &Span) -> &'static str {
 
 /// What happens to the part file once written.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Finish {
+pub(super) enum Finish {
     /// Renamed to the path, which must not exist.
     New,
     /// Renamed over the path.
@@ -1056,7 +1090,7 @@ enum Finish {
 
 /// Writes through `<path>.part` (progress reported, cancellable, synced, then renamed as
 /// `finish` says); the part file is removed on any failure.
-fn write_file(
+pub(super) fn write_file(
     path: &Path,
     video: &VideoTrack,
     audio: &[AudioTrack],

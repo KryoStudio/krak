@@ -2400,3 +2400,225 @@ fn editor_exports_vertical_clips() {
     assert!(inside.abs_diff(bright) > 20, "the badge: {inside}");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ---- Compositions (`compose`): cuts, slow motion, blur, caption, title, music, fades. ----
+
+/// `seconds` of a 440 Hz tone, 48 kHz stereo 16-bit WAV: a song for the music track.
+fn tone_wav(path: &Path, seconds: usize) {
+    let frames = 48_000 * seconds;
+    let mut data = Vec::with_capacity(frames * 4);
+    for i in 0..frames {
+        let v = ((std::f64::consts::TAU * 440.0 * i as f64 / 48_000.0).sin() * 12_000.0) as i16;
+        data.extend_from_slice(&v.to_le_bytes());
+        data.extend_from_slice(&v.to_le_bytes());
+    }
+    let mut wav = Vec::with_capacity(44 + data.len());
+    let len = |n: usize| u32::try_from(n).expect("size").to_le_bytes();
+    wav.extend_from_slice(b"RIFF");
+    wav.extend_from_slice(&len(36 + data.len()));
+    wav.extend_from_slice(b"WAVEfmt ");
+    wav.extend_from_slice(&16u32.to_le_bytes());
+    wav.extend_from_slice(&1u16.to_le_bytes()); // PCM
+    wav.extend_from_slice(&2u16.to_le_bytes());
+    wav.extend_from_slice(&48_000u32.to_le_bytes());
+    wav.extend_from_slice(&(48_000u32 * 4).to_le_bytes());
+    wav.extend_from_slice(&4u16.to_le_bytes());
+    wav.extend_from_slice(&16u16.to_le_bytes());
+    wav.extend_from_slice(b"data");
+    wav.extend_from_slice(&len(data.len()));
+    wav.extend_from_slice(&data);
+    std::fs::write(path, wav).expect("wav");
+}
+
+/// Mean absolute difference between horizontal neighbours over `rows` × `cols` of `luma`.
+fn roughness(
+    luma: &[u8],
+    width: usize,
+    rows: std::ops::Range<usize>,
+    cols: std::ops::Range<usize>,
+) -> f64 {
+    let mut sum = 0u64;
+    let mut n = 0u64;
+    for y in rows {
+        for x in cols.start..cols.end - 1 {
+            sum += u64::from(luma[y * width + x].abs_diff(luma[y * width + x + 1]));
+            n += 1;
+        }
+    }
+    sum as f64 / n.max(1) as f64
+}
+
+#[test]
+#[ignore = "needs Media Foundation and the GPU; run with --ignored"]
+fn editor_composes_clips() {
+    use super::compose::{self, Composition, Output};
+    let _com = ComGuard::new();
+    let _mf = MfGuard::new().expect("media foundation");
+    let dir = std::env::var_os("KRYO_EDITOR_OUT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| std::env::temp_dir().join("kryo-editor-e2e"))
+        .join("compose");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("dir");
+    let clip = dir.join("clip.mp4");
+    synthetic_clip(&clip);
+    let song = dir.join("song.wav");
+    tone_wav(&song, 20);
+
+    // Clip A 0.5..4.5 without 1.5..2.5, half speed over 3.0..3.5; the noise band's right half
+    // pixelated; a caption; then clip B 0..2; a title first, fades between, the song under it.
+    let song_json = serde_json::to_string(&song.to_string_lossy()).expect("json");
+    let json = String::from(
+        r#"{
+            "clips": [{
+                "id": "a", "start": 0.5, "end": 4.5, "gains": {"game": 1, "mic": 1},
+                "cuts": [{"start": 1.5, "end": 2.5}],
+                "slow": [{"start": 3.0, "end": 3.5, "rate": 0.5}],
+                "mutes": [{"start": 1.0, "end": 1.2, "track": "all"}],
+                "blurs": [{"x": 0.5, "y": 0.27, "w": 0.5, "h": 0.21}],
+                "texts": [{"text": "GG WP", "start": 0.5, "end": 4.5, "x": 0.5, "y": 0.75, "size": 0.1, "style": "box"}]
+            }, {"id": "b", "start": 0, "end": 2, "gains": {"game": 1, "mic": 1}}],
+            "transition": "fade",
+            "title": "Best of",
+            "music": {"path": SONG, "volume": 0.5, "offset": 1.0}
+        }"#,
+    )
+    .replace("SONG", &song_json);
+    let composition: Composition = serde_json::from_str(&json).expect("composition");
+    let cancel = AtomicBool::new(false);
+    let report = |_: f64| {};
+    let progress = Progress::new(&cancel, &report);
+    let started = Instant::now();
+    let output = Output::Folder {
+        dir: dir.join("Best-of"),
+        stem: "Best-of test".into(),
+    };
+    let exported = compose::compose(
+        &[clip.clone(), clip.clone()],
+        &composition,
+        &output,
+        &progress,
+    )
+    .expect("composed");
+    println!(
+        "composition: {} ({} bytes, {}) in {:.1} s",
+        exported.path.display(),
+        exported.size,
+        exported.detail,
+        started.elapsed().as_secs_f64()
+    );
+    assert!(exported.path.ends_with("Best-of/Best-of test.mp4"));
+
+    // 2.5 s title + 1 + 0.5 + 1 (0.5 s slowed) + 1 of clip A + 2 of clip B.
+    let info = testing::probe(&exported.path);
+    println!("{info:?}");
+    assert!((info.duration - 8.0).abs() < 0.1, "{} s", info.duration);
+    let video = info.streams.iter().find(|s| s.width > 0).expect("video");
+    assert_eq!((video.width, video.height), (SYN_W, SYN_H));
+    assert_eq!(info.streams.len(), 2, "video and one mixed track");
+
+    // Each output frame shows the right source frame (index in its top band).
+    let mut frames = decoded_indices(&exported.path);
+    frames.sort_by_key(|(t, _)| *t);
+    assert!(
+        (frames.len() as i64 - 480).abs() <= 2,
+        "{} frames",
+        frames.len()
+    );
+    let at = |t: f64| frames[(t * 60.0).round() as usize].1;
+    let source = |s: f64| (s * 60.0).round() as u32;
+    for (t, s) in [(3.0, 1.0), (3.75, 2.75), (5.5, 4.0), (7.0, 1.0)] {
+        assert!(
+            at(t).abs_diff(source(s)) <= 1,
+            "at {t} s: {} instead of {}",
+            at(t),
+            source(s)
+        );
+    }
+    // Half speed: two output frames per source frame.
+    let slowed: Vec<u32> = (0..8).map(|k| at(4.3 + f64::from(k) / 60.0)).collect();
+    println!("slowed: {slowed:?}");
+    let distinct = {
+        let mut d = slowed.clone();
+        d.dedup();
+        d.len()
+    };
+    assert!((4..=5).contains(&distinct), "{slowed:?}");
+
+    // The title card: black with white letters in the middle.
+    let (width, title) = luma_frame(&exported.path, 75);
+    let height = title.len() / width;
+    let white = |luma: &[u8], rows: std::ops::Range<usize>| {
+        rows.flat_map(|y| (0..width).map(move |x| (x, y)))
+            .filter(|&(x, y)| luma[y * width + x] > 225)
+            .count()
+    };
+    assert!(title[10 * width + 10] < 24, "black around the title");
+    assert!(
+        white(&title, height * 2 / 5..height * 3 / 5) > 300,
+        "the title's letters"
+    );
+
+    // In clip A: the noise band is pixelated on the right only, the caption is there.
+    let (_, frame) = luma_frame(&exported.path, (3.0 * 60.0) as usize);
+    let band = height * 30 / 100..height * 45 / 100;
+    let left = roughness(&frame, width, band.clone(), 0..width / 2 - 8);
+    let right = roughness(&frame, width, band, width / 2 + 40..width - 40);
+    println!("noise roughness: left {left:.1}, right (pixelated) {right:.1}");
+    assert!(left > 30.0 && right < left / 4.0);
+    assert!(
+        white(&frame, height * 68 / 100..height * 82 / 100) > 200,
+        "the caption"
+    );
+    // Clip B has no caption.
+    let (_, plain) = luma_frame(&exported.path, (7.0 * 60.0) as usize);
+    assert!(white(&plain, height * 68 / 100..height * 82 / 100) < 20);
+
+    // A fade: black at the join between the clips (6.0 s).
+    let (_, join) = luma_frame(&exported.path, 6 * 60);
+    let mean = join.iter().map(|&v| u64::from(v)).sum::<u64>() as f64 / join.len() as f64;
+    assert!(mean < 30.0, "dipped to black: mean {mean:.0}");
+
+    // Sound: the song under the title (no clip sound there), the right length.
+    let (pcm, channels) = testing::decode_audio(&exported.path, 0);
+    let seconds = pcm.len() as f64 / f64::from(channels) / 48_000.0;
+    assert!((seconds - 8.0).abs() < 0.15, "{seconds} s of sound");
+    let rms = |from: f64, to: f64| {
+        let (a, b) = (
+            (from * 48_000.0) as usize * channels as usize,
+            (to * 48_000.0) as usize * channels as usize,
+        );
+        (pcm[a..b].iter().map(|&s| f64::from(s).powi(2)).sum::<f64>() / (b - a) as f64).sqrt()
+    };
+    println!(
+        "sound rms: title {:.0}, end {:.0}",
+        rms(1.0, 2.0),
+        rms(7.95, 7.99)
+    );
+    assert!(rms(1.0, 2.0) > 2000.0, "the song under the title");
+    assert!(rms(7.95, 7.99) < 500.0, "faded out at the end");
+
+    // The same for Discord, under 2 MB, vertical, with flashes.
+    let vertical: Composition = serde_json::from_str(&json.replace(
+        r#""transition": "fade""#,
+        r#""transition": "flash", "vertical": true"#,
+    ))
+    .expect("composition");
+    let cancel = AtomicBool::new(false);
+    let progress = Progress::new(&cancel, &report);
+    let small = compose::compose(
+        &[clip.clone(), clip],
+        &vertical,
+        &Output::Discord {
+            dir: dir.join("discord"),
+            max_bytes: 2_000_000,
+        },
+        &progress,
+    )
+    .expect("composed for Discord");
+    println!("discord: {} ({} bytes)", small.path.display(), small.size);
+    assert!(small.size <= 2_000_000);
+    let info = testing::probe(&small.path);
+    let video = info.streams.iter().find(|s| s.width > 0).expect("video");
+    assert!(video.height > video.width, "vertical");
+}
