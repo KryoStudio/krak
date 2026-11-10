@@ -196,7 +196,9 @@ fn on_menu_event(app: &AppHandle, event: MenuEvent) {
             window::show_main(app);
             let _ = app.emit(UPDATE_INSTALL, ());
         }
-        CAPTURE_NOW => replay::request_save(app),
+        CAPTURE_NOW => {
+            replay::request_save(app);
+        }
         TOGGLE_RECORDING => recording::toggle(app),
         SCREENSHOT => screenshots::request(app),
         TOGGLE_REPLAY => {

@@ -25,7 +25,9 @@ use crate::media::{ComGuard, MfGuard, d3d};
 use crate::settings::{Settings, SettingsPatch};
 use crate::state::{AppState, lock};
 use crate::storage::{self, StorageInfo};
-use crate::{clipboard, editor, i18n, names, presence, replay, shell, tray, update, window};
+use crate::{
+    clipboard, editor, gamepad, i18n, names, presence, replay, shell, tray, update, window,
+};
 
 type CmdResult<T> = Result<T, String>;
 
@@ -451,6 +453,13 @@ pub async fn list_microphones() -> CmdResult<Vec<Microphone>> {
 #[tauri::command]
 pub async fn get_storage_info(app: AppHandle) -> CmdResult<StorageInfo> {
     blocking(move || Ok(storage::info(&app.state::<AppState>().clips_dir()))).await
+}
+
+/// Waits (up to 10 s) for controller buttons held together then released, for the controller
+/// shortcut: "no_controller" | "combo_timeout" | "combo_short".
+#[tauri::command]
+pub async fn capture_controller_combo(app: AppHandle) -> CmdResult<String> {
+    blocking(move || gamepad::capture(&app)).await
 }
 
 /// One row of audio peaks per track of a clip (same order and names as `probe_shard`).

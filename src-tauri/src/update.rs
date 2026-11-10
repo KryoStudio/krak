@@ -55,6 +55,7 @@ pub async fn apply(app: &AppHandle, patch: SettingsPatch) -> Result<Settings, &'
     }
     replay::settings_changed(app, &old, &new);
     crate::presence::settings_changed(app, &old, &new);
+    crate::gamepad::settings_changed(app, &old, &new);
     if new.storage_limit_gb.is_some()
         && (new.storage_limit_gb != old.storage_limit_gb || dir_changed)
     {

@@ -638,6 +638,7 @@ impl Pipeline {
             }
             timer.wait_until(due(start, tick));
             let now = clock::now();
+            shared.forget_last_clip(now);
             // Late (busy encoder, starved thread): skip to the latest tick that is due, on the
             // pace (every tick, or every second or fourth one).
             let pace = self.pace;

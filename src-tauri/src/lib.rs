@@ -5,6 +5,7 @@ mod clipboard;
 mod commands;
 mod community;
 mod editor;
+mod gamepad;
 mod hotkey;
 mod i18n;
 mod library;
@@ -105,6 +106,7 @@ pub fn run() {
             commands::get_storage_info,
             commands::get_waveforms,
             commands::get_audio_stems,
+            commands::capture_controller_combo,
             recording::start_recording,
             recording::stop_recording,
             screenshots::take_screenshot,
@@ -142,6 +144,7 @@ fn setup(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {
     // After the replay (it shows its state); connects in the background.
     presence::init(&handle);
     hotkey::register_initial(&handle, &settings);
+    gamepad::init(&handle);
 
     // Windows are created only now (`create: false` in the config): their pages call commands
     // as soon as they load, and in release builds that is faster than this setup.

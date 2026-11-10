@@ -13,7 +13,7 @@
 //! muxer's edit list hides the reorder delay on every track (see `mp4_writer`).
 
 use std::io::ErrorKind;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -61,6 +61,34 @@ pub(super) struct Snapshot {
     pub audio_bitrate: u32,
     /// The longest clip there can be (100 ns): the replay window and the audio margin.
     pub max_span: i64,
+}
+
+impl Snapshot {
+    /// This clip continued up to the end of `later` (collected after it): the same start, and
+    /// everything the stream had since, `extra` longer at most than a clip may be. `None` when
+    /// `later` is not the same stream going on without a hole (the capture restarted, or this
+    /// clip's end is no longer held).
+    pub fn extended(&self, later: &Snapshot, extra: i64) -> Option<Snapshot> {
+        if !Arc::ptr_eq(&self.params, &later.params) {
+            return None;
+        }
+        let end = self.video.last()?;
+        let at = later.video.iter().position(|p| Arc::ptr_eq(p, end))?;
+        let mut video = self.video.clone();
+        video.extend(later.video[at + 1..].iter().cloned());
+        let mic = match (&later.mic, &self.mic) {
+            (Some(later), Some(earlier)) => Some(later.clone().after(earlier.clone())),
+            (mic, _) => mic.clone(),
+        };
+        Some(Snapshot {
+            params: later.params.clone(),
+            video,
+            game: later.game.clone().after(self.game.clone()),
+            mic,
+            audio_bitrate: later.audio_bitrate,
+            max_span: later.max_span + extra,
+        })
+    }
 }
 
 struct Track {
@@ -205,10 +233,13 @@ fn encode(tracks: &[Track]) -> Result<Vec<AacStream>, &'static str> {
     })
 }
 
-/// Writes the clip and returns its path.
+/// Writes the clip and returns its path: in place of `replacing` (the shorter clip it extends)
+/// when given, else under a new name. If the old file cannot be replaced, the clip gets its own
+/// file and both stay.
 pub(super) fn write_clip(
     snapshot: &Snapshot,
     request: &SaveRequest,
+    replacing: Option<&Path>,
 ) -> Result<PathBuf, &'static str> {
     if snapshot.video.is_empty() {
         return Err(EMPTY);
@@ -252,6 +283,15 @@ pub(super) fn write_clip(
         })
         .collect();
 
+    if let Some(path) = replacing {
+        match mp4_writer::write_file(path, &video, &audio, &Options::default(), true) {
+            Ok(_) => return Ok(path.to_path_buf()),
+            Err(err) => eprintln!(
+                "krak: cannot replace {} ({err}), the longer clip gets its own file",
+                path.display()
+            ),
+        }
+    }
     let folder = match &request.game {
         Some(game) => request.clips_dir.join(game),
         None => request.clips_dir.clone(),
@@ -475,6 +515,91 @@ mod tests {
         assert_eq!(audio_frames(0, end, 40 * S), 40 * 48_000);
         assert_eq!(audio_frames(S, 2 * S, 40 * S), 48_000);
         assert_eq!(audio_frames(2 * S, S, 40 * S), 0);
+    }
+
+    #[test]
+    fn extends_a_clip_with_what_followed() {
+        use crate::capture::ring::VideoRing;
+        const S: i64 = TICKS_PER_SECOND;
+        let window = 5 * S;
+        // 10 fps, a keyframe every second.
+        let packet = |i: i64| {
+            Arc::new(VideoPacket {
+                data: vec![0; 100],
+                pts: i * S / 10,
+                dts: i * S / 10,
+                keyframe: i % 10 == 0,
+                clean_end: true,
+            })
+        };
+        let stream = |width: u32| StreamParams {
+            config: crate::media::codec::CodecConfig::Avc {
+                sps: vec![0x67, 1],
+                pps: vec![0x68, 2],
+            },
+            width,
+            height: 720,
+            fps: 10,
+        };
+        let mut ring = VideoRing::default();
+        ring.set_params(stream(1280));
+        let mut audio = AudioTimeline::new(0, 48_000 * 60);
+        let push = |ring: &mut VideoRing, range: std::ops::Range<i64>| {
+            for i in range {
+                ring.push(packet(i), window, usize::MAX);
+            }
+        };
+        let snapshot = |ring: &VideoRing, audio: &AudioTimeline, now: i64| Snapshot {
+            params: ring.params().expect("a stream"),
+            video: ring.snapshot(now * S / 10, window),
+            game: audio.snapshot(),
+            mic: None,
+            audio_bitrate: 192_000,
+            max_span: window + 8 * S,
+        };
+        push(&mut ring, 0..80);
+        audio.write(0, &vec![1; 2 * 48_000 * 8], false);
+        // Pressed at 7.9 s: from the keyframe at 2 s.
+        let first = snapshot(&ring, &audio, 79);
+        assert_eq!(first.video[0].pts, 2 * S);
+        // Pressed again at 11.9 s: the ring has moved on (from 6 s), the audio too.
+        push(&mut ring, 80..120);
+        audio.write(48_000 * 8, &vec![2; 2 * 48_000 * 4], false);
+        audio.trim(48_000 * 6);
+        let later = snapshot(&ring, &audio, 119);
+        let longer = first.extended(&later, 60 * S).expect("same stream");
+        let pts: Vec<i64> = longer.video.iter().map(|p| p.pts / (S / 10)).collect();
+        assert_eq!(
+            pts,
+            (20..120).collect::<Vec<_>>(),
+            "every frame, once, in order"
+        );
+        // Longer than a clip may be, by what an extension allows.
+        assert_eq!(longer.max_span, window + 8 * S + 60 * S);
+        let kept = bounded(&longer.video, longer.max_span, S / 10);
+        assert_eq!(kept.len(), longer.video.len());
+        // The audio of the start comes from the first snapshot.
+        let pcm = longer.game.read(48_000 * 2, 48_000 * 10);
+        assert_eq!(
+            (pcm[0], pcm[2 * 48_000 * 6 - 1], pcm[2 * 48_000 * 6]),
+            (1, 1, 2)
+        );
+
+        // Once the first clip's end is gone from the ring, or the stream changed: no.
+        push(&mut ring, 120..200);
+        assert!(
+            first
+                .extended(&snapshot(&ring, &audio, 199), 60 * S)
+                .is_none()
+        );
+        let fresh = snapshot(&ring, &audio, 199);
+        ring.set_params(stream(1920));
+        push(&mut ring, 200..230);
+        assert!(
+            fresh
+                .extended(&snapshot(&ring, &audio, 229), 60 * S)
+                .is_none()
+        );
     }
 
     #[test]
