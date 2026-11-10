@@ -47,11 +47,16 @@ A clip is called a **shard**. Your library is the **Glacier**.
 - [x] The Krak Discord one click away, and clips shared to its #clips from the app, opt-in (the app's side is ready; the community's bot opens it)
 - [x] Discord Rich Presence, with your Discord profile shown in the app (read from Discord itself, no login)
 - [x] Controller shortcut (Xbox controllers) with a buzz to confirm, and a second press that makes the last shard longer instead of a new one
+- [x] Game-only capture ("stream-proof"): only the game's window is filmed, found by itself or picked from the open apps, so overlays, notifications, Discord and the desktop never end up in a clip
+- [x] Choice of the captured screen, and the mouse cursor in clips (optional)
+- [x] Editor tools: cut a passage out, mute or bleep the mic or the game over a zone, slow motion, blurred zones, captions, all previewed live
+- [x] Best-of: shards one after another as edited, cut, fade or flash transitions, an intro title, your music lowered under voices and action, 16:9 or 9:16, with a guided tour
+- [x] Markers: a shortcut marks a moment while you play, found again on the editor's timeline
 - [x] Installer and signed automatic updates
 - [ ] Windows code signing (no SmartScreen warning)
-- [ ] Native AMD and Intel encoders, separate Discord voice track, mouse cursor in clips, choice of the captured screen
+- [ ] Native AMD and Intel encoders, separate Discord voice track
 
-**Later:** slow motion, text and local subtitles, importing clips from ShadowPlay / OBS / Medal, community translations.
+**Later:** local subtitles, importing clips from ShadowPlay / OBS / Medal, community translations.
 
 ## Building from source
 
@@ -69,7 +74,7 @@ Releases are built by GitHub Actions: push a tag such as `v0.2.0` (matching the 
 
 ### How capture works
 
-The screen is read with DXGI Desktop Duplication, the same Windows API that OBS and Discord use, so nothing is injected into games. Frames are encoded on the graphics card and the last seconds are kept in memory: on NVIDIA through the driver's NVENC directly (H.264, HEVC and AV1 where the card has it, with B-frames, lookahead and adaptive quantization), on AMD and Intel through Media Foundation, with a software fallback. If the encoder cannot keep up (a heavy game, a high frame rate), it switches to lighter settings on the fly instead of dropping frames. The video keeps the desktop's size: when a game switches the display to its own resolution (a stretched 1440x1080), its image is scaled into that frame the way the monitor shows it, so the stream and the replay go on through the change. Game sound comes from WASAPI loopback and the microphone from its own device, on separate tracks. Pressing the hotkey writes an MP4 straight from memory, without re-encoding. Continuous recording reuses the same encoded video and writes a fragmented MP4 as it goes, so a crash loses at most a second; screenshots are full-resolution PNGs of the same capture.
+The screen is read with DXGI Desktop Duplication, the same Windows API that OBS and Discord use, so nothing is injected into games. In game-only capture (or with the mouse cursor), Windows Graphics Capture films the game's window (or the screen) instead: no injection either, and nothing drawn over the window is recorded. Frames are encoded on the graphics card and the last seconds are kept in memory: on NVIDIA through the driver's NVENC directly (H.264, HEVC and AV1 where the card has it, with B-frames, lookahead and adaptive quantization), on AMD and Intel through Media Foundation, with a software fallback. If the encoder cannot keep up (a heavy game, a high frame rate), it switches to lighter settings on the fly instead of dropping frames. The video keeps the desktop's size: when a game switches the display to its own resolution (a stretched 1440x1080), its image is scaled into that frame the way the monitor shows it, so the stream and the replay go on through the change. Game sound comes from WASAPI loopback and the microphone from its own device, on separate tracks. Pressing the hotkey writes an MP4 straight from memory, without re-encoding. Continuous recording reuses the same encoded video and writes a fragmented MP4 as it goes, so a crash loses at most a second; screenshots are full-resolution PNGs of the same capture.
 
 The quality presets and the measurements behind them (bitrates, tools, PSNR/SSIM, encoder speed) are documented in [`src-tauri/src/capture/quality.rs`](src-tauri/src/capture/quality.rs). The NVENC layer is a small C file compiled by `cargo` with the Visual Studio C++ tools, against NVIDIA's MIT-licensed `nvEncodeAPI.h` ([`src-tauri/native/nvenc`](src-tauri/native/nvenc)); the NVENC library itself ships with the NVIDIA driver and is loaded at run time, never redistributed.
 

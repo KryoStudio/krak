@@ -874,4 +874,42 @@ b",
             assert!(!valid_version(bad), "{bad}");
         }
     }
+
+    #[test]
+    fn reads_composition_requests_from_the_page() {
+        // What `api.exportComposition` sends for a best-of saved to the Glacier.
+        let json = r#"{
+            "clips": [
+                {"id": "Valorant/a.mp4", "start": 0, "end": 9.5, "gains": {"game": 1, "mic": 0.8},
+                 "cuts": [], "slow": [{"start": 2, "end": 3, "rate": 0.5}], "mutes": [], "blurs": [],
+                 "texts": [{"text": "ACE", "start": 1, "end": 4, "x": 0.5, "y": 0.8, "size": 0.07, "style": "shadow"}],
+                 "cropX": 0.5},
+                {"id": "Fortnite/b.mp4", "start": 3, "end": 12, "gains": {"game": 1, "mic": 1}}
+            ],
+            "transition": "flash",
+            "title": null,
+            "music": null,
+            "vertical": false,
+            "watermark": true,
+            "target": "glacier",
+            "maxBytes": null,
+            "path": null,
+            "name": "Best-of 10-11-2026"
+        }"#;
+        let request: CompositionRequest = serde_json::from_str(json).expect("parsed");
+        assert_eq!(request.target, CompositionTarget::Glacier);
+        assert_eq!(request.name.as_deref(), Some("Best-of 10-11-2026"));
+        assert_eq!(request.composition.clips.len(), 2);
+        assert_eq!(request.composition.clips[0].slow.len(), 1);
+        assert!(request.composition.title.is_none() && request.composition.watermark);
+        // An editor export of one clip to Discord.
+        let discord: CompositionRequest = serde_json::from_str(
+            r#"{"clips": [{"id": "a.mp4", "start": 1, "end": 2, "gains": {"game": 1, "mic": 1}, "mutes": [{"start": 1.2, "end": 1.4, "track": "all", "beep": true}]}],
+                "vertical": true, "watermark": false, "target": "discord", "maxBytes": 20000000}"#,
+        )
+        .expect("parsed");
+        assert_eq!(discord.target, CompositionTarget::Discord);
+        assert_eq!(discord.max_bytes, Some(20_000_000.0));
+        assert!(discord.composition.vertical && discord.path.is_none());
+    }
 }
